@@ -26,7 +26,8 @@ class TransferService {
   static final TransferService instance = TransferService._();
 
   final HttpClient _client = HttpClient()
-    ..connectionTimeout = const Duration(seconds: 5);
+    ..connectionTimeout = const Duration(seconds: 5)
+    ..findProxy = ((uri) => 'DIRECT');
 
   final ValueNotifier<PendingTransferRequest?> incomingRequestNotifier =
       ValueNotifier(null);
@@ -50,6 +51,11 @@ class TransferService {
   }) async {
     final transferId = _generateUuidV4();
     final ownIdentity = DeviceIdentityService.identity;
+
+    if (kDebugMode) {
+      debugPrint(
+          '[DropLAN Timestamp] MAC TRANSFER START transferId=$transferId time=${DateTime.now().toIso8601String()}');
+    }
 
     final fileItems = selectedFileDetails.map((f) {
       return TransferFileItem(
@@ -76,6 +82,10 @@ class TransferService {
     // 35 second fallback timeout for sender
     final timer = Timer(const Duration(seconds: 35), () {
       if (_outgoingRequests.containsKey(transferId)) {
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN Timestamp] MAC REQUEST RESPONSE/TIMEOUT transferId=$transferId status=TIMEOUT time=${DateTime.now().toIso8601String()}');
+        }
         _outgoingFileItems.remove(transferId);
         _outgoingRequests.remove(transferId)?.complete(
               const TransferRequestOutcome(
@@ -89,18 +99,33 @@ class TransferService {
     try {
       final uri =
           Uri.http('$targetHost:$targetPort', DropLanConfig.transferRequestPath);
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Timestamp] MAC REQUEST CONNECT transferId=$transferId uri=$uri time=${DateTime.now().toIso8601String()}');
+      }
       final request = await _client.postUrl(uri);
       request.headers.contentType = ContentType.json;
       request.write(jsonEncode(payload));
 
       final response = await request.close();
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Timestamp] MAC REQUEST BODY SENT transferId=$transferId time=${DateTime.now().toIso8601String()}');
+      }
+      final responseBody = await utf8.decoder.bind(response).join();
+
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Timestamp] MAC REQUEST RESPONSE/TIMEOUT transferId=$transferId status=${response.statusCode} time=${DateTime.now().toIso8601String()}');
+      }
+
       if (response.statusCode != HttpStatus.ok) {
         timer.cancel();
         _outgoingFileItems.remove(transferId);
         _outgoingRequests.remove(transferId);
-        return const TransferRequestOutcome(
+        return TransferRequestOutcome(
           status: TransferResultStatus.failed,
-          message: 'Receiver rejected request initial handshake',
+          message: 'Receiver rejected initial handshake (${response.statusCode}): $responseBody',
         );
       }
 
@@ -108,6 +133,10 @@ class TransferService {
       timer.cancel();
       return result;
     } catch (e) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Timestamp] MAC REQUEST RESPONSE/TIMEOUT transferId=$transferId status=EXCEPTION error=$e time=${DateTime.now().toIso8601String()}');
+      }
       timer.cancel();
       _outgoingFileItems.remove(transferId);
       _outgoingRequests.remove(transferId);
@@ -135,6 +164,10 @@ class TransferService {
       final file = File(fileToSend.localPath);
 
       if (!await file.exists()) {
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN Stream Sender] File not found on sender: ${fileToSend.localPath}');
+        }
         progressNotifier.value = TransferProgressState(
           transferId: transferId,
           currentFileName: fileItem.fileName,
@@ -165,6 +198,11 @@ class TransferService {
       try {
         final uri =
             Uri.http('$targetHost:$targetPort', DropLanConfig.transferFilePath);
+        if (kDebugMode) {
+          debugPrint('[DropLAN Stream Sender] Opening connection to $uri');
+          debugPrint(
+              '[DropLAN Stream Sender] transferId: $transferId, fileId: ${fileItem.fileId}, fileName: ${fileItem.fileName}, expectedSize: ${fileItem.fileSize}');
+        }
         final request = await _client.postUrl(uri);
         request.headers.contentType = ContentType.binary;
         request.headers.set('authorization', 'Bearer $transferToken');
@@ -174,29 +212,56 @@ class TransferService {
             'x-file-name', Uri.encodeComponent(fileItem.fileName));
         request.contentLength = fileItem.fileSize;
 
-        int currentFileSent = 0;
-        final fileStream = file.openRead();
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN Stream Sender] Connection opened. Streaming file data...');
+        }
 
-        await for (final chunk in fileStream) {
-          request.add(chunk);
+        int currentFileSent = 0;
+        int lastProgressUpdateMs = 0;
+        final fileStream = file.openRead().map((chunk) {
           currentFileSent += chunk.length;
-          progressNotifier.value = TransferProgressState(
-            transferId: transferId,
-            currentFileName: fileItem.fileName,
-            currentFileIndex: i + 1,
-            totalFiles: filesToSend.length,
-            currentFileBytesTransferred: currentFileSent,
-            currentFileSizeBytes: fileItem.fileSize,
-            overallBytesTransferred: completedFilesBytes + currentFileSent,
-            overallTotalBytes: overallTotalBytes,
-            status: TransferProgressStatus.transferring,
-          );
+          final nowMs = DateTime.now().millisecondsSinceEpoch;
+          if (nowMs - lastProgressUpdateMs >= 50 ||
+              currentFileSent == fileItem.fileSize) {
+            lastProgressUpdateMs = nowMs;
+            progressNotifier.value = TransferProgressState(
+              transferId: transferId,
+              currentFileName: fileItem.fileName,
+              currentFileIndex: i + 1,
+              totalFiles: filesToSend.length,
+              currentFileBytesTransferred: currentFileSent,
+              currentFileSizeBytes: fileItem.fileSize,
+              overallBytesTransferred: completedFilesBytes + currentFileSent,
+              overallTotalBytes: overallTotalBytes,
+              status: TransferProgressStatus.transferring,
+            );
+          }
+          return chunk;
+        });
+
+        await request.addStream(fileStream);
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN Stream Sender] Finished writing stream to socket. Bytes sent: $currentFileSent / ${fileItem.fileSize}');
         }
 
         final response = await request.close();
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN Stream Sender] Response HTTP Status: ${response.statusCode}');
+          response.headers.forEach((name, values) {
+            debugPrint(
+                '[DropLAN Stream Sender] Response Header: $name = ${values.join(", ")}');
+          });
+        }
 
         if (response.statusCode != HttpStatus.ok) {
           final responseBody = await utf8.decoder.bind(response).join();
+          if (kDebugMode) {
+            debugPrint(
+                '[DropLAN Stream Sender] Upload failed status ${response.statusCode}, body: $responseBody');
+          }
           progressNotifier.value = TransferProgressState(
             transferId: transferId,
             currentFileName: fileItem.fileName,
@@ -213,8 +278,18 @@ class TransferService {
           return false;
         }
 
+        await response.drain();
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN Stream Sender] Connection closed cleanly for ${fileItem.fileName}');
+        }
+
         completedFilesBytes += fileItem.fileSize;
-      } catch (e) {
+      } catch (e, st) {
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN Stream Sender] Exception during file upload: $e\n$st');
+        }
         progressNotifier.value = TransferProgressState(
           transferId: transferId,
           currentFileName: fileItem.fileName,
@@ -250,12 +325,43 @@ class TransferService {
       Map<String, dynamic> body, String clientRemoteHost) async {
     final pendingRequest = PendingTransferRequest.fromJson(body);
 
-    if (pendingRequest.transferId.isEmpty ||
-        _processedTransferIds.contains(pendingRequest.transferId) ||
-        incomingRequestNotifier.value != null) {
+    if (kDebugMode) {
+      debugPrint(
+          '[DropLAN Timestamp] ANDROID handleIncomingRequest START transferId=${pendingRequest.transferId} time=${DateTime.now().toIso8601String()}');
+    }
+
+    if (pendingRequest.transferId.isEmpty) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] REJECTED: transferId is empty');
+      }
       return {
         'status': 'rejected',
-        'error': 'Duplicate transfer ID or busy',
+        'error': 'Transfer ID is empty',
+        'code': 'EMPTY_TRANSFER_ID',
+      };
+    }
+
+    if (_processedTransferIds.contains(pendingRequest.transferId)) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] REJECTED: Duplicate transfer ID ${pendingRequest.transferId}');
+      }
+      return {
+        'status': 'rejected',
+        'error': 'Duplicate transfer ID',
+        'code': 'BUSY_OR_DUPLICATE',
+      };
+    }
+
+    if (incomingRequestNotifier.value != null) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] REJECTED: Receiver busy with pending request ${incomingRequestNotifier.value?.transferId}');
+      }
+      return {
+        'status': 'rejected',
+        'error': 'Receiver is busy with another incoming transfer',
         'code': 'BUSY_OR_DUPLICATE',
       };
     }
@@ -280,6 +386,11 @@ class TransferService {
     });
 
     incomingRequestNotifier.value = requestWithHost;
+
+    if (kDebugMode) {
+      debugPrint(
+          '[DropLAN Timestamp] ANDROID incomingRequestNotifier UPDATED transferId=${requestWithHost.transferId} time=${DateTime.now().toIso8601String()}');
+    }
 
     return {
       'status': 'pending',
@@ -319,11 +430,24 @@ class TransferService {
         '${request.senderHost}:${request.senderPort}',
         DropLanConfig.transferAcceptPath,
       );
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN] Sending accept to $uri for transferId: $transferId');
+      }
       final req = await _client.postUrl(uri);
       req.headers.contentType = ContentType.json;
       req.write(jsonEncode(payload));
-      await req.close();
-    } catch (_) {}
+      final res = await req.close();
+      await res.drain();
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN] Accept request completed with status: ${res.statusCode}');
+      }
+    } catch (e, st) {
+      if (kDebugMode) {
+        debugPrint('[DropLAN] Error sending accept request: $e\n$st');
+      }
+    }
   }
 
   Future<void> rejectIncomingRequest(String transferId,
@@ -345,11 +469,24 @@ class TransferService {
         '${request.senderHost}:${request.senderPort}',
         DropLanConfig.transferRejectPath,
       );
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN] Sending reject to $uri for transferId: $transferId');
+      }
       final req = await _client.postUrl(uri);
       req.headers.contentType = ContentType.json;
       req.write(jsonEncode(payload));
-      await req.close();
-    } catch (_) {}
+      final res = await req.close();
+      await res.drain();
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN] Reject request completed with status: ${res.statusCode}');
+      }
+    } catch (e, st) {
+      if (kDebugMode) {
+        debugPrint('[DropLAN] Error sending reject request: $e\n$st');
+      }
+    }
   }
 
   void handleAcceptResponse(Map<String, dynamic> body) {
@@ -388,8 +525,24 @@ class TransferService {
   }
 
   Future<void> handleIncomingFileUpload(HttpRequest request) async {
+    final clientIp =
+        request.connectionInfo?.remoteAddress.address ?? 'unknown';
     final authHeader = request.headers.value('authorization');
+
+    if (kDebugMode) {
+      debugPrint(
+          '[DropLAN Stream Receiver] Connection opened from $clientIp for endpoint ${request.uri.path}');
+      request.headers.forEach((name, values) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Request Header: $name = ${values.join(", ")}');
+      });
+    }
+
     if (authHeader == null || !authHeader.startsWith('Bearer ')) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Missing or invalid Authorization header');
+      }
       await _sendErrorResponse(
         request,
         HttpStatus.unauthorized,
@@ -405,12 +558,22 @@ class TransferService {
     final rawFileNameHeader = request.headers.value('x-file-name') ?? '';
     final rawFileName = Uri.decodeComponent(rawFileNameHeader);
     final contentLengthHeader = request.headers.value('content-length');
-    final declaredSize =
-        contentLengthHeader != null ? int.tryParse(contentLengthHeader) ?? -1 : -1;
+    final declaredSize = contentLengthHeader != null
+        ? int.tryParse(contentLengthHeader) ?? -1
+        : -1;
+
+    if (kDebugMode) {
+      debugPrint(
+          '[DropLAN Stream Receiver] transferId: $transferId, fileId: $fileId, fileName: $rawFileName, declaredSize: $declaredSize');
+    }
 
     // 1. Check pending accepted request
     final pendingReq = _acceptedRequests[transferId];
     if (pendingReq == null) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Transfer ID $transferId not active or accepted');
+      }
       await _sendErrorResponse(
         request,
         HttpStatus.badRequest,
@@ -423,6 +586,10 @@ class TransferService {
     // 2. Validate token
     final token = validateToken(tokenString, fileId);
     if (token == null) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Invalid or expired token for fileId $fileId');
+      }
       await _sendErrorResponse(
         request,
         HttpStatus.forbidden,
@@ -434,6 +601,10 @@ class TransferService {
 
     // 3. Bound sender device ID check
     if (token.senderDeviceId != pendingReq.senderDeviceId) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Sender device ID mismatch');
+      }
       await _sendErrorResponse(
         request,
         HttpStatus.forbidden,
@@ -445,6 +616,10 @@ class TransferService {
 
     // 4. Token transfer ID check
     if (token.transferId != transferId) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Token transfer ID mismatch');
+      }
       await _sendErrorResponse(
         request,
         HttpStatus.forbidden,
@@ -464,6 +639,10 @@ class TransferService {
     }
 
     if (expectedFileItem == null) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] File ID $fileId not found in transfer metadata');
+      }
       await _sendErrorResponse(
         request,
         HttpStatus.badRequest,
@@ -475,6 +654,10 @@ class TransferService {
 
     // 6. Expected filename & file size checks
     if (rawFileName.isNotEmpty && rawFileName != expectedFileItem.fileName) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Filename mismatch: got $rawFileName, expected ${expectedFileItem.fileName}');
+      }
       await _sendErrorResponse(
         request,
         HttpStatus.badRequest,
@@ -484,7 +667,11 @@ class TransferService {
       return;
     }
 
-    if (declaredSize != expectedFileItem.fileSize) {
+    if (declaredSize != -1 && declaredSize != expectedFileItem.fileSize) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Size mismatch: got $declaredSize, expected ${expectedFileItem.fileSize}');
+      }
       await _sendErrorResponse(
         request,
         HttpStatus.badRequest,
@@ -496,16 +683,59 @@ class TransferService {
 
     final expectedSize = expectedFileItem.fileSize;
     final tempDir = await getTemporaryDirectory();
+
+    if (kDebugMode) {
+      debugPrint(
+          '[DropLAN Stream Receiver] Receive directory path: ${tempDir.path}');
+    }
+
+    if (!await tempDir.exists()) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Receive directory does not exist. Creating recursively: ${tempDir.path}');
+      }
+      await tempDir.create(recursive: true);
+    }
+
     final tempFile =
-        File('${tempDir.path}/droplan_${transferId}_$fileId.tmp');
+        File(p.join(tempDir.path, 'droplan_${transferId}_$fileId.tmp'));
+
+    if (!await tempFile.parent.exists()) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Parent directory does not exist. Creating recursively: ${tempFile.parent.path}');
+      }
+      await tempFile.parent.create(recursive: true);
+    }
+
+    if (kDebugMode) {
+      debugPrint(
+          '[DropLAN Stream Receiver] Temp file path: ${tempFile.path}');
+      debugPrint(
+          '[DropLAN Stream Receiver] Existence of parent directory immediately before opening: ${await tempFile.parent.exists()}');
+    }
 
     if (await tempFile.exists()) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Deleting existing stale temp file at ${tempFile.path}');
+      }
       await tempFile.delete();
     }
 
     final sink = tempFile.openWrite();
+    if (kDebugMode) {
+      debugPrint(
+          '[DropLAN Stream Receiver] Opened write sink for ${tempFile.path}. Temp file exists immediately after open: ${await tempFile.exists()}');
+    }
+
     int actualBytesReceived = 0;
     bool sizeExceeded = false;
+
+    if (kDebugMode) {
+      debugPrint(
+          '[DropLAN Stream Receiver] Start reading request stream for $rawFileName. Expected size: $expectedSize bytes');
+    }
 
     try {
       await for (final chunk in request) {
@@ -527,12 +757,28 @@ class TransferService {
       }
       await sink.flush();
       await sink.close();
-    } catch (e) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Stream read complete. Expected: $expectedSize, Actual bytes received: $actualBytesReceived');
+      }
+    } catch (e, st) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Exception receiving stream for $rawFileName: $e\n$st');
+      }
+      try {
+        await sink.close();
+      } catch (_) {}
+
       if (await tempFile.exists()) {
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN Stream Receiver] Deleting incomplete temp file during error cleanup: ${tempFile.path}');
+        }
         await tempFile.delete();
       }
       _setReceiverProgressFailed(
-          transferId, 'Error receiving stream for $rawFileName');
+          transferId, 'Error receiving stream for $rawFileName: $e');
       await _sendErrorResponse(
         request,
         HttpStatus.internalServerError,
@@ -543,11 +789,15 @@ class TransferService {
     }
 
     if (sizeExceeded || actualBytesReceived != expectedSize) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Byte count mismatch: expected $expectedSize, got $actualBytesReceived (sizeExceeded: $sizeExceeded)');
+      }
       if (await tempFile.exists()) {
         await tempFile.delete();
       }
-      _setReceiverProgressFailed(
-          transferId, 'Byte count mismatch for $rawFileName');
+      _setReceiverProgressFailed(transferId,
+          'Byte count mismatch for $rawFileName: expected $expectedSize, got $actualBytesReceived');
       await _sendErrorResponse(
         request,
         HttpStatus.badRequest,
@@ -560,21 +810,68 @@ class TransferService {
     // Save to target destination safely
     final targetFile =
         await _resolveSafeDestinationFile(expectedFileItem.fileName);
-    try {
-      await tempFile.rename(targetFile.path);
-    } catch (_) {
-      await tempFile.copy(targetFile.path);
-      await tempFile.delete();
+    if (kDebugMode) {
+      debugPrint(
+          '[DropLAN Stream Receiver] Final destination file path resolved: ${targetFile.path}');
+      debugPrint(
+          '[DropLAN Stream Receiver] Renaming temp file ${tempFile.path} -> ${targetFile.path}');
     }
 
-    _markFileReceived(transferId, fileId, tokenString, pendingReq);
+    try {
+      await tempFile.rename(targetFile.path);
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Rename failed ($e), falling back to copy & delete');
+      }
+      await tempFile.copy(targetFile.path);
+      if (await tempFile.exists()) {
+        await tempFile.delete();
+      }
+    }
+
+    final finalExists = await targetFile.exists();
+    final finalSize = finalExists ? await targetFile.length() : -1;
+
+    if (!finalExists || finalSize != actualBytesReceived) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Stream Receiver] Final file verification failed: exists=$finalExists, expectedSize=$actualBytesReceived, finalSize=$finalSize');
+      }
+      _setReceiverProgressFailed(transferId,
+          'Final destination file verification failed for $rawFileName');
+      await _sendErrorResponse(
+        request,
+        HttpStatus.internalServerError,
+        'File finalization failed',
+        'FINALIZATION_ERROR',
+      );
+      return;
+    }
+
+    if (kDebugMode) {
+      debugPrint('[DropLAN Stream Receiver] Transfer completed successfully:');
+      debugPrint('[DropLAN Stream Receiver]   temporary path: ${tempFile.path}');
+      debugPrint('[DropLAN Stream Receiver]   final path: ${targetFile.path}');
+      debugPrint('[DropLAN Stream Receiver]   received bytes: $actualBytesReceived');
+      debugPrint('[DropLAN Stream Receiver]   final file size: $finalSize');
+      debugPrint('[DropLAN Stream Receiver]   completion status: SUCCESS');
+    }
+
+    _markFileReceived(transferId, fileId, tokenString, pendingReq, targetFile.path);
 
     request.response
       ..statusCode = HttpStatus.ok
       ..headers.contentType = ContentType.json
       ..write(jsonEncode({'status': 'file_received', 'fileId': fileId}));
     await request.response.close();
+    if (kDebugMode) {
+      debugPrint(
+          '[DropLAN Stream Receiver] Connection closed cleanly for fileId $fileId');
+    }
   }
+
+  int _lastReceiverUpdateMs = 0;
 
   void _updateReceiverProgress({
     required String transferId,
@@ -584,6 +881,13 @@ class TransferService {
     required int currentFileBytes,
     required int currentFileSize,
   }) {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _lastReceiverUpdateMs < 50 &&
+        currentFileBytes < currentFileSize) {
+      return;
+    }
+    _lastReceiverUpdateMs = nowMs;
+
     final alreadyReceivedSet = _receivedFilesPerTransfer[transferId] ?? {};
     int completedBytes = 0;
     int currentFileIndex = 1;
@@ -633,6 +937,7 @@ class TransferService {
     String fileId,
     String tokenString,
     PendingTransferRequest pendingReq,
+    String savedPath,
   ) {
     final set = _receivedFilesPerTransfer.putIfAbsent(transferId, () => {});
     set.add(fileId);
@@ -649,6 +954,7 @@ class TransferService {
         overallBytesTransferred: pendingReq.totalSize,
         overallTotalBytes: pendingReq.totalSize,
         status: TransferProgressStatus.completed,
+        destinationPath: savedPath,
       );
 
       // Invalidate token after batch completion
@@ -671,9 +977,24 @@ class TransferService {
     if (Platform.isAndroid) {
       downloadsDir = Directory('/storage/emulated/0/Download/DropLAN');
     } else {
-      final systemDownloads = await getDownloadsDirectory();
-      downloadsDir = Directory(
-          '${systemDownloads?.path ?? Directory.systemTemp.path}/DropLAN');
+      String baseDownloadsPath = '';
+      try {
+        final systemDownloads = await getDownloadsDirectory();
+        baseDownloadsPath = systemDownloads?.path ?? '';
+      } catch (_) {}
+
+      if (baseDownloadsPath.isEmpty) {
+        final home = Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'] ?? '';
+        if (home.isNotEmpty) {
+          baseDownloadsPath = p.join(home, 'Downloads');
+        }
+      }
+
+      if (baseDownloadsPath.isEmpty) {
+        baseDownloadsPath = Directory.systemTemp.path;
+      }
+
+      downloadsDir = Directory(p.join(baseDownloadsPath, 'DropLAN'));
     }
 
     if (!await downloadsDir.exists()) {

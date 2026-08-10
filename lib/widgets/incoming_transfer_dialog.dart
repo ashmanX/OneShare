@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import 'package:droplan/models/transfer_models.dart';
@@ -25,6 +26,11 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
   @override
   void initState() {
     super.initState();
+
+    if (kDebugMode) {
+      debugPrint(
+          '[DropLAN Timestamp] ANDROID IncomingTransferDialog BUILD/SHOW transferId=${widget.request.transferId} time=${DateTime.now().toIso8601String()}');
+    }
 
     _countdownTimer = Timer.periodic(
       const Duration(seconds: 1),

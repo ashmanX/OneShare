@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+
 import 'package:droplan/config/droplan_config.dart';
 import 'package:droplan/services/device_identity_service.dart';
 import 'package:droplan/services/transfer_service.dart';
@@ -16,31 +18,51 @@ class DropLanHttpServer {
 
   Future<void> start() async {
     if (_server != null) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN HttpServer] Server already running on port ${_server!.port}');
+      }
       return;
     }
 
     final localAddress = await _findLocalWifiAddress();
-    if (localAddress == null) {
-      return;
+    final bindAddress = localAddress ?? InternetAddress.anyIPv4;
+
+    try {
+      final server = await HttpServer.bind(
+        bindAddress,
+        DropLanConfig.port,
+        shared: true,
+      );
+
+      server.listen(_handleRequest);
+      _server = server;
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN HttpServer] Server started listening on ${server.address.address}:${server.port} (local Wi-Fi IP: ${localAddress?.address})');
+      }
+    } catch (e, st) {
+      if (kDebugMode) {
+        debugPrint('[DropLAN HttpServer] Failed to start server: $e\n$st');
+      }
     }
-
-    final server = await HttpServer.bind(
-      localAddress,
-      DropLanConfig.port,
-      shared: true,
-    );
-
-    server.listen(_handleRequest);
-    _server = server;
   }
 
   Future<void> stop() async {
     final server = _server;
     _server = null;
     await server?.close(force: true);
+    if (kDebugMode) {
+      debugPrint('[DropLAN HttpServer] Server stopped');
+    }
   }
 
   Future<void> _handleRequest(HttpRequest request) async {
+    if (kDebugMode) {
+      debugPrint(
+          '[DropLAN Timestamp] ANDROID REQUEST SOCKET/HTTP RECEIVED path=${request.uri.path} time=${DateTime.now().toIso8601String()}');
+    }
+
     try {
       if (request.method == 'GET' &&
           request.uri.path == DropLanConfig.infoPath) {
@@ -50,7 +72,15 @@ class DropLanHttpServer {
 
       if (request.method == 'POST' &&
           request.uri.path == DropLanConfig.transferRequestPath) {
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN Timestamp] ANDROID REQUEST BODY READ START path=${request.uri.path} time=${DateTime.now().toIso8601String()}');
+        }
         final jsonBody = await _readJsonBody(request);
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN Timestamp] ANDROID REQUEST PARSED transferId=${jsonBody['transferId']} time=${DateTime.now().toIso8601String()}');
+        }
         final clientIp =
             request.connectionInfo?.remoteAddress.address ?? '127.0.0.1';
         final responseMap = await TransferService.instance
@@ -60,10 +90,16 @@ class DropLanHttpServer {
             ? HttpStatus.conflict
             : HttpStatus.ok;
 
+        final responseJson = jsonEncode(responseMap);
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN HttpServer] Handshake response (status: $statusCode): $responseJson');
+        }
+
         request.response
           ..statusCode = statusCode
           ..headers.contentType = ContentType.json
-          ..write(jsonEncode(responseMap));
+          ..write(responseJson);
         await request.response.close();
         return;
       }
@@ -71,26 +107,34 @@ class DropLanHttpServer {
       if (request.method == 'POST' &&
           request.uri.path == DropLanConfig.transferAcceptPath) {
         final jsonBody = await _readJsonBody(request);
-        TransferService.instance.handleAcceptResponse(jsonBody);
-
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN HttpServer] Parsed transfer accept JSON body: $jsonBody');
+        }
         request.response
           ..statusCode = HttpStatus.ok
           ..headers.contentType = ContentType.json
           ..write(jsonEncode({'status': 'accepted_acknowledged'}));
         await request.response.close();
+
+        TransferService.instance.handleAcceptResponse(jsonBody);
         return;
       }
 
       if (request.method == 'POST' &&
           request.uri.path == DropLanConfig.transferRejectPath) {
         final jsonBody = await _readJsonBody(request);
-        TransferService.instance.handleRejectResponse(jsonBody);
-
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN HttpServer] Parsed transfer reject JSON body: $jsonBody');
+        }
         request.response
           ..statusCode = HttpStatus.ok
           ..headers.contentType = ContentType.json
           ..write(jsonEncode({'status': 'rejection_acknowledged'}));
         await request.response.close();
+
+        TransferService.instance.handleRejectResponse(jsonBody);
         return;
       }
 
@@ -100,12 +144,20 @@ class DropLanHttpServer {
         return;
       }
 
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN HttpServer] Unrecognized endpoint ${request.method} ${request.uri.path}');
+      }
       request.response
         ..statusCode = HttpStatus.notFound
         ..headers.contentType = ContentType.json
         ..write(jsonEncode({'error': 'Not found', 'code': 'NOT_FOUND'}));
       await request.response.close();
-    } catch (_) {
+    } catch (e, st) {
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN HttpServer] Error handling request ${request.uri.path}: $e\n$st');
+      }
       if (!request.response.headers.chunkedTransferEncoding) {
         request.response.statusCode = HttpStatus.internalServerError;
         await request.response.close();
@@ -116,6 +168,10 @@ class DropLanHttpServer {
   Future<Map<String, dynamic>> _readJsonBody(HttpRequest request) async {
     try {
       final content = await utf8.decoder.bind(request).join();
+      if (kDebugMode) {
+        debugPrint(
+            '[DropLAN Timestamp] ANDROID REQUEST BODY READ COMPLETE bytes=${content.length} time=${DateTime.now().toIso8601String()}');
+      }
       if (content.isEmpty) return {};
       return jsonDecode(content) as Map<String, dynamic>;
     } catch (_) {

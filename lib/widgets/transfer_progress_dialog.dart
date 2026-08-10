@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import 'package:droplan/models/transfer_models.dart';
@@ -12,6 +14,15 @@ class TransferProgressDialog extends StatelessWidget {
       return '${(bytes / 1024).toStringAsFixed(1)} KB';
     }
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  static String _formatDestinationPath(String? path) {
+    if (path == null || path.isEmpty) return '~/Downloads/DropLAN/';
+    final home = Platform.environment['HOME'] ?? '';
+    if (home.isNotEmpty && path.startsWith(home)) {
+      return '~${path.substring(home.length)}';
+    }
+    return path;
   }
 
   @override
@@ -68,6 +79,57 @@ class TransferProgressDialog extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(height: 12),
+              ] else if (isCompleted) ...[
+                Text(
+                  state.totalFiles == 1
+                      ? 'Successfully received ${state.currentFileName}'
+                      : 'Successfully received ${state.totalFiles} files',
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+                  decoration: BoxDecoration(
+                    color: Colors.green.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.green.withValues(alpha: 0.3)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.task_alt, color: Colors.green, size: 20),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '100% • ${_formatFileSize(state.overallTotalBytes)} transferred',
+                          style: theme.textTheme.labelMedium?.copyWith(
+                            color: Colors.green.shade900,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Saved to:',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                SelectableText(
+                  _formatDestinationPath(state.destinationPath),
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    fontFamily: 'monospace',
+                    color: theme.colorScheme.primary,
+                  ),
+                ),
               ] else ...[
                 Text(
                   'File ${state.currentFileIndex} of ${state.totalFiles}: ${state.currentFileName}',
@@ -112,7 +174,15 @@ class TransferProgressDialog extends StatelessWidget {
             ],
           ),
           actions: [
-            if (isCompleted || isFailed)
+            if (isCompleted)
+              FilledButton(
+                onPressed: () {
+                  TransferService.instance.progressNotifier.value = null;
+                  Navigator.of(context).maybePop();
+                },
+                child: const Text('Done'),
+              )
+            else if (isFailed)
               FilledButton(
                 onPressed: () {
                   TransferService.instance.progressNotifier.value = null;

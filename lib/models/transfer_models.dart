@@ -138,6 +138,7 @@ class TransferProgressState {
     required this.overallTotalBytes,
     required this.status,
     this.errorMessage,
+    this.destinationPath,
   });
 
   final String transferId;
@@ -150,6 +151,7 @@ class TransferProgressState {
   final int overallTotalBytes;
   final TransferProgressStatus status;
   final String? errorMessage;
+  final String? destinationPath;
 
   double get currentFileProgress => currentFileSizeBytes == 0
       ? 1.0

@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:file_selector/file_selector.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -62,6 +63,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
 
   bool _isSendingRequest = false;
   bool _isProgressDialogOpen = false;
+  bool _isIncomingDialogOpen = false;
 
   @override
   void initState() {
@@ -105,34 +107,35 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       return;
     }
 
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      if (!mounted) {
-        return;
-      }
+    if (kDebugMode) {
+      debugPrint(
+          '[DropLAN Timestamp] ANDROID UI LISTENER FIRED transferId=${request.transferId} time=${DateTime.now().toIso8601String()}');
+    }
 
-      if (Platform.isMacOS) {
-        try {
-          await const MethodChannel(
-            'com.example.droplan/nsd_control',
-          ).invokeMethod('activateApp');
-        } catch (error) {
-          print(
-            'DropLAN: failed to activate macOS app: $error',
-          );
-        }
-      }
+    if (_isIncomingDialogOpen) {
+      return;
+    }
 
-      if (!mounted) {
-        return;
-      }
+    _isIncomingDialogOpen = true;
 
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (_) => IncomingTransferDialog(
-          request: request,
-        ),
-      );
+    if (Platform.isMacOS) {
+      const MethodChannel('com.example.droplan/nsd_control')
+          .invokeMethod('activateApp')
+          .catchError((_) {});
+    }
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => IncomingTransferDialog(
+        request: request,
+      ),
+    ).then((_) {
+      _isIncomingDialogOpen = false;
+      if (TransferService.instance.incomingRequestNotifier.value?.transferId ==
+          request.transferId) {
+        TransferService.instance.incomingRequestNotifier.value = null;
+      }
     });
   }
 
@@ -394,11 +397,10 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
 
     return Scaffold(
       body: SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
           child: Column(
-            crossAxisAlignment:
-                CrossAxisAlignment.stretch,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const SizedBox(height: 16),
 
@@ -415,8 +417,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
               Text(
                 'Fast file sharing on your local network',
                 style: theme.textTheme.bodyLarge?.copyWith(
-                  color:
-                      theme.colorScheme.onSurfaceVariant,
+                  color: theme.colorScheme.onSurfaceVariant,
                 ),
                 textAlign: TextAlign.center,
               ),
@@ -439,8 +440,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                     children: [
                       Icon(
                         Icons.smartphone,
-                        color:
-                            theme.colorScheme.primary,
+                        color: theme.colorScheme.primary,
                         size: 28,
                       ),
 
@@ -448,8 +448,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
 
                       Text(
                         _deviceName,
-                        style:
-                            theme.textTheme.titleLarge,
+                        style: theme.textTheme.titleLarge,
                       ),
                     ],
                   ),
@@ -467,11 +466,9 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
 
               const SizedBox(height: 8),
 
-              ValueListenableBuilder<
-                  List<DiscoveredDevice>>(
+              ValueListenableBuilder<List<DiscoveredDevice>>(
                 valueListenable:
-                    _discoveryService
-                        .discoveredDevicesNotifier,
+                    _discoveryService.discoveredDevicesNotifier,
                 builder: (
                   context,
                   devices,
@@ -480,15 +477,13 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                   if (devices.isEmpty) {
                     return Card(
                       child: Padding(
-                        padding:
-                            const EdgeInsets.all(16),
+                        padding: const EdgeInsets.all(16),
                         child: Row(
                           children: [
                             const SizedBox(
                               width: 16,
                               height: 16,
-                              child:
-                                  CircularProgressIndicator(
+                              child: CircularProgressIndicator(
                                 strokeWidth: 2,
                               ),
                             ),
@@ -498,13 +493,9 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                             Expanded(
                               child: Text(
                                 'Searching for DropLAN devices...',
-                                style: theme
-                                    .textTheme
-                                    .bodyMedium
-                                    ?.copyWith(
+                                style: theme.textTheme.bodyMedium?.copyWith(
                                   color: theme
-                                      .colorScheme
-                                      .onSurfaceVariant,
+                                      .colorScheme.onSurfaceVariant,
                                 ),
                               ),
                             ),
@@ -517,8 +508,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                   return SizedBox(
                     height: 120,
                     child: ListView.separated(
-                      scrollDirection:
-                          Axis.horizontal,
+                      scrollDirection: Axis.horizontal,
                       itemCount: devices.length,
                       separatorBuilder: (
                         _,
@@ -529,34 +519,29 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                         context,
                         index,
                       ) {
-                        final device =
-                            devices[index];
+                        final device = devices[index];
 
                         return SizedBox(
                           width: 190,
                           child: Card(
                             child: InkWell(
-                              borderRadius:
-                                  BorderRadius.circular(
+                              borderRadius: BorderRadius.circular(
                                 12,
                               ),
                               onTap: _isSendingRequest
                                   ? null
-                                  : () =>
-                                      _sendTransferToDevice(
+                                  : () => _sendTransferToDevice(
                                         device,
                                       ),
                               child: Padding(
-                                padding:
-                                    const EdgeInsets
-                                        .all(12),
+                                padding: const EdgeInsets.all(
+                                  12,
+                                ),
                                 child: Column(
                                   crossAxisAlignment:
-                                      CrossAxisAlignment
-                                          .start,
+                                      CrossAxisAlignment.start,
                                   mainAxisAlignment:
-                                      MainAxisAlignment
-                                          .center,
+                                      MainAxisAlignment.center,
                                   children: [
                                     Row(
                                       children: [
@@ -564,8 +549,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                                           Icons.devices,
                                           size: 20,
                                           color: theme
-                                              .colorScheme
-                                              .primary,
+                                              .colorScheme.primary,
                                         ),
 
                                         const SizedBox(
@@ -574,20 +558,16 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
 
                                         Expanded(
                                           child: Text(
-                                            device
-                                                .deviceName,
+                                            device.deviceName,
                                             style: theme
-                                                .textTheme
-                                                .titleSmall
+                                                .textTheme.titleSmall
                                                 ?.copyWith(
                                               fontWeight:
-                                                  FontWeight
-                                                      .bold,
+                                                  FontWeight.bold,
                                             ),
                                             maxLines: 1,
                                             overflow:
-                                                TextOverflow
-                                                    .ellipsis,
+                                                TextOverflow.ellipsis,
                                           ),
                                         ),
                                       ],
@@ -599,18 +579,13 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
 
                                     Text(
                                       '${device.host}:${device.port}',
-                                      style: theme
-                                          .textTheme
-                                          .bodySmall
+                                      style: theme.textTheme.bodySmall
                                           ?.copyWith(
                                         color: theme
-                                            .colorScheme
-                                            .onSurfaceVariant,
+                                            .colorScheme.onSurfaceVariant,
                                       ),
                                       maxLines: 1,
-                                      overflow:
-                                          TextOverflow
-                                              .ellipsis,
+                                      overflow: TextOverflow.ellipsis,
                                     ),
 
                                     const SizedBox(
@@ -622,8 +597,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                                         const Icon(
                                           Icons.send,
                                           size: 14,
-                                          color:
-                                              Colors.blue,
+                                          color: Colors.blue,
                                         ),
 
                                         const SizedBox(
@@ -633,15 +607,10 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                                         Text(
                                           'Tap to Send',
                                           style: theme
-                                              .textTheme
-                                              .labelSmall
+                                              .textTheme.labelSmall
                                               ?.copyWith(
-                                            color: Colors
-                                                .blue
-                                                .shade700,
-                                            fontWeight:
-                                                FontWeight
-                                                    .w600,
+                                            color: Colors.blue.shade700,
+                                            fontWeight: FontWeight.w600,
                                           ),
                                         ),
                                       ],
@@ -670,67 +639,60 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
 
                 const SizedBox(height: 8),
 
-                Expanded(
-                  child: ListView.separated(
-                    itemCount:
-                        _selectedFiles.length,
-                    separatorBuilder: (
-                      _,
-                      _,
-                    ) =>
-                        const SizedBox(height: 8),
-                    itemBuilder: (
-                      context,
-                      index,
-                    ) {
-                      final file =
-                          _selectedFiles[index];
+                ListView.separated(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: _selectedFiles.length,
+                  separatorBuilder: (
+                    _,
+                    _,
+                  ) =>
+                      const SizedBox(height: 8),
+                  itemBuilder: (
+                    context,
+                    index,
+                  ) {
+                    final file = _selectedFiles[index];
 
-                      return Card(
-                        child: ListTile(
-                          leading: const Icon(
-                            Icons.insert_drive_file,
-                          ),
-                          title: Text(
-                            file.name,
-                            maxLines: 2,
-                            overflow:
-                                TextOverflow.ellipsis,
-                          ),
-                          subtitle: Text(
-                            _formatFileSize(
-                              file.size,
-                            ),
-                          ),
-                          trailing: IconButton(
-                            icon: const Icon(
-                              Icons.close,
-                            ),
-                            tooltip: 'Remove',
-                            onPressed: () =>
-                                _removeFile(index),
+                    return Card(
+                      child: ListTile(
+                        leading: const Icon(
+                          Icons.insert_drive_file,
+                        ),
+                        title: Text(
+                          file.name,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        subtitle: Text(
+                          _formatFileSize(
+                            file.size,
                           ),
                         ),
-                      );
-                    },
-                  ),
+                        trailing: IconButton(
+                          icon: const Icon(
+                            Icons.close,
+                          ),
+                          tooltip: 'Remove',
+                          onPressed: () => _removeFile(index),
+                        ),
+                      ),
+                    );
+                  },
                 ),
-              ] else
-                const Spacer(),
+              ],
 
-              const SizedBox(height: 16),
+              const SizedBox(height: 24),
 
               FilledButton.icon(
                 onPressed: _pickFiles,
                 icon: const Icon(Icons.upload),
                 label: const Text('Send files'),
                 style: FilledButton.styleFrom(
-                  padding:
-                      const EdgeInsets.symmetric(
+                  padding: const EdgeInsets.symmetric(
                     vertical: 18,
                   ),
-                  textStyle:
-                      theme.textTheme.titleMedium,
+                  textStyle: theme.textTheme.titleMedium,
                 ),
               ),
 
@@ -741,12 +703,10 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                 icon: const Icon(Icons.download),
                 label: const Text('Receive files'),
                 style: OutlinedButton.styleFrom(
-                  padding:
-                      const EdgeInsets.symmetric(
+                  padding: const EdgeInsets.symmetric(
                     vertical: 18,
                   ),
-                  textStyle:
-                      theme.textTheme.titleMedium,
+                  textStyle: theme.textTheme.titleMedium,
                 ),
               ),
 
