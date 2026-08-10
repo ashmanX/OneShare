@@ -1,5 +1,8 @@
+import 'dart:io';
+
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'package:droplan/config/droplan_config.dart';
 import 'package:droplan/models/transfer_models.dart';
@@ -54,6 +57,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   late final String _deviceName;
   late final DropLanHttpServer _httpServer;
   late final DropLanDiscoveryService _discoveryService;
+
   final List<SelectedFile> _selectedFiles = [];
 
   bool _isSendingRequest = false;
@@ -62,14 +66,19 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   @override
   void initState() {
     super.initState();
+
     _deviceName = DeviceIdentityService.identity.deviceName;
     _httpServer = DropLanHttpServer();
     _discoveryService = DropLanDiscoveryService();
+
     WidgetsBinding.instance.addObserver(this);
+
     TransferService.instance.incomingRequestNotifier
         .addListener(_onIncomingTransferRequest);
+
     TransferService.instance.progressNotifier
         .addListener(_onTransferProgressChanged);
+
     _startServicesIfForeground();
   }
 
@@ -77,31 +86,67 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   void dispose() {
     TransferService.instance.incomingRequestNotifier
         .removeListener(_onIncomingTransferRequest);
+
     TransferService.instance.progressNotifier
         .removeListener(_onTransferProgressChanged);
+
     WidgetsBinding.instance.removeObserver(this);
+
     _stopServices();
+
     super.dispose();
   }
 
   void _onIncomingTransferRequest() {
-    final request = TransferService.instance.incomingRequestNotifier.value;
-    if (request == null || !mounted) return;
+    final request =
+        TransferService.instance.incomingRequestNotifier.value;
 
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => IncomingTransferDialog(request: request),
-    );
+    if (request == null || !mounted) {
+      return;
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) {
+        return;
+      }
+
+      if (Platform.isMacOS) {
+        try {
+          await const MethodChannel(
+            'com.example.droplan/nsd_control',
+          ).invokeMethod('activateApp');
+        } catch (error) {
+          print(
+            'DropLAN: failed to activate macOS app: $error',
+          );
+        }
+      }
+
+      if (!mounted) {
+        return;
+      }
+
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => IncomingTransferDialog(
+          request: request,
+        ),
+      );
+    });
   }
 
   void _onTransferProgressChanged() {
     final state = TransferService.instance.progressNotifier.value;
-    if (state == null || !mounted) return;
+
+    if (state == null || !mounted) {
+      return;
+    }
 
     if (!_isProgressDialogOpen &&
         state.status == TransferProgressStatus.transferring) {
       _isProgressDialogOpen = true;
+
       showDialog(
         context: context,
         barrierDismissible: false,
@@ -126,7 +171,9 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   }
 
   Future<void> _startServicesIfForeground() async {
-    final lifecycleState = WidgetsBinding.instance.lifecycleState;
+    final lifecycleState =
+        WidgetsBinding.instance.lifecycleState;
+
     if (lifecycleState != null &&
         lifecycleState != AppLifecycleState.resumed &&
         lifecycleState != AppLifecycleState.inactive) {
@@ -134,8 +181,13 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     }
 
     await _httpServer.start();
+
     if (_httpServer.isRunning) {
-      await _discoveryService.startAdvertising(_deviceName, DropLanConfig.port);
+      await _discoveryService.startAdvertising(
+        _deviceName,
+        DropLanConfig.port,
+      );
+
       await _discoveryService.startDiscovery();
     }
   }
@@ -143,26 +195,36 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   Future<void> _stopServices() async {
     await _discoveryService.stopDiscovery();
     await _discoveryService.stopAdvertising();
+
     _discoveryService.clearDiscoveredDevices();
+
     await _httpServer.stop();
   }
 
   static String _formatFileSize(int bytes) {
-    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024) {
+      return '$bytes B';
+    }
+
     if (bytes < 1024 * 1024) {
       return '${(bytes / 1024).toStringAsFixed(1)} KB';
     }
+
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
 
   Future<void> _pickFiles() async {
     final pickedFiles = await openFiles();
 
-    if (pickedFiles.isEmpty) return;
+    if (pickedFiles.isEmpty) {
+      return;
+    }
 
     final newFiles = <SelectedFile>[];
+
     for (final file in pickedFiles) {
       final size = await file.length();
+
       newFiles.add(
         SelectedFile(
           name: file.name,
@@ -180,6 +242,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
               existing.size == file.size &&
               existing.path == file.path,
         );
+
         if (!isDuplicate) {
           _selectedFiles.add(file);
         }
@@ -193,18 +256,25 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     });
   }
 
-  Future<void> _sendTransferToDevice(DiscoveredDevice device) async {
+  Future<void> _sendTransferToDevice(
+    DiscoveredDevice device,
+  ) async {
     if (_selectedFiles.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Please select files to send first'),
+          content: Text(
+            'Please select files to send first',
+          ),
           behavior: SnackBarBehavior.floating,
         ),
       );
+
       return;
     }
 
-    if (_isSendingRequest) return;
+    if (_isSendingRequest) {
+      return;
+    }
 
     setState(() {
       _isSendingRequest = true;
@@ -212,7 +282,10 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text('Sending transfer request to ${device.deviceName}...'),
+        content: Text(
+          'Sending transfer request to '
+          '${device.deviceName}...',
+        ),
         duration: const Duration(seconds: 4),
         behavior: SnackBarBehavior.floating,
       ),
@@ -225,13 +298,16 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       };
     }).toList();
 
-    final outcome = await TransferService.instance.sendTransferRequest(
+    final outcome =
+        await TransferService.instance.sendTransferRequest(
       targetHost: device.host,
       targetPort: device.port,
       selectedFileDetails: filePayloads,
     );
 
-    if (!mounted) return;
+    if (!mounted) {
+      return;
+    }
 
     setState(() {
       _isSendingRequest = false;
@@ -242,9 +318,13 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
         if (outcome.transferId != null &&
             outcome.transferToken != null &&
             outcome.fileItems != null &&
-            outcome.fileItems!.length == _selectedFiles.length) {
+            outcome.fileItems!.length ==
+                _selectedFiles.length) {
           final filesToSend = <FileToSend>[];
-          for (int i = 0; i < outcome.fileItems!.length; i++) {
+
+          for (int i = 0;
+              i < outcome.fileItems!.length;
+              i++) {
             filesToSend.add(
               FileToSend(
                 fileItem: outcome.fileItems![i],
@@ -261,33 +341,49 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
             filesToSend: filesToSend,
           );
         }
+
         break;
+
       case TransferResultStatus.rejected:
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Request rejected by ${device.deviceName}.'),
+            content: Text(
+              'Request rejected by '
+              '${device.deviceName}.',
+            ),
             backgroundColor: Colors.red.shade700,
             behavior: SnackBarBehavior.floating,
           ),
         );
+
         break;
+
       case TransferResultStatus.expired:
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Request to ${device.deviceName} expired (no response).'),
+            content: Text(
+              'Request to ${device.deviceName} '
+              'expired (no response).',
+            ),
             backgroundColor: Colors.orange.shade800,
             behavior: SnackBarBehavior.floating,
           ),
         );
+
         break;
+
       case TransferResultStatus.failed:
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Transfer request failed: ${outcome.message}'),
+            content: Text(
+              'Transfer request failed: '
+              '${outcome.message}',
+            ),
             backgroundColor: Colors.red.shade800,
             behavior: SnackBarBehavior.floating,
           ),
         );
+
         break;
     }
   }
@@ -301,9 +397,11 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
         child: Padding(
           padding: const EdgeInsets.all(24),
           child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
+            crossAxisAlignment:
+                CrossAxisAlignment.stretch,
             children: [
               const SizedBox(height: 16),
+
               Text(
                 'DropLAN',
                 style: theme.textTheme.headlineLarge?.copyWith(
@@ -311,22 +409,29 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                 ),
                 textAlign: TextAlign.center,
               ),
+
               const SizedBox(height: 4),
+
               Text(
                 'Fast file sharing on your local network',
                 style: theme.textTheme.bodyLarge?.copyWith(
-                  color: theme.colorScheme.onSurfaceVariant,
+                  color:
+                      theme.colorScheme.onSurfaceVariant,
                 ),
                 textAlign: TextAlign.center,
               ),
+
               const SizedBox(height: 24),
+
               Text(
                 'This device',
                 style: theme.textTheme.titleMedium?.copyWith(
                   fontWeight: FontWeight.w600,
                 ),
               ),
+
               const SizedBox(height: 8),
+
               Card(
                 child: Padding(
                   padding: const EdgeInsets.all(16),
@@ -334,46 +439,72 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                     children: [
                       Icon(
                         Icons.smartphone,
-                        color: theme.colorScheme.primary,
+                        color:
+                            theme.colorScheme.primary,
                         size: 28,
                       ),
+
                       const SizedBox(width: 16),
+
                       Text(
                         _deviceName,
-                        style: theme.textTheme.titleLarge,
+                        style:
+                            theme.textTheme.titleLarge,
                       ),
                     ],
                   ),
                 ),
               ),
+
               const SizedBox(height: 16),
+
               Text(
                 'Nearby devices',
                 style: theme.textTheme.titleMedium?.copyWith(
                   fontWeight: FontWeight.w600,
                 ),
               ),
+
               const SizedBox(height: 8),
-              ValueListenableBuilder<List<DiscoveredDevice>>(
-                valueListenable: _discoveryService.discoveredDevicesNotifier,
-                builder: (context, devices, _) {
+
+              ValueListenableBuilder<
+                  List<DiscoveredDevice>>(
+                valueListenable:
+                    _discoveryService
+                        .discoveredDevicesNotifier,
+                builder: (
+                  context,
+                  devices,
+                  _,
+                ) {
                   if (devices.isEmpty) {
                     return Card(
                       child: Padding(
-                        padding: const EdgeInsets.all(16),
+                        padding:
+                            const EdgeInsets.all(16),
                         child: Row(
                           children: [
                             const SizedBox(
                               width: 16,
                               height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
+                              child:
+                                  CircularProgressIndicator(
+                                strokeWidth: 2,
+                              ),
                             ),
+
                             const SizedBox(width: 12),
+
                             Expanded(
                               child: Text(
                                 'Searching for DropLAN devices...',
-                                style: theme.textTheme.bodyMedium?.copyWith(
-                                  color: theme.colorScheme.onSurfaceVariant,
+                                style: theme
+                                    .textTheme
+                                    .bodyMedium
+                                    ?.copyWith(
+                                  color: theme
+                                      .colorScheme
+                                      .onSurfaceVariant,
                                 ),
                               ),
                             ),
@@ -386,71 +517,131 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                   return SizedBox(
                     height: 120,
                     child: ListView.separated(
-                      scrollDirection: Axis.horizontal,
+                      scrollDirection:
+                          Axis.horizontal,
                       itemCount: devices.length,
-                      separatorBuilder: (_, _) => const SizedBox(width: 8),
-                      itemBuilder: (context, index) {
-                        final device = devices[index];
+                      separatorBuilder: (
+                        _,
+                        _,
+                      ) =>
+                          const SizedBox(width: 8),
+                      itemBuilder: (
+                        context,
+                        index,
+                      ) {
+                        final device =
+                            devices[index];
+
                         return SizedBox(
                           width: 190,
                           child: Card(
                             child: InkWell(
-                              borderRadius: BorderRadius.circular(12),
+                              borderRadius:
+                                  BorderRadius.circular(
+                                12,
+                              ),
                               onTap: _isSendingRequest
                                   ? null
-                                  : () => _sendTransferToDevice(device),
+                                  : () =>
+                                      _sendTransferToDevice(
+                                        device,
+                                      ),
                               child: Padding(
-                                padding: const EdgeInsets.all(12),
+                                padding:
+                                    const EdgeInsets
+                                        .all(12),
                                 child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment
+                                          .start,
+                                  mainAxisAlignment:
+                                      MainAxisAlignment
+                                          .center,
                                   children: [
                                     Row(
                                       children: [
                                         Icon(
                                           Icons.devices,
                                           size: 20,
-                                          color: theme.colorScheme.primary,
+                                          color: theme
+                                              .colorScheme
+                                              .primary,
                                         ),
-                                        const SizedBox(width: 6),
+
+                                        const SizedBox(
+                                          width: 6,
+                                        ),
+
                                         Expanded(
                                           child: Text(
-                                            device.deviceName,
-                                            style: theme.textTheme.titleSmall
+                                            device
+                                                .deviceName,
+                                            style: theme
+                                                .textTheme
+                                                .titleSmall
                                                 ?.copyWith(
-                                              fontWeight: FontWeight.bold,
+                                              fontWeight:
+                                                  FontWeight
+                                                      .bold,
                                             ),
                                             maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
+                                            overflow:
+                                                TextOverflow
+                                                    .ellipsis,
                                           ),
                                         ),
                                       ],
                                     ),
-                                    const SizedBox(height: 6),
+
+                                    const SizedBox(
+                                      height: 6,
+                                    ),
+
                                     Text(
                                       '${device.host}:${device.port}',
-                                      style: theme.textTheme.bodySmall?.copyWith(
-                                        color:
-                                            theme.colorScheme.onSurfaceVariant,
+                                      style: theme
+                                          .textTheme
+                                          .bodySmall
+                                          ?.copyWith(
+                                        color: theme
+                                            .colorScheme
+                                            .onSurfaceVariant,
                                       ),
                                       maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
+                                      overflow:
+                                          TextOverflow
+                                              .ellipsis,
                                     ),
-                                    const SizedBox(height: 6),
+
+                                    const SizedBox(
+                                      height: 6,
+                                    ),
+
                                     Row(
                                       children: [
                                         const Icon(
                                           Icons.send,
                                           size: 14,
-                                          color: Colors.blue,
+                                          color:
+                                              Colors.blue,
                                         ),
-                                        const SizedBox(width: 4),
+
+                                        const SizedBox(
+                                          width: 4,
+                                        ),
+
                                         Text(
                                           'Tap to Send',
-                                          style: theme.textTheme.labelSmall
+                                          style: theme
+                                              .textTheme
+                                              .labelSmall
                                               ?.copyWith(
-                                            color: Colors.blue.shade700,
-                                            fontWeight: FontWeight.w600,
+                                            color: Colors
+                                                .blue
+                                                .shade700,
+                                            fontWeight:
+                                                FontWeight
+                                                    .w600,
                                           ),
                                         ),
                                       ],
@@ -466,34 +657,58 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                   );
                 },
               ),
+
               if (_selectedFiles.isNotEmpty) ...[
                 const SizedBox(height: 16),
+
                 Text(
                   'Selected files',
                   style: theme.textTheme.titleMedium?.copyWith(
                     fontWeight: FontWeight.w600,
                   ),
                 ),
+
                 const SizedBox(height: 8),
+
                 Expanded(
                   child: ListView.separated(
-                    itemCount: _selectedFiles.length,
-                    separatorBuilder: (_, _) => const SizedBox(height: 8),
-                    itemBuilder: (context, index) {
-                      final file = _selectedFiles[index];
+                    itemCount:
+                        _selectedFiles.length,
+                    separatorBuilder: (
+                      _,
+                      _,
+                    ) =>
+                        const SizedBox(height: 8),
+                    itemBuilder: (
+                      context,
+                      index,
+                    ) {
+                      final file =
+                          _selectedFiles[index];
+
                       return Card(
                         child: ListTile(
-                          leading: const Icon(Icons.insert_drive_file),
+                          leading: const Icon(
+                            Icons.insert_drive_file,
+                          ),
                           title: Text(
                             file.name,
                             maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
+                            overflow:
+                                TextOverflow.ellipsis,
                           ),
-                          subtitle: Text(_formatFileSize(file.size)),
+                          subtitle: Text(
+                            _formatFileSize(
+                              file.size,
+                            ),
+                          ),
                           trailing: IconButton(
-                            icon: const Icon(Icons.close),
+                            icon: const Icon(
+                              Icons.close,
+                            ),
                             tooltip: 'Remove',
-                            onPressed: () => _removeFile(index),
+                            onPressed: () =>
+                                _removeFile(index),
                           ),
                         ),
                       );
@@ -502,26 +717,39 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                 ),
               ] else
                 const Spacer(),
+
               const SizedBox(height: 16),
+
               FilledButton.icon(
                 onPressed: _pickFiles,
                 icon: const Icon(Icons.upload),
                 label: const Text('Send files'),
                 style: FilledButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 18),
-                  textStyle: theme.textTheme.titleMedium,
+                  padding:
+                      const EdgeInsets.symmetric(
+                    vertical: 18,
+                  ),
+                  textStyle:
+                      theme.textTheme.titleMedium,
                 ),
               ),
+
               const SizedBox(height: 12),
+
               OutlinedButton.icon(
                 onPressed: () {},
                 icon: const Icon(Icons.download),
                 label: const Text('Receive files'),
                 style: OutlinedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 18),
-                  textStyle: theme.textTheme.titleMedium,
+                  padding:
+                      const EdgeInsets.symmetric(
+                    vertical: 18,
+                  ),
+                  textStyle:
+                      theme.textTheme.titleMedium,
                 ),
               ),
+
               const SizedBox(height: 16),
             ],
           ),

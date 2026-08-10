@@ -14,35 +14,37 @@ class IncomingTransferDialog extends StatefulWidget {
   final PendingTransferRequest request;
 
   @override
-  State<IncomingTransferDialog> createState() => _IncomingTransferDialogState();
+  State<IncomingTransferDialog> createState() =>
+      _IncomingTransferDialogState();
 }
 
 class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
-  late int _remainingSeconds;
   Timer? _countdownTimer;
+  int _remainingSeconds = 30;
 
   @override
   void initState() {
     super.initState();
-    _remainingSeconds = 30;
-    _startCountdown();
-  }
 
-  void _startCountdown() {
-    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (_remainingSeconds <= 1) {
-        timer.cancel();
-        if (mounted) {
-          Navigator.of(context).maybePop();
+    _countdownTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (timer) {
+        if (!mounted) {
+          timer.cancel();
+          return;
         }
-      } else {
-        if (mounted) {
-          setState(() {
-            _remainingSeconds--;
-          });
+
+        if (_remainingSeconds <= 1) {
+          timer.cancel();
+          _rejectAndClose('timeout');
+          return;
         }
-      }
-    });
+
+        setState(() {
+          _remainingSeconds--;
+        });
+      },
+    );
   }
 
   @override
@@ -52,117 +54,185 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
   }
 
   static String _formatFileSize(int bytes) {
-    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024) {
+      return '$bytes B';
+    }
+
     if (bytes < 1024 * 1024) {
       return '${(bytes / 1024).toStringAsFixed(1)} KB';
     }
-    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+  }
+
+  void _acceptAndClose() {
+    _countdownTimer?.cancel();
+
+    final transferId = widget.request.transferId;
+
+    TransferService.instance.acceptIncomingRequest(transferId);
+
+    if (mounted) {
+      Navigator.of(context).pop();
+    }
+  }
+
+  void _rejectAndClose(String reason) {
+    _countdownTimer?.cancel();
+
+    final transferId = widget.request.transferId;
+
+    TransferService.instance.rejectIncomingRequest(
+      transferId,
+      reason,
+    );
+
+    if (mounted) {
+      Navigator.of(context).maybePop();
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final req = widget.request;
+    final request = widget.request;
 
-    return AlertDialog(
-      title: Row(
-        children: [
-          Icon(Icons.swap_horizontal_circle,
-              color: theme.colorScheme.primary, size: 28),
-          const SizedBox(width: 12),
-          const Expanded(
-            child: Text('Incoming Transfer'),
-          ),
-        ],
-      ),
-      content: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              '${req.senderDeviceName} wants to send you ${req.files.length} file${req.files.length > 1 ? 's' : ''}:',
-              style: theme.textTheme.bodyMedium?.copyWith(
-                fontWeight: FontWeight.w600,
+    final fileCount = request.files.length;
+    final fileLabel = fileCount == 1 ? 'file' : 'files';
+
+    return Dialog(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(
+          minWidth: 420,
+          maxWidth: 560,
+          maxHeight: 620,
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    Icons.swap_horizontal_circle,
+                    size: 32,
+                    color: theme.colorScheme.primary,
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Text(
+                      'Incoming Transfer',
+                      style: TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
               ),
-            ),
-            const SizedBox(height: 12),
-            Container(
-              decoration: BoxDecoration(
-                color: theme.colorScheme.surfaceContainerHighest
-                    .withValues(alpha: 0.5),
-                borderRadius: BorderRadius.circular(8),
+
+              const SizedBox(height: 20),
+
+              Text(
+                '${request.senderDeviceName} wants to send you '
+                '$fileCount $fileLabel.',
+                style: theme.textTheme.bodyLarge?.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
               ),
-              constraints: const BoxConstraints(maxHeight: 140),
-              child: ListView.separated(
-                shrinkWrap: true,
-                padding: const EdgeInsets.all(8),
-                itemCount: req.files.length,
-                separatorBuilder: (_, _) => const Divider(height: 8),
-                itemBuilder: (context, index) {
-                  final file = req.files[index];
-                  return Row(
-                    children: [
-                      const Icon(Icons.insert_drive_file, size: 18),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
+
+              const SizedBox(height: 16),
+
+              Container(
+                constraints: const BoxConstraints(
+                  maxHeight: 220,
+                ),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Scrollbar(
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: fileCount,
+                    padding: const EdgeInsets.symmetric(
+                      vertical: 6,
+                    ),
+                    itemBuilder: (context, index) {
+                      final file = request.files[index];
+
+                      return ListTile(
+                        dense: true,
+                        leading: const Icon(
+                          Icons.insert_drive_file,
+                        ),
+                        title: Text(
                           file.fileName,
-                          style: theme.textTheme.bodySmall,
                           overflow: TextOverflow.ellipsis,
                         ),
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        _formatFileSize(file.fileSize),
-                        style: theme.textTheme.labelSmall?.copyWith(
-                          color: theme.colorScheme.onSurfaceVariant,
+                        trailing: Text(
+                          _formatFileSize(file.fileSize),
+                          style: theme.textTheme.bodySmall,
                         ),
-                      ),
-                    ],
-                  );
-                },
+                      );
+                    },
+                  ),
+                ),
               ),
-            ),
-            const SizedBox(height: 12),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  'Total size: ${_formatFileSize(req.totalSize)}',
-                  style: theme.textTheme.labelLarge?.copyWith(
-                    fontWeight: FontWeight.bold,
+
+              const SizedBox(height: 16),
+
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Total: ${_formatFileSize(request.totalSize)}',
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
                   ),
-                ),
-                Text(
-                  'Expires in ${_remainingSeconds}s',
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: Colors.orange.shade800,
-                    fontWeight: FontWeight.bold,
+                  Text(
+                    '$_remainingSeconds s',
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      fontWeight: FontWeight.bold,
+                      color: _remainingSeconds <= 10
+                          ? theme.colorScheme.error
+                          : theme.colorScheme.primary,
+                    ),
                   ),
-                ),
-              ],
-            ),
-          ],
+                ],
+              ),
+
+              const SizedBox(height: 20),
+
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    onPressed: () {
+                      _rejectAndClose('user_rejected');
+                    },
+                    child: const Text('Reject'),
+                  ),
+                  const SizedBox(width: 12),
+                  FilledButton.icon(
+                    onPressed: _acceptAndClose,
+                    icon: const Icon(Icons.check),
+                    label: const Text('Accept'),
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
-      actions: [
-        TextButton(
-          onPressed: () {
-            TransferService.instance
-                .rejectIncomingRequest(req.transferId, 'user_rejected');
-            Navigator.of(context).pop();
-          },
-          child: const Text('Reject'),
-        ),
-        FilledButton(
-          onPressed: () {
-            TransferService.instance.acceptIncomingRequest(req.transferId);
-            Navigator.of(context).pop();
-          },
-          child: const Text('Accept'),
-        ),
-      ],
     );
   }
 }
