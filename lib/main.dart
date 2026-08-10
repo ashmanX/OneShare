@@ -162,18 +162,21 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (kDebugMode) {
+      debugPrint('[DropLAN Timestamp] ANDROID lifecycle: ${state.name}');
+    }
+
     if (state == AppLifecycleState.resumed) {
-      _startServicesIfForeground();
+      _startServicesIfForeground(isResume: true);
       return;
     }
 
-    if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.detached) {
+    if (state == AppLifecycleState.detached) {
       _stopServices();
     }
   }
 
-  Future<void> _startServicesIfForeground() async {
+  Future<void> _startServicesIfForeground({bool isResume = false}) async {
     final lifecycleState =
         WidgetsBinding.instance.lifecycleState;
 
@@ -189,6 +192,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       await _discoveryService.startAdvertising(
         _deviceName,
         DropLanConfig.port,
+        isResume: isResume,
       );
 
       await _discoveryService.startDiscovery();

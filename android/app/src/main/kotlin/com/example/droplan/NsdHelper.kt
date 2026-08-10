@@ -25,6 +25,10 @@ class NsdHelper(context: Context) {
     private val resolveQueue = LinkedList<NsdServiceInfo>()
     private var isResolving = false
 
+    private var activeServiceName: String? = null
+    private var activePort: Int = 0
+    private var isRegistered = false
+
     var eventSink: EventChannel.EventSink? = null
 
     companion object {
@@ -47,6 +51,15 @@ class NsdHelper(context: Context) {
     }
 
     fun startAdvertising(serviceName: String, port: Int) {
+        registerServiceInternal(serviceName, port, 0)
+    }
+
+    private fun registerServiceInternal(serviceName: String, port: Int, retryCount: Int) {
+        if (isRegistered && activeServiceName == serviceName && activePort == port && registrationListener != null) {
+            Log.d(TAG, "Already advertising $serviceName:$port cleanly")
+            return
+        }
+
         stopAdvertising()
 
         val serviceInfo = NsdServiceInfo().apply {
@@ -55,6 +68,9 @@ class NsdHelper(context: Context) {
             this.port = port
         }
 
+        activeServiceName = serviceName
+        activePort = port
+
         val listener = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
                 Log.d(
@@ -62,19 +78,33 @@ class NsdHelper(context: Context) {
                     "Registered: ${serviceInfo.serviceName} " +
                         "${serviceInfo.serviceType}:${serviceInfo.port}"
                 )
+                postToMain {
+                    isRegistered = true
+                }
             }
 
             override fun onRegistrationFailed(
                 serviceInfo: NsdServiceInfo,
                 errorCode: Int
             ) {
-                Log.e(TAG, "Registration failed: $errorCode")
-                postToMain { registrationListener = null }
+                Log.e(TAG, "Registration failed: $errorCode (retry $retryCount)")
+                postToMain {
+                    registrationListener = null
+                    isRegistered = false
+                    if (retryCount < 3) {
+                        mainHandler.postDelayed({
+                            registerServiceInternal(serviceName, port, retryCount + 1)
+                        }, 500)
+                    }
+                }
             }
 
             override fun onServiceUnregistered(arg0: NsdServiceInfo) {
                 Log.d(TAG, "Service unregistered")
-                postToMain { registrationListener = null }
+                postToMain {
+                    registrationListener = null
+                    isRegistered = false
+                }
             }
 
             override fun onUnregistrationFailed(
@@ -82,7 +112,10 @@ class NsdHelper(context: Context) {
                 errorCode: Int
             ) {
                 Log.e(TAG, "Unregistration failed: $errorCode")
-                postToMain { registrationListener = null }
+                postToMain {
+                    registrationListener = null
+                    isRegistered = false
+                }
             }
         }
 
@@ -97,12 +130,19 @@ class NsdHelper(context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "registerService exception", e)
             registrationListener = null
+            isRegistered = false
+            if (retryCount < 3) {
+                mainHandler.postDelayed({
+                    registerServiceInternal(serviceName, port, retryCount + 1)
+                }, 500)
+            }
         }
     }
 
     fun stopAdvertising() {
         val listener = registrationListener ?: return
         registrationListener = null
+        isRegistered = false
 
         try {
             nsdManager.unregisterService(listener)

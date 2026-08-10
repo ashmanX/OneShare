@@ -56,35 +56,79 @@ class DropLanDiscoveryService {
 
   final Map<String, DiscoveredDevice> _discoveredDevices = {};
 
-  Future startAdvertising(String deviceName, int port) async {
+  bool _isAdvertising = false;
+  bool _isDiscovering = false;
+  String? _lastAdvertisedName;
+  int? _lastAdvertisedPort;
+
+  bool get isAdvertising => _isAdvertising;
+  bool get isDiscovering => _isDiscovering;
+
+  Future<void> startAdvertising(String deviceName, int port,
+      {bool isResume = false}) async {
     if (!Platform.isAndroid && !Platform.isMacOS) {
       return;
     }
+
+    if (_isAdvertising &&
+        _lastAdvertisedName == deviceName &&
+        _lastAdvertisedPort == port &&
+        !isResume) {
+      return;
+    }
+
+    _lastAdvertisedName = deviceName;
+    _lastAdvertisedPort = port;
 
     try {
       await _controlChannel.invokeMethod('startAdvertising', {
         'deviceName': deviceName,
         'port': port,
       });
+      _isAdvertising = true;
+      if (kDebugMode) {
+        if (isResume) {
+          debugPrint(
+              '[DropLAN Timestamp] ANDROID advertising: restarted after resume (name=$deviceName, port=$port)');
+        } else {
+          debugPrint(
+              '[DropLAN Timestamp] ANDROID advertising: started (name=$deviceName, port=$port)');
+        }
+      }
     } catch (error) {
-      print('DropLAN discovery: startAdvertising failed: $error');
+      if (kDebugMode) {
+        debugPrint('DropLAN discovery: startAdvertising failed: $error');
+      }
     }
   }
 
-  Future stopAdvertising() async {
+  Future<void> stopAdvertising() async {
     if (!Platform.isAndroid && !Platform.isMacOS) {
       return;
     }
 
     try {
       await _controlChannel.invokeMethod('stopAdvertising');
+      _isAdvertising = false;
+      if (kDebugMode &&
+          _lastAdvertisedName != null &&
+          _lastAdvertisedPort != null) {
+        debugPrint(
+            '[DropLAN Timestamp] ANDROID advertising: stopped (name=$_lastAdvertisedName, port=$_lastAdvertisedPort)');
+      }
     } catch (error) {
-      print('DropLAN discovery: stopAdvertising failed: $error');
+      if (kDebugMode) {
+        debugPrint('DropLAN discovery: stopAdvertising failed: $error');
+      }
     }
   }
 
-  Future startDiscovery() async {
+  Future<void> startDiscovery() async {
     if (!Platform.isAndroid && !Platform.isMacOS) {
+      return;
+    }
+
+    if (_isDiscovering) {
       return;
     }
 
@@ -93,12 +137,18 @@ class DropLanDiscoveryService {
 
     try {
       await _controlChannel.invokeMethod('startDiscovery');
+      _isDiscovering = true;
+      if (kDebugMode) {
+        debugPrint('[DropLAN Timestamp] ANDROID discovery: started');
+      }
     } catch (error) {
-      print('DropLAN discovery: startDiscovery failed: $error');
+      if (kDebugMode) {
+        debugPrint('DropLAN discovery: startDiscovery failed: $error');
+      }
     }
   }
 
-  Future stopDiscovery() async {
+  Future<void> stopDiscovery() async {
     if (!Platform.isAndroid && !Platform.isMacOS) {
       return;
     }
@@ -108,8 +158,14 @@ class DropLanDiscoveryService {
 
     try {
       await _controlChannel.invokeMethod('stopDiscovery');
+      _isDiscovering = false;
+      if (kDebugMode) {
+        debugPrint('[DropLAN Timestamp] ANDROID discovery: stopped');
+      }
     } catch (error) {
-      print('DropLAN discovery: stopDiscovery failed: $error');
+      if (kDebugMode) {
+        debugPrint('DropLAN discovery: stopDiscovery failed: $error');
+      }
     }
   }
 
