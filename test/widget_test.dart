@@ -7,10 +7,10 @@ void main() {
     // Build our app and trigger a frame.
     await tester.pumpWidget(const DropLanApp());
 
-    // Verify that AirShare branding, Nearby Devices subtitle, and main action render.
+    // Verify that AirShare branding, subtitle, radar text, and main action render.
     expect(find.text('AirShare'), findsOneWidget);
-    expect(find.text('Nearby Devices'), findsOneWidget);
-    expect(find.text('Select Files to send'), findsOneWidget);
-    expect(find.text('Scanning for nearby devices...'), findsOneWidget);
+    expect(find.text('Share files wirelessly with nearby devices.'), findsOneWidget);
+    expect(find.text('Select Files to Send'), findsOneWidget);
+    expect(find.text('Scanning for devices...'), findsOneWidget);
   });
 }
