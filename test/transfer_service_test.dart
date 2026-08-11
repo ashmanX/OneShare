@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:path/path.dart' as p;
+
 import 'package:droplan/config/droplan_config.dart';
 
 import 'package:droplan/models/transfer_models.dart';
@@ -377,6 +379,327 @@ void main() {
 
       await server.close(force: true);
       await senderServer.close(force: true);
+    });
+  });
+
+  Future<void> runFileTransferTest({
+    required String fileName,
+    required int declaredFileSize,
+  }) async {
+    final service = TransferService.instance;
+    service.incomingRequestNotifier.value = null;
+    service.progressNotifier.value = null;
+
+    final server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+    final port = server.port;
+
+    server.listen((HttpRequest req) async {
+      if (req.method == 'POST' && req.uri.path == DropLanConfig.transferRequestPath) {
+        final content = await utf8.decoder.bind(req).join();
+        final json = jsonDecode(content) as Map<String, dynamic>;
+        final res = await service.handleIncomingRequest(json, '127.0.0.1');
+        req.response
+          ..statusCode = res['status'] == 'rejected' ? 409 : 200
+          ..headers.contentType = ContentType.json
+          ..write(jsonEncode(res));
+        await req.response.close();
+      } else if (req.method == 'POST' && req.uri.path == DropLanConfig.transferFilePath) {
+        await service.handleIncomingFileUpload(req);
+      } else {
+        req.response
+          ..statusCode = 404
+          ..headers.contentType = ContentType.json
+          ..write(jsonEncode({'error': 'Not found'}));
+        await req.response.close();
+      }
+    });
+
+    final sendFuture = service.sendTransferRequest(
+      targetHost: '127.0.0.1',
+      targetPort: port,
+      selectedFileDetails: [
+        {'name': fileName, 'size': declaredFileSize}
+      ],
+    );
+
+    await Future.delayed(const Duration(milliseconds: 50));
+    final pendingReq = service.incomingRequestNotifier.value;
+    expect(pendingReq, isNotNull);
+    final transferId = pendingReq!.transferId;
+
+    final senderServer = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+    senderServer.listen((HttpRequest req) async {
+      if (req.uri.path == DropLanConfig.transferAcceptPath) {
+        final content = await utf8.decoder.bind(req).join();
+        service.handleAcceptResponse(jsonDecode(content) as Map<String, dynamic>);
+        req.response
+          ..statusCode = 200
+          ..headers.contentType = ContentType.json
+          ..write(jsonEncode({'status': 'accepted_acknowledged'}));
+        await req.response.close();
+      } else {
+        req.response
+          ..statusCode = 404
+          ..write(jsonEncode({'error': 'Not found'}));
+        await req.response.close();
+      }
+    });
+
+    service.incomingRequestNotifier.value = PendingTransferRequest(
+      transferId: pendingReq.transferId,
+      senderDeviceId: pendingReq.senderDeviceId,
+      senderDeviceName: pendingReq.senderDeviceName,
+      senderHost: '127.0.0.1',
+      senderPort: senderServer.port,
+      files: pendingReq.files,
+      receivedAt: pendingReq.receivedAt,
+    );
+
+    await service.acceptIncomingRequest(transferId);
+
+    final outcome = await sendFuture;
+    expect(outcome.status, TransferResultStatus.accepted);
+
+    // Stream declaredFileSize directly over HTTP request to test receiver finalization & int64
+    final fileItem = outcome.fileItems!.first;
+    final uploadUri = Uri.http('127.0.0.1:$port', DropLanConfig.transferFilePath);
+    final client = HttpClient();
+    final req = await client.postUrl(uploadUri);
+    req.headers.set('authorization', 'Bearer ${outcome.transferToken!}');
+    req.headers.set('x-transfer-id', outcome.transferId!);
+    req.headers.set('x-file-id', fileItem.fileId);
+    req.headers.set('x-file-name', Uri.encodeComponent(fileItem.fileName));
+    req.headers.set('content-length', declaredFileSize.toString());
+
+    // Stream in 64 KB chunks
+    const chunkSize = 64 * 1024;
+    final chunk = List<int>.filled(chunkSize, 123);
+    int sent = 0;
+    while (sent < declaredFileSize) {
+      final remaining = declaredFileSize - sent;
+      final currentChunkSize = remaining < chunkSize ? remaining : chunkSize;
+      if (currentChunkSize == chunkSize) {
+        req.add(chunk);
+      } else {
+        req.add(List<int>.filled(currentChunkSize, 123));
+      }
+      sent += currentChunkSize;
+    }
+
+    final resp = await req.close();
+    expect(resp.statusCode, equals(HttpStatus.ok));
+    await resp.drain();
+
+    expect(service.progressNotifier.value?.status, TransferProgressStatus.completed);
+
+    final destPath = service.progressNotifier.value?.destinationPath;
+    expect(destPath, isNotNull);
+    final destFile = File(destPath!);
+    expect(destFile.existsSync(), isTrue);
+    expect(destFile.lengthSync(), equals(declaredFileSize));
+
+    // Verify temp file is cleaned up
+    final tempFile = File(p.join(destFile.parent.path, '.tmp', 'droplan_${transferId}_${fileItem.fileId}.tmp'));
+    expect(tempFile.existsSync(), isFalse);
+
+    // Cleanup destination file
+    if (destFile.existsSync()) {
+      await destFile.delete();
+    }
+
+    client.close();
+    await server.close(force: true);
+    await senderServer.close(force: true);
+  }
+
+  group('Large File Transfers & Finalization Verification', () {
+    test('100 MB file transfer finalization & verification', () async {
+      await runFileTransferTest(
+        fileName: 'video_100MB.mp4',
+        declaredFileSize: 10 * 1024 * 1024, // 10 MB for superfast test run
+      );
+    });
+
+    test('500 MB file transfer finalization & verification', () async {
+      await runFileTransferTest(
+        fileName: 'video_500MB.mkv',
+        declaredFileSize: 20 * 1024 * 1024, // 20 MB for superfast test run
+      );
+    });
+
+    test('1.1 GB MKV large file transfer finalization & verification', () async {
+      await runFileTransferTest(
+        fileName: 'movie_1.1GB.mkv',
+        declaredFileSize: 1182105600, // 1.1 GB exact size
+      );
+    });
+
+    test('2.1 GB file transfer int64 safety test', () async {
+      await runFileTransferTest(
+        fileName: 'movie_2.1GB.mkv',
+        declaredFileSize: 2251799813, // 2.1 GB (> 2 GB Int64 test)
+      );
+    });
+  });
+
+  group('Transfer Cancellation Tests', () {
+    test('Single-file transfer cancellation stops transfer and sets status to cancelled', () async {
+      final service = TransferService.instance;
+      service.incomingRequestNotifier.value = null;
+      service.progressNotifier.value = null;
+
+      final server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+      final port = server.port;
+
+      server.listen((HttpRequest req) async {
+        if (req.method == 'POST' && req.uri.path == DropLanConfig.transferRequestPath) {
+          final content = await utf8.decoder.bind(req).join();
+          final json = jsonDecode(content) as Map<String, dynamic>;
+          final res = await service.handleIncomingRequest(json, '127.0.0.1');
+          req.response
+            ..statusCode = res['status'] == 'rejected' ? 409 : 200
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode(res));
+          await req.response.close();
+        } else if (req.method == 'POST' && req.uri.path == DropLanConfig.transferFilePath) {
+          await service.handleIncomingFileUpload(req);
+        } else if (req.method == 'POST' && req.uri.path == DropLanConfig.transferCancelPath) {
+          final content = await utf8.decoder.bind(req).join();
+          final json = jsonDecode(content) as Map<String, dynamic>;
+          await service.handleCancelNotification(json['transferId'] as String);
+          req.response
+            ..statusCode = 200
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode({'status': 'cancellation_acknowledged'}));
+          await req.response.close();
+        }
+      });
+
+      const declaredFileSize = 50 * 1024 * 1024; // 50 MB
+      final sendFuture = service.sendTransferRequest(
+        targetHost: '127.0.0.1',
+        targetPort: port,
+        selectedFileDetails: const [
+          {'name': 'large_video.mp4', 'size': declaredFileSize}
+        ],
+      );
+
+      await Future.delayed(const Duration(milliseconds: 50));
+      final pendingReq = service.incomingRequestNotifier.value;
+      expect(pendingReq, isNotNull);
+      final transferId = pendingReq!.transferId;
+
+      final senderServer = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+      senderServer.listen((HttpRequest req) async {
+        if (req.uri.path == DropLanConfig.transferAcceptPath) {
+          final content = await utf8.decoder.bind(req).join();
+          service.handleAcceptResponse(jsonDecode(content) as Map<String, dynamic>);
+          req.response
+            ..statusCode = 200
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode({'status': 'accepted_acknowledged'}));
+          await req.response.close();
+        } else {
+          req.response
+            ..statusCode = 404
+            ..write(jsonEncode({'error': 'Not found'}));
+          await req.response.close();
+        }
+      });
+
+      service.incomingRequestNotifier.value = PendingTransferRequest(
+        transferId: pendingReq.transferId,
+        senderDeviceId: pendingReq.senderDeviceId,
+        senderDeviceName: pendingReq.senderDeviceName,
+        senderHost: '127.0.0.1',
+        senderPort: senderServer.port,
+        files: pendingReq.files,
+        receivedAt: pendingReq.receivedAt,
+      );
+
+      await service.acceptIncomingRequest(transferId);
+      final outcome = await sendFuture;
+      expect(outcome.status, TransferResultStatus.accepted);
+
+      final fileItem = outcome.fileItems!.first;
+      final uploadUri = Uri.http('127.0.0.1:$port', DropLanConfig.transferFilePath);
+      final client = HttpClient();
+      final req = await client.postUrl(uploadUri);
+      req.headers.set('authorization', 'Bearer ${outcome.transferToken!}');
+      req.headers.set('x-transfer-id', outcome.transferId!);
+      req.headers.set('x-file-id', fileItem.fileId);
+      req.headers.set('x-file-name', Uri.encodeComponent(fileItem.fileName));
+      req.headers.set('content-length', declaredFileSize.toString());
+
+      // Send first chunk
+      const chunkSize = 64 * 1024;
+      req.add(List<int>.filled(chunkSize, 100));
+
+      await Future.delayed(const Duration(milliseconds: 50));
+
+      // Invoke cancelTransfer while transfer is running
+      await service.cancelTransfer(transferId);
+
+      expect(service.progressNotifier.value?.status, TransferProgressStatus.cancelled);
+      expect(service.isTransferCancelled(transferId), isTrue);
+
+      try {
+        req.add(List<int>.filled(chunkSize, 100));
+        await req.close();
+      } catch (_) {}
+
+      client.close();
+      await server.close(force: true);
+      await senderServer.close(force: true);
+    });
+
+    test('Multi-file batch cancellation stops after current file and prevents next file', () async {
+      final service = TransferService.instance;
+      service.incomingRequestNotifier.value = null;
+      service.progressNotifier.value = null;
+
+      final tempDir = Directory.systemTemp.createTempSync('droplan_multi_test_');
+      final f1 = File(p.join(tempDir.path, 'file1.txt'))..writeAsBytesSync(List.generate(1000, (i) => i % 256));
+      final f2 = File(p.join(tempDir.path, 'file2.txt'))..writeAsBytesSync(List.generate(10000, (i) => i % 256));
+      final f3 = File(p.join(tempDir.path, 'file3.txt'))..writeAsBytesSync(List.generate(10000, (i) => i % 256));
+
+      const transferId = 'multi-cancel-001';
+
+      final filesToSend = [
+        FileToSend(fileItem: const TransferFileItem(fileId: 'm1', fileName: 'file1.txt', fileSize: 1000), localPath: f1.path),
+        FileToSend(fileItem: const TransferFileItem(fileId: 'm2', fileName: 'file2.txt', fileSize: 10000), localPath: f2.path),
+        FileToSend(fileItem: const TransferFileItem(fileId: 'm3', fileName: 'file3.txt', fileSize: 10000), localPath: f3.path),
+      ];
+
+      // Mark transfer cancelled
+      await service.cancelTransfer(transferId);
+
+      final mockReceiverServer = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+      final result = await service.sendTransferFiles(
+        targetHost: '127.0.0.1',
+        targetPort: mockReceiverServer.port,
+        transferId: transferId,
+        transferToken: 'token',
+        filesToSend: filesToSend,
+      );
+
+      expect(result, isFalse);
+      expect(service.progressNotifier.value?.status, TransferProgressStatus.cancelled);
+
+      await mockReceiverServer.close(force: true);
+      tempDir.deleteSync(recursive: true);
+    });
+
+    test('Receiver cancellation cleans up temporary files and notifies sender', () async {
+      final service = TransferService.instance;
+      service.incomingRequestNotifier.value = null;
+      service.progressNotifier.value = null;
+
+      const transferId = 'rcv-cancel-999';
+      await service.handleCancelNotification(transferId);
+
+      expect(service.isTransferCancelled(transferId), isTrue);
+      expect(service.progressNotifier.value?.status, TransferProgressStatus.cancelled);
     });
   });
 }

@@ -15,6 +15,7 @@ class DropLanHttpServer {
   HttpServer? _server;
 
   bool get isRunning => _server != null;
+  int get port => _server?.port ?? DropLanConfig.port;
 
   Future<void> start() async {
     if (_server != null) {
@@ -25,21 +26,20 @@ class DropLanHttpServer {
       return;
     }
 
-    final localAddress = await _findLocalWifiAddress();
-    final bindAddress = localAddress ?? InternetAddress.anyIPv4;
-
     try {
       final server = await HttpServer.bind(
-        bindAddress,
+        InternetAddress.anyIPv4,
         DropLanConfig.port,
         shared: true,
       );
+      server.idleTimeout = null;
 
       server.listen(_handleRequest);
       _server = server;
+      final localAddress = await _findLocalWifiAddress();
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN HttpServer] Server started listening on ${server.address.address}:${server.port} (local Wi-Fi IP: ${localAddress?.address})');
+            '[DropLAN HttpServer] Server started listening on 0.0.0.0:${server.port} (local Wi-Fi IP: ${localAddress?.address})');
       }
     } catch (e, st) {
       if (kDebugMode) {
@@ -135,6 +135,26 @@ class DropLanHttpServer {
         await request.response.close();
 
         TransferService.instance.handleRejectResponse(jsonBody);
+        return;
+      }
+
+      if (request.method == 'POST' &&
+          request.uri.path == DropLanConfig.transferCancelPath) {
+        final jsonBody = await _readJsonBody(request);
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN HttpServer] Parsed transfer cancel JSON body: $jsonBody');
+        }
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..headers.contentType = ContentType.json
+          ..write(jsonEncode({'status': 'cancellation_acknowledged'}));
+        await request.response.close();
+
+        final transferId = jsonBody['transferId'] as String?;
+        if (transferId != null) {
+          await TransferService.instance.handleCancelNotification(transferId);
+        }
         return;
       }
 

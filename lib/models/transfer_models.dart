@@ -124,6 +124,37 @@ enum TransferProgressStatus {
   transferring,
   completed,
   failed,
+  cancelled,
+}
+
+enum FileTransferStatus {
+  waiting,
+  transferring,
+  completed,
+  failed,
+  cancelled,
+}
+
+class PerFileTransferState {
+  const PerFileTransferState({
+    required this.fileId,
+    required this.fileName,
+    required this.fileSize,
+    required this.bytesTransferred,
+    required this.status,
+    this.errorMessage,
+  });
+
+  final String fileId;
+  final String fileName;
+  final int fileSize;
+  final int bytesTransferred;
+  final FileTransferStatus status;
+  final String? errorMessage;
+
+  double get progress => fileSize == 0
+      ? 1.0
+      : (bytesTransferred / fileSize).clamp(0.0, 1.0);
 }
 
 class TransferProgressState {
@@ -137,6 +168,7 @@ class TransferProgressState {
     required this.overallBytesTransferred,
     required this.overallTotalBytes,
     required this.status,
+    this.files = const [],
     this.errorMessage,
     this.destinationPath,
   });
@@ -150,6 +182,7 @@ class TransferProgressState {
   final int overallBytesTransferred;
   final int overallTotalBytes;
   final TransferProgressStatus status;
+  final List<PerFileTransferState> files;
   final String? errorMessage;
   final String? destinationPath;
 
