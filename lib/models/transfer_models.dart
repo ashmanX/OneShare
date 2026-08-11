@@ -187,11 +187,11 @@ class TransferProgressState {
   final String? destinationPath;
 
   double get currentFileProgress => currentFileSizeBytes == 0
-      ? 1.0
+      ? 0.0
       : (currentFileBytesTransferred / currentFileSizeBytes).clamp(0.0, 1.0);
 
   double get overallProgress => overallTotalBytes == 0
-      ? 1.0
+      ? 0.0
       : (overallBytesTransferred / overallTotalBytes).clamp(0.0, 1.0);
 }
 

@@ -134,15 +134,15 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
 
     return Dialog(
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(28),
-        side: const BorderSide(color: Color(0xFF1F2232), width: 1),
+        borderRadius: BorderRadius.circular(24),
+        side: const BorderSide(color: Color(0xFF242838), width: 1),
       ),
-      backgroundColor: const Color(0xFF12141D),
+      backgroundColor: const Color(0xFF161822),
       elevation: 20,
       child: ConstrainedBox(
         constraints: const BoxConstraints(
           minWidth: 320,
-          maxWidth: 440,
+          maxWidth: 420,
           maxHeight: 560,
         ),
         child: Padding(
@@ -154,11 +154,11 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
               Row(
                 children: [
                   Container(
-                    width: 56,
-                    height: 56,
+                    width: 52,
+                    height: 52,
                     alignment: Alignment.center,
                     decoration: BoxDecoration(
-                      color: const Color(0xFF1A233D),
+                      color: const Color(0xFF182642),
                       borderRadius: BorderRadius.circular(16),
                     ),
                     child: const Icon(
@@ -173,15 +173,14 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          'Incoming\nTransfer',
+                          'Incoming Transfer',
                           style: GoogleFonts.plusJakartaSans(
-                            fontSize: 20,
-                            fontWeight: FontWeight.w800,
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
                             color: Colors.white,
-                            height: 1.15,
                           ),
                         ),
-                        const SizedBox(height: 4),
+                        const SizedBox(height: 3),
                         Row(
                           children: [
                             Text(
@@ -211,28 +210,42 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
                 ],
               ),
 
-              const SizedBox(height: 20),
+              const SizedBox(height: 18),
 
-              Text(
-                'Wants to share $fileCount $fileLabel with you:',
-                style: GoogleFonts.plusJakartaSans(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
-                  color: const Color(0xFF8E95A5),
+              RichText(
+                text: TextSpan(
+                  children: [
+                    TextSpan(
+                      text: request.senderDeviceName,
+                      style: GoogleFonts.plusJakartaSans(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                        color: const Color(0xFF38BDF8),
+                      ),
+                    ),
+                    TextSpan(
+                      text: ' wants to share $fileCount $fileLabel with you:',
+                      style: GoogleFonts.plusJakartaSans(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500,
+                        color: const Color(0xFF94A3B8),
+                      ),
+                    ),
+                  ],
                 ),
               ),
 
-              const SizedBox(height: 10),
+              const SizedBox(height: 12),
 
               Container(
                 constraints: const BoxConstraints(
                   maxHeight: 200,
                 ),
                 decoration: BoxDecoration(
-                  color: const Color(0xFF090B10),
+                  color: const Color(0xFF0F111A),
                   borderRadius: BorderRadius.circular(16),
                   border: Border.all(
-                    color: const Color(0xFF1F2232),
+                    color: const Color(0xFF222636),
                   ),
                 ),
                 child: Scrollbar(
@@ -244,7 +257,7 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
                     ),
                     separatorBuilder: (_, _) => const Divider(
                       height: 1,
-                      color: Color(0xFF1F2232),
+                      color: Color(0xFF222636),
                     ),
                     itemBuilder: (context, index) {
                       final file = request.files[index];
@@ -261,8 +274,8 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
                               height: 40,
                               alignment: Alignment.center,
                               decoration: BoxDecoration(
-                                color: const Color(0xFF1A233D),
-                                borderRadius: BorderRadius.circular(10),
+                                color: const Color(0xFF182642),
+                                borderRadius: BorderRadius.circular(12),
                               ),
                               child: const Icon(
                                 Icons.insert_drive_file_rounded,
@@ -272,23 +285,28 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
                             ),
                             const SizedBox(width: 12),
                             Expanded(
-                              child: Text(
-                                file.fileName,
-                                overflow: TextOverflow.ellipsis,
-                                style: GoogleFonts.plusJakartaSans(
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.w700,
-                                  color: Colors.white,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            Text(
-                              _formatFileSize(file.fileSize),
-                              style: GoogleFonts.plusJakartaSans(
-                                fontSize: 13,
-                                fontWeight: FontWeight.w500,
-                                color: const Color(0xFF8E95A5),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    file.fileName,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: GoogleFonts.plusJakartaSans(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    _formatFileSize(file.fileSize),
+                                    style: GoogleFonts.plusJakartaSans(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w500,
+                                      color: const Color(0xFF8E95A5),
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
                           ],
@@ -314,16 +332,16 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
                   ),
                   Container(
                     padding: const EdgeInsets.symmetric(
-                        horizontal: 14, vertical: 6),
+                        horizontal: 12, vertical: 5),
                     decoration: BoxDecoration(
                       color: _remainingSeconds <= 10
                           ? const Color(0xFFEF4444).withValues(alpha: 0.15)
-                          : const Color(0xFF1A233D),
+                          : const Color(0xFF132036),
                       borderRadius: BorderRadius.circular(20),
                       border: Border.all(
                         color: _remainingSeconds <= 10
                             ? const Color(0xFFEF4444)
-                            : const Color(0xFF38BDF8).withValues(alpha: 0.6),
+                            : const Color(0xFF233858),
                         width: 1,
                       ),
                     ),
@@ -332,17 +350,17 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
                       children: [
                         Icon(
                           Icons.timer_outlined,
-                          size: 16,
+                          size: 15,
                           color: _remainingSeconds <= 10
                               ? const Color(0xFFEF4444)
                               : const Color(0xFF38BDF8),
                         ),
-                        const SizedBox(width: 6),
+                        const SizedBox(width: 5),
                         Text(
                           '${_remainingSeconds}s',
                           style: GoogleFonts.plusJakartaSans(
                             fontSize: 13,
-                            fontWeight: FontWeight.w800,
+                            fontWeight: FontWeight.w700,
                             color: _remainingSeconds <= 10
                                 ? const Color(0xFFEF4444)
                                 : const Color(0xFF38BDF8),
@@ -361,12 +379,28 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
                   Expanded(
                     child: SizedBox(
                       height: 48,
-                      child: OutlinedButton.icon(
+                      child: FilledButton(
                         onPressed: () {
                           _rejectAndClose('user_rejected');
                         },
-                        icon: const Icon(Icons.close_rounded, size: 16),
-                        label: const FittedBox(
+                        style: FilledButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                          backgroundColor: const Color(0xFF202434),
+                          foregroundColor: const Color(0xFF38BDF8),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                            side: const BorderSide(
+                              color: Color(0xFF2A3044),
+                              width: 1,
+                            ),
+                          ),
+                          textStyle: GoogleFonts.plusJakartaSans(
+                            fontWeight: FontWeight.w700,
+                            fontSize: 13.5,
+                            letterSpacing: -0.2,
+                          ),
+                        ),
+                        child: const FittedBox(
                           fit: BoxFit.scaleDown,
                           child: Text(
                             'Decline',
@@ -374,65 +408,50 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
                             softWrap: false,
                           ),
                         ),
-                        style: OutlinedButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(horizontal: 8),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                          foregroundColor: const Color(0xFFEF4444),
-                          side: BorderSide(
-                            color: const Color(0xFFEF4444).withValues(alpha: 0.35),
-                            width: 1,
-                          ),
-                          textStyle: GoogleFonts.plusJakartaSans(
-                            fontWeight: FontWeight.w700,
-                            fontSize: 14,
-                          ),
-                        ),
                       ),
                     ),
                   ),
-                  const SizedBox(width: 10),
+                  const SizedBox(width: 12),
                   Expanded(
                     child: SizedBox(
                       height: 48,
                       child: Container(
                         decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(14),
+                          borderRadius: BorderRadius.circular(16),
                           gradient: const LinearGradient(
-                            colors: [Color(0xFF0EA5E9), Color(0xFF0284C7)],
+                            colors: [Color(0xFF2563EB), Color(0xFF3B82F6)],
                           ),
                           boxShadow: [
                             BoxShadow(
-                              color: const Color(0xFF0EA5E9)
+                              color: const Color(0xFF2563EB)
                                   .withValues(alpha: 0.35),
                               blurRadius: 10,
                               offset: const Offset(0, 3),
                             ),
                           ],
                         ),
-                        child: ElevatedButton.icon(
+                        child: ElevatedButton(
                           onPressed: _acceptAndClose,
-                          icon: const Icon(Icons.check_rounded, size: 16),
-                          label: const FittedBox(
+                          style: ElevatedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                            backgroundColor: Colors.transparent,
+                            shadowColor: Colors.transparent,
+                            foregroundColor: Colors.white,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            textStyle: GoogleFonts.plusJakartaSans(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13.5,
+                              letterSpacing: -0.2,
+                            ),
+                          ),
+                          child: const FittedBox(
                             fit: BoxFit.scaleDown,
                             child: Text(
                               'Accept',
                               maxLines: 1,
                               softWrap: false,
-                            ),
-                          ),
-                          style: ElevatedButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(horizontal: 8),
-                            backgroundColor: Colors.transparent,
-                            shadowColor: Colors.transparent,
-                            foregroundColor: Colors.white,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(14),
-                            ),
-                            textStyle: GoogleFonts.plusJakartaSans(
-                              fontWeight: FontWeight.w700,
-                              fontSize: 14,
                             ),
                           ),
                         ),

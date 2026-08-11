@@ -747,49 +747,153 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   Future<void> _confirmAndCancelTransfer() async {
     final shouldCancel = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (context) => Dialog(
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(20),
-          side: const BorderSide(color: Color(0xFF19233A), width: 1),
+          borderRadius: BorderRadius.circular(24),
+          side: const BorderSide(color: Color(0xFF242838), width: 1),
         ),
-        backgroundColor: const Color(0xFF0B1220),
-        title: Text(
-          'Cancel transfer?',
-          style: GoogleFonts.plusJakartaSans(
-            fontSize: 18,
-            fontWeight: FontWeight.bold,
-            color: Colors.white,
-          ),
-        ),
-        content: Text(
-          'The current transfer will be stopped.',
-          style: GoogleFonts.plusJakartaSans(
-            fontSize: 14,
-            color: const Color(0xFFCBD5E1),
-          ),
-        ),
-        actions: [
-          OutlinedButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            style: OutlinedButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-              foregroundColor: const Color(0xFFCBD5E1),
-              side: const BorderSide(color: Color(0xFF263044)),
+        backgroundColor: const Color(0xFF161822),
+        elevation: 20,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child: Padding(
+            padding: const EdgeInsets.all(22),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      width: 52,
+                      height: 52,
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF2D1D24),
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: const Icon(
+                        Icons.cancel_outlined,
+                        size: 26,
+                        color: Color(0xFFEF4444),
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Cancel Transfer?',
+                            style: GoogleFonts.plusJakartaSans(
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            'The current transfer will be stopped.',
+                            style: GoogleFonts.plusJakartaSans(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w500,
+                              color: const Color(0xFF94A3B8),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 24),
+                Row(
+                  children: [
+                    Expanded(
+                      child: SizedBox(
+                        height: 48,
+                        child: FilledButton(
+                          onPressed: () => Navigator.of(context).pop(false),
+                          style: FilledButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                            backgroundColor: const Color(0xFF202434),
+                            foregroundColor: const Color(0xFF38BDF8),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(16),
+                              side: const BorderSide(
+                                color: Color(0xFF2A3044),
+                                width: 1,
+                              ),
+                            ),
+                            textStyle: GoogleFonts.plusJakartaSans(
+                              fontWeight: FontWeight.w700,
+                              fontSize: 13.5,
+                              letterSpacing: -0.2,
+                            ),
+                          ),
+                          child: const FittedBox(
+                            fit: BoxFit.scaleDown,
+                            child: Text(
+                              'Keep Transferring',
+                              maxLines: 1,
+                              softWrap: false,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: SizedBox(
+                        height: 48,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(16),
+                            gradient: const LinearGradient(
+                              colors: [Color(0xFFEF4444), Color(0xFFDC2626)],
+                            ),
+                            boxShadow: [
+                              BoxShadow(
+                                color: const Color(0xFFEF4444)
+                                    .withValues(alpha: 0.35),
+                                blurRadius: 10,
+                                offset: const Offset(0, 3),
+                              ),
+                            ],
+                          ),
+                          child: ElevatedButton(
+                            onPressed: () => Navigator.of(context).pop(true),
+                            style: ElevatedButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(horizontal: 10),
+                              backgroundColor: Colors.transparent,
+                              shadowColor: Colors.transparent,
+                              foregroundColor: Colors.white,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(16),
+                              ),
+                              textStyle: GoogleFonts.plusJakartaSans(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13.5,
+                                letterSpacing: -0.2,
+                              ),
+                            ),
+                            child: const FittedBox(
+                              fit: BoxFit.scaleDown,
+                              child: Text(
+                                'Cancel Transfer',
+                                maxLines: 1,
+                                softWrap: false,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
             ),
-            child: const Text('Keep transferring'),
           ),
-          FilledButton(
-            onPressed: () => Navigator.of(context).pop(true),
-            style: FilledButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-              backgroundColor: const Color(0xFFEF4444),
-              foregroundColor: Colors.white,
-            ),
-            child: const Text('Cancel transfer'),
-          ),
-        ],
+        ),
       ),
     );
 
@@ -813,8 +917,8 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       setState(() {
         _selectedFiles.clear();
         _isSendingRequest = false;
-        _activeTransferSessionId = null;
-        _currentScreen = AppScreen.home;
+        // Keep screen on SC3 so the user sees 'Transfer Cancelled' and the Done button.
+        // Tapping Done will clear notifiers and return to Home.
       });
     }
   }
@@ -824,15 +928,14 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   // ──────────────────────────────────────────────────────────
 
   void _onDone() {
-    // BUG-11 FIX: Clear both split progress notifiers.
-    // BUG-15/03 FIX: Clear _activeTransferSessionId first so the listener
-    // will ignore any in-flight late progress updates that arrive after Done.
-    setState(() {
-      _activeTransferSessionId = null;
-    });
+    // Clear split progress notifiers first
     TransferService.instance.sendProgressNotifier.value = null;
     TransferService.instance.receiveProgressNotifier.value = null;
+
+    if (!mounted) return;
+    // Perform a single atomic setState call to avoid mid-frame rebuild flashes
     setState(() {
+      _activeTransferSessionId = null;
       _selectedFiles.clear();
       _isSendingRequest = false;
       _currentScreen = AppScreen.home;
@@ -853,10 +956,39 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
         ? (sendState ?? receiveState)
         : (receiveState ?? sendState);
 
-    // Black Screen Prevention Guard: If screen is SC3 but no progress exists, reset to Home.
+    // Compute effective screen immutably without mutating _currentScreen during build
+    final effectiveScreen = (_currentScreen == AppScreen.sc3 && progressState == null)
+        ? AppScreen.home
+        : _currentScreen;
+
     if (_currentScreen == AppScreen.sc3 && progressState == null) {
-      _currentScreen = AppScreen.home;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          setState(() {
+            _currentScreen = AppScreen.home;
+          });
+        }
+      });
     }
+
+    final isMacOS = defaultTargetPlatform == TargetPlatform.macOS;
+    final Widget screenContent = switch (effectiveScreen) {
+      AppScreen.home => _buildHomeScreen(context),
+      AppScreen.sc2 => _buildSC2Screen(context),
+      AppScreen.sc3 => _buildSC3Screen(context, progressState),
+    };
+
+    final Widget bodyWidget = isMacOS
+        ? Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 720),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: screenContent,
+              ),
+            ),
+          )
+        : screenContent;
 
     // BUG-02 FIX: Wrap root with PopScope so the Android Back gesture on SC2
     // returns to Home (or cancels the pending request) instead of exiting.
@@ -884,11 +1016,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
         child: Scaffold(
           backgroundColor: theme.colorScheme.surface,
           body: SafeArea(
-            child: switch (_currentScreen) {
-              AppScreen.home => _buildHomeScreen(context),
-              AppScreen.sc2 => _buildSC2Screen(context),
-              AppScreen.sc3 => _buildSC3Screen(context, progressState),
-            },
+            child: bodyWidget,
           ),
         ),
       ),

@@ -77,6 +77,9 @@ class TransferService {
   String? _activeTargetHost;
   int? _activeTargetPort;
 
+  int _activeSenderCurrentFileBytes = 0;
+  int _activeSenderCompletedFilesBytes = 0;
+
   // BUG-01 FIX: Completer used to cancel a pending outgoing transfer request
   // before the 35-second timeout fires.
   Completer<TransferRequestOutcome>? _outgoingCancelCompleter;
@@ -349,43 +352,123 @@ class TransferService {
     }
     _addCancelledId(transferId);
 
-    // BUG-08 FIX: Clean up _acceptedRequests and _activeTokens on cancel so
-    // stale tokens cannot be used after a transfer is cancelled.
+    // Resolve peer target host and port before state cleanup so receiver can notify sender on cancel
+    final host = _activeTargetHost ?? _acceptedRequests[transferId]?.senderHost;
+    final port = _activeTargetPort ?? _acceptedRequests[transferId]?.senderPort;
+
+    // Clean up _acceptedRequests and _activeTokens on cancel so stale tokens cannot be used
     _cleanupTransferState(transferId);
 
-    // 1. Instantly set progress status to cancelled on the SENDER notifier.
-    final current = sendProgressNotifier.value;
-    final cancelledFiles = current?.files.map((f) {
-      if (f.status == FileTransferStatus.completed) return f;
-      return PerFileTransferState(
-        fileId: f.fileId,
-        fileName: f.fileName,
-        fileSize: f.fileSize,
-        bytesTransferred: f.bytesTransferred,
-        status: FileTransferStatus.cancelled,
-        errorMessage: 'Cancelled',
-      );
-    }).toList() ?? const [];
+    // 1. Instantly set progress status to cancelled on matching notifiers.
+    final sendCurrent = sendProgressNotifier.value;
+    if (sendCurrent == null || sendCurrent.transferId == transferId) {
+      final activeIndex = (sendCurrent?.currentFileIndex ?? 1) - 1;
+      final currentSent = _activeSenderCurrentFileBytes;
+      final completedSent = _activeSenderCompletedFilesBytes;
+      final totalTransferred = completedSent + currentSent;
+      final outgoingItems = _outgoingFileItems[transferId];
 
-    sendProgressNotifier.value = TransferProgressState(
-      transferId: transferId,
-      currentFileName: current?.currentFileName ?? 'Transfer',
-      currentFileIndex: current?.currentFileIndex ?? 1,
-      totalFiles: current?.totalFiles ?? 1,
-      currentFileBytesTransferred: current?.currentFileBytesTransferred ?? 0,
-      currentFileSizeBytes: current?.currentFileSizeBytes ?? 0,
-      overallBytesTransferred: current?.overallBytesTransferred ?? 0,
-      overallTotalBytes: current?.overallTotalBytes ?? 0,
-      status: TransferProgressStatus.cancelled,
-      files: cancelledFiles,
-      errorMessage: 'Transfer cancelled by user',
-    );
+      final List<PerFileTransferState> cancelledFiles;
+      if (sendCurrent != null && sendCurrent.files.isNotEmpty) {
+        cancelledFiles = sendCurrent.files.asMap().entries.map((entry) {
+          final idx = entry.key;
+          final f = entry.value;
+          if (f.status == FileTransferStatus.completed) return f;
+          if (idx == activeIndex && currentSent > 0) {
+            return PerFileTransferState(
+              fileId: f.fileId,
+              fileName: f.fileName,
+              fileSize: f.fileSize,
+              bytesTransferred: currentSent,
+              status: FileTransferStatus.cancelled,
+              errorMessage: 'Cancelled',
+            );
+          }
+          return PerFileTransferState(
+            fileId: f.fileId,
+            fileName: f.fileName,
+            fileSize: f.fileSize,
+            bytesTransferred: f.bytesTransferred,
+            status: FileTransferStatus.cancelled,
+            errorMessage: 'Cancelled',
+          );
+        }).toList();
+      } else if (outgoingItems != null && outgoingItems.isNotEmpty) {
+        cancelledFiles = outgoingItems.asMap().entries.map((entry) {
+          final idx = entry.key;
+          final f = entry.value;
+          final bytes = (idx == activeIndex && currentSent > 0) ? currentSent : 0;
+          return PerFileTransferState(
+            fileId: f.fileId,
+            fileName: f.fileName,
+            fileSize: f.fileSize,
+            bytesTransferred: bytes,
+            status: FileTransferStatus.cancelled,
+            errorMessage: 'Cancelled',
+          );
+        }).toList();
+      } else {
+        cancelledFiles = const [];
+      }
+
+      final totalBytes = (sendCurrent != null && sendCurrent.overallTotalBytes > 0)
+          ? sendCurrent.overallTotalBytes
+          : (outgoingItems?.fold<int>(0, (sum, f) => sum + f.fileSize) ?? 0);
+
+      final currentFileTransferred = currentSent > 0
+          ? currentSent
+          : (sendCurrent?.currentFileBytesTransferred ?? 0);
+      final overallTransferred = totalTransferred > 0
+          ? totalTransferred
+          : (sendCurrent?.overallBytesTransferred ?? 0);
+
+      sendProgressNotifier.value = TransferProgressState(
+        transferId: transferId,
+        currentFileName: sendCurrent?.currentFileName ?? outgoingItems?.firstOrNull?.fileName ?? 'Transfer',
+        currentFileIndex: sendCurrent?.currentFileIndex ?? 1,
+        totalFiles: sendCurrent?.totalFiles ?? outgoingItems?.length ?? 1,
+        currentFileBytesTransferred: currentFileTransferred,
+        currentFileSizeBytes: sendCurrent?.currentFileSizeBytes ?? outgoingItems?.firstOrNull?.fileSize ?? 0,
+        overallBytesTransferred: overallTransferred,
+        overallTotalBytes: totalBytes,
+        status: TransferProgressStatus.cancelled,
+        files: cancelledFiles,
+        errorMessage: 'Transfer cancelled by user',
+      );
+    }
+
+    final recvCurrent = receiveProgressNotifier.value;
+    if (recvCurrent != null && recvCurrent.transferId == transferId) {
+      final cancelledFiles = recvCurrent.files.map((f) {
+        if (f.status == FileTransferStatus.completed) return f;
+        return PerFileTransferState(
+          fileId: f.fileId,
+          fileName: f.fileName,
+          fileSize: f.fileSize,
+          bytesTransferred: f.bytesTransferred,
+          status: FileTransferStatus.cancelled,
+          errorMessage: 'Cancelled',
+        );
+      }).toList();
+
+      receiveProgressNotifier.value = TransferProgressState(
+        transferId: transferId,
+        currentFileName: recvCurrent.currentFileName,
+        currentFileIndex: recvCurrent.currentFileIndex,
+        totalFiles: recvCurrent.totalFiles,
+        currentFileBytesTransferred: recvCurrent.currentFileBytesTransferred,
+        currentFileSizeBytes: recvCurrent.currentFileSizeBytes,
+        overallBytesTransferred: recvCurrent.overallBytesTransferred,
+        overallTotalBytes: recvCurrent.overallTotalBytes,
+        status: TransferProgressStatus.cancelled,
+        files: cancelledFiles,
+        errorMessage: 'Transfer cancelled by user',
+      );
+    }
 
     // BUG-04 FIX: Send cancel notification to peer BEFORE aborting the local
-    // HTTP request. This gives the receiver a chance to set the "cancelled"
+    // HTTP request. This gives the peer a chance to set the "cancelled"
     // state before the connection drop triggers a "failed" state.
-    final host = _activeTargetHost;
-    final port = _activeTargetPort;
     if (host != null && port != null) {
       try {
         final uri = Uri.http('$host:$port', DropLanConfig.transferCancelPath);
@@ -498,33 +581,112 @@ class TransferService {
       _activeOutgoingRequest = null;
     }
 
-    // Update the RECEIVER progress notifier on cancel notification.
-    final current = receiveProgressNotifier.value;
-    final cancelledFiles = current?.files.map((f) {
-      if (f.status == FileTransferStatus.completed) return f;
-      return PerFileTransferState(
-        fileId: f.fileId,
-        fileName: f.fileName,
-        fileSize: f.fileSize,
-        bytesTransferred: f.bytesTransferred,
-        status: FileTransferStatus.cancelled,
-        errorMessage: 'Cancelled',
-      );
-    }).toList() ?? const [];
+    // Update BOTH SENDER and RECEIVER progress notifiers on peer cancel notification.
+    final sendCurrent = sendProgressNotifier.value;
+    if (sendCurrent == null || sendCurrent.transferId == transferId) {
+      final activeIndex = (sendCurrent?.currentFileIndex ?? 1) - 1;
+      final currentSent = _activeSenderCurrentFileBytes;
+      final completedSent = _activeSenderCompletedFilesBytes;
+      final totalTransferred = completedSent + currentSent;
+      final outgoingItems = _outgoingFileItems[transferId];
 
-    receiveProgressNotifier.value = TransferProgressState(
-      transferId: transferId,
-      currentFileName: current?.currentFileName ?? 'Transfer',
-      currentFileIndex: current?.currentFileIndex ?? 1,
-      totalFiles: current?.totalFiles ?? 1,
-      currentFileBytesTransferred: current?.currentFileBytesTransferred ?? 0,
-      currentFileSizeBytes: current?.currentFileSizeBytes ?? 0,
-      overallBytesTransferred: current?.overallBytesTransferred ?? 0,
-      overallTotalBytes: current?.overallTotalBytes ?? 0,
-      status: TransferProgressStatus.cancelled,
-      files: cancelledFiles,
-      errorMessage: 'Transfer cancelled by peer device',
-    );
+      final List<PerFileTransferState> cancelledFiles;
+      if (sendCurrent != null && sendCurrent.files.isNotEmpty) {
+        cancelledFiles = sendCurrent.files.asMap().entries.map((entry) {
+          final idx = entry.key;
+          final f = entry.value;
+          if (f.status == FileTransferStatus.completed) return f;
+          if (idx == activeIndex && currentSent > 0) {
+            return PerFileTransferState(
+              fileId: f.fileId,
+              fileName: f.fileName,
+              fileSize: f.fileSize,
+              bytesTransferred: currentSent,
+              status: FileTransferStatus.cancelled,
+              errorMessage: 'Cancelled',
+            );
+          }
+          return PerFileTransferState(
+            fileId: f.fileId,
+            fileName: f.fileName,
+            fileSize: f.fileSize,
+            bytesTransferred: f.bytesTransferred,
+            status: FileTransferStatus.cancelled,
+            errorMessage: 'Cancelled',
+          );
+        }).toList();
+      } else if (outgoingItems != null && outgoingItems.isNotEmpty) {
+        cancelledFiles = outgoingItems.asMap().entries.map((entry) {
+          final idx = entry.key;
+          final f = entry.value;
+          final bytes = (idx == activeIndex && currentSent > 0) ? currentSent : 0;
+          return PerFileTransferState(
+            fileId: f.fileId,
+            fileName: f.fileName,
+            fileSize: f.fileSize,
+            bytesTransferred: bytes,
+            status: FileTransferStatus.cancelled,
+            errorMessage: 'Cancelled',
+          );
+        }).toList();
+      } else {
+        cancelledFiles = const [];
+      }
+
+      final totalBytes = (sendCurrent != null && sendCurrent.overallTotalBytes > 0)
+          ? sendCurrent.overallTotalBytes
+          : (outgoingItems?.fold<int>(0, (sum, f) => sum + f.fileSize) ?? 0);
+
+      final currentFileTransferred = currentSent > 0
+          ? currentSent
+          : (sendCurrent?.currentFileBytesTransferred ?? 0);
+      final overallTransferred = totalTransferred > 0
+          ? totalTransferred
+          : (sendCurrent?.overallBytesTransferred ?? 0);
+
+      sendProgressNotifier.value = TransferProgressState(
+        transferId: transferId,
+        currentFileName: sendCurrent?.currentFileName ?? outgoingItems?.firstOrNull?.fileName ?? 'Transfer',
+        currentFileIndex: sendCurrent?.currentFileIndex ?? 1,
+        totalFiles: sendCurrent?.totalFiles ?? outgoingItems?.length ?? 1,
+        currentFileBytesTransferred: currentFileTransferred,
+        currentFileSizeBytes: sendCurrent?.currentFileSizeBytes ?? outgoingItems?.firstOrNull?.fileSize ?? 0,
+        overallBytesTransferred: overallTransferred,
+        overallTotalBytes: totalBytes,
+        status: TransferProgressStatus.cancelled,
+        files: cancelledFiles,
+        errorMessage: 'Transfer cancelled by peer device',
+      );
+    }
+
+    final recvCurrent = receiveProgressNotifier.value;
+    if (recvCurrent == null || recvCurrent.transferId == transferId) {
+      final cancelledFiles = recvCurrent?.files.map((f) {
+        if (f.status == FileTransferStatus.completed) return f;
+        return PerFileTransferState(
+          fileId: f.fileId,
+          fileName: f.fileName,
+          fileSize: f.fileSize,
+          bytesTransferred: f.bytesTransferred,
+          status: FileTransferStatus.cancelled,
+          errorMessage: 'Cancelled',
+        );
+      }).toList() ?? const [];
+
+      receiveProgressNotifier.value = TransferProgressState(
+        transferId: transferId,
+        currentFileName: recvCurrent?.currentFileName ?? 'Transfer',
+        currentFileIndex: recvCurrent?.currentFileIndex ?? 1,
+        totalFiles: recvCurrent?.totalFiles ?? 1,
+        currentFileBytesTransferred: recvCurrent?.currentFileBytesTransferred ?? 0,
+        currentFileSizeBytes: recvCurrent?.currentFileSizeBytes ?? 0,
+        overallBytesTransferred: recvCurrent?.overallBytesTransferred ?? 0,
+        overallTotalBytes: recvCurrent?.overallTotalBytes ?? 0,
+        status: TransferProgressStatus.cancelled,
+        files: cancelledFiles,
+        errorMessage: 'Transfer cancelled by peer device',
+      );
+    }
   }
 
   Future<TransferRequestOutcome> sendTransferRequest({
@@ -553,6 +715,30 @@ class TransferService {
     }).toList();
 
     _outgoingFileItems[transferId] = fileItems;
+
+    final totalSize = fileItems.fold<int>(0, (sum, f) => sum + f.fileSize);
+    final initialSenderFiles = fileItems.map((f) {
+      return PerFileTransferState(
+        fileId: f.fileId,
+        fileName: f.fileName,
+        fileSize: f.fileSize,
+        bytesTransferred: 0,
+        status: FileTransferStatus.waiting,
+      );
+    }).toList();
+
+    sendProgressNotifier.value = TransferProgressState(
+      transferId: transferId,
+      currentFileName: fileItems.firstOrNull?.fileName ?? 'Transfer',
+      currentFileIndex: 1,
+      totalFiles: fileItems.length,
+      currentFileBytesTransferred: 0,
+      currentFileSizeBytes: fileItems.firstOrNull?.fileSize ?? 0,
+      overallBytesTransferred: 0,
+      overallTotalBytes: totalSize,
+      status: TransferProgressStatus.transferring,
+      files: initialSenderFiles,
+    );
 
     final payload = {
       'transferId': transferId,
@@ -713,6 +899,8 @@ class TransferService {
     }
     _activeTargetHost = targetHost;
     _activeTargetPort = targetPort;
+    _activeSenderCurrentFileBytes = 0;
+    _activeSenderCompletedFilesBytes = 0;
 
     final overallTotalBytes =
         filesToSend.fold<int>(0, (sum, f) => sum + f.fileItem.fileSize);
@@ -720,6 +908,9 @@ class TransferService {
 
     try {
       for (int i = 0; i < filesToSend.length; i++) {
+        _activeSenderCurrentFileBytes = 0;
+        _activeSenderCompletedFilesBytes = completedFilesBytes;
+
         if (isTransferCancelled(transferId)) {
           if (kDebugMode) {
             debugPrint(
@@ -783,6 +974,8 @@ class TransferService {
           );
         }
 
+        int currentFileSent = 0;
+
         try {
           final uri =
               Uri.http('$targetHost:$targetPort', DropLanConfig.transferFilePath);
@@ -807,13 +1000,13 @@ class TransferService {
                 '[DropLAN Stream Sender] Connection opened. Streaming file data...');
           }
 
-          int currentFileSent = 0;
           int lastProgressUpdateMs = 0;
           final fileStream = _openFileStream(
             fileToSend.localPath,
             transferId,
             (chunkLength) {
               currentFileSent += chunkLength;
+              _activeSenderCurrentFileBytes = currentFileSent;
               final nowMs = DateTime.now().millisecondsSinceEpoch;
               if (nowMs - lastProgressUpdateMs >= 50 ||
                   currentFileSent == fileItem.fileSize) {
@@ -878,6 +1071,10 @@ class TransferService {
               debugPrint(
                   '[DropLAN Stream Sender] Upload failed status ${response.statusCode}, body: $responseBody');
             }
+
+            // Allow in-flight peer cancel HTTP notification to process if socket/HTTP 499 arrived first
+            await Future.delayed(const Duration(milliseconds: 300));
+
             if (!isTransferCancelled(transferId) &&
                 !isFileCancelled(transferId, fileItem.fileId)) {
               sendProgressNotifier.value = TransferProgressState(
@@ -918,6 +1115,16 @@ class TransferService {
             return false;
           }
 
+          // Allow in-flight peer cancel HTTP notification to process if socket dropped first
+          await Future.delayed(const Duration(milliseconds: 300));
+          if (isTransferCancelled(transferId)) {
+            if (kDebugMode) {
+              debugPrint(
+                  '[DropLAN Stream Sender] Outgoing transfer marked cancelled after socket drop for $transferId');
+            }
+            return false;
+          }
+
           if (isFileCancelled(transferId, fileItem.fileId)) {
             if (kDebugMode) {
               debugPrint(
@@ -930,19 +1137,20 @@ class TransferService {
             debugPrint(
                 '[DropLAN Stream Sender] Exception during file upload: $e\n$st');
           }
+          final finalSent = currentFileSent > 0 ? currentFileSent : _activeSenderCurrentFileBytes;
           sendProgressNotifier.value = TransferProgressState(
             transferId: transferId,
             currentFileName: fileItem.fileName,
             currentFileIndex: i + 1,
             totalFiles: filesToSend.length,
-            currentFileBytesTransferred: 0,
+            currentFileBytesTransferred: finalSent,
             currentFileSizeBytes: fileItem.fileSize,
-            overallBytesTransferred: completedFilesBytes,
+            overallBytesTransferred: completedFilesBytes + finalSent,
             overallTotalBytes: overallTotalBytes,
             status: TransferProgressStatus.failed,
             errorMessage: 'Transfer network error: $e',
             files: _buildSenderFileStates(
-                transferId, filesToSend, i, 0, FileTransferStatus.failed,
+                transferId, filesToSend, i, finalSent, FileTransferStatus.failed,
                 errorMessage: 'Network error'),
           );
           return false;
@@ -1081,8 +1289,35 @@ class TransferService {
       expiresAt: DateTime.now().add(const Duration(minutes: 5)),
     );
 
+    _activeTargetHost = request.senderHost;
+    _activeTargetPort = request.senderPort;
+
     _activeTokens[tokenString] = token;
     _acceptedRequests[transferId] = request;
+
+    // Immediately populate receiveProgressNotifier with metadata so UI shows 0% and file list
+    final initialFiles = request.files.map((f) {
+      return PerFileTransferState(
+        fileId: f.fileId,
+        fileName: f.fileName,
+        fileSize: f.fileSize,
+        bytesTransferred: 0,
+        status: FileTransferStatus.waiting,
+      );
+    }).toList();
+
+    receiveProgressNotifier.value = TransferProgressState(
+      transferId: transferId,
+      currentFileName: request.files.firstOrNull?.fileName ?? 'Transfer',
+      currentFileIndex: 1,
+      totalFiles: request.files.length,
+      currentFileBytesTransferred: 0,
+      currentFileSizeBytes: request.files.firstOrNull?.fileSize ?? 0,
+      overallBytesTransferred: 0,
+      overallTotalBytes: request.totalSize,
+      status: TransferProgressStatus.transferring,
+      files: initialFiles,
+    );
 
     final payload = {
       'transferId': transferId,
@@ -1183,7 +1418,7 @@ class TransferService {
     final token = body['transferToken'] as String?;
 
     if (transferId != null && _outgoingRequests.containsKey(transferId)) {
-      final fileItems = _outgoingFileItems.remove(transferId);
+      final fileItems = _outgoingFileItems[transferId];
       _outgoingRequests.remove(transferId)?.complete(
             TransferRequestOutcome(
               status: TransferResultStatus.accepted,
@@ -1507,6 +1742,7 @@ class TransferService {
       }
     } catch (e, st) {
       _activeIncomingSink = null;
+      await Future.delayed(const Duration(milliseconds: 50));
       if (isTransferCancelled(transferId)) {
         if (await tempFile.exists()) {
           try {
@@ -2077,10 +2313,10 @@ class TransferService {
     } else {
       final file = File(path);
       await for (final chunk in file.openRead()) {
+        onChunk(chunk.length);
         if (isTransferCancelled(transferId)) {
           throw const TransferCancelledException();
         }
-        onChunk(chunk.length);
         yield chunk;
       }
     }
