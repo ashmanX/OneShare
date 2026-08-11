@@ -56,6 +56,11 @@ class DropLanDiscoveryService {
 
   final Map<String, DiscoveredDevice> _discoveredDevices = {};
 
+  // BUG-09 FIX: Secondary map from NSD service-name → deviceId so that the
+  // "lost" event (which only provides the service name) can look up the
+  // correct deviceId key rather than doing an error-prone name-based search.
+  final Map<String, String> _serviceNameToDeviceId = {};
+
   bool _isAdvertising = false;
   bool _isDiscovering = false;
   String? _lastAdvertisedName;
@@ -236,8 +241,12 @@ class DropLanDiscoveryService {
         return;
       }
 
-      _discoveredDevices[verifiedDevice.deviceId] =
-          verifiedDevice;
+      _discoveredDevices[verifiedDevice.deviceId] = verifiedDevice;
+
+      // BUG-09 FIX: Record the mapping from NSD service-name to deviceId.
+      // We use deviceName as the NSD service name since that is what Android
+      // NSD advertises and returns in the "lost" event's serviceName field.
+      _serviceNameToDeviceId[verifiedDevice.deviceName] = verifiedDevice.deviceId;
 
       if (kDebugMode) {
         debugPrint(
@@ -265,9 +274,18 @@ class DropLanDiscoveryService {
           );
         }
 
-        _discoveredDevices.removeWhere(
-          (_, device) => device.deviceName == serviceName,
-        );
+        // BUG-09 FIX: Look up the unique deviceId by service name first.
+        // This prevents two devices with the same display name from both
+        // being removed when only one of them goes offline.
+        final lostDeviceId = _serviceNameToDeviceId.remove(serviceName);
+        if (lostDeviceId != null) {
+          _discoveredDevices.remove(lostDeviceId);
+        } else {
+          // Fallback: if the mapping is missing for any reason, remove by name.
+          _discoveredDevices.removeWhere(
+            (_, device) => device.deviceName == serviceName,
+          );
+        }
 
         discoveredDevicesNotifier.value =
             _discoveredDevices.values.toList();

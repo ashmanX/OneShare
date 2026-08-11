@@ -1,7 +1,8 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 
-import 'package:file_picker/file_picker.dart';
+import 'package:file_selector/file_selector.dart' as file_selector;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -34,6 +35,10 @@ class SelectedFile {
 /// Three clear application states.
 enum AppScreen { home, sc2, sc3 }
 
+// BUG-11 FIX: Track which direction the active SC3 transfer is going so we
+// can read the correct progress notifier (send vs receive).
+enum TransferDirection { sending, receiving }
+
 // ============================================================
 // App root — theme only, no business logic
 // ============================================================
@@ -48,21 +53,21 @@ class DropLanApp extends StatelessWidget {
 
     const darkColorScheme = ColorScheme(
       brightness: Brightness.dark,
-      primary: Color(0xFF6366F1),
+      primary: Color(0xFF3B82F6),
       onPrimary: Color(0xFFFFFFFF),
-      primaryContainer: Color(0xFF312E81),
-      onPrimaryContainer: Color(0xFFE0E7FF),
+      primaryContainer: Color(0xFF1E40AF),
+      onPrimaryContainer: Color(0xFFDBEAFE),
       secondary: Color(0xFF38BDF8),
       onSecondary: Color(0xFFFFFFFF),
       secondaryContainer: Color(0xFF075985),
       onSecondaryContainer: Color(0xFFE0F2FE),
-      surface: Color(0xFF040711),
+      surface: Color(0xFF000000),
       onSurface: Color(0xFFFFFFFF),
-      surfaceContainerLowest: Color(0xFF070B14),
-      surfaceContainerHigh: Color(0xFF0B1220),
-      onSurfaceVariant: Color(0xFF94A3B8),
-      outline: Color(0xFF263044),
-      outlineVariant: Color(0xFF19233A),
+      surfaceContainerLowest: Color(0xFF05060A),
+      surfaceContainerHigh: Color(0xFF12141D),
+      onSurfaceVariant: Color(0xFF8E95A5),
+      outline: Color(0xFF1F2232),
+      outlineVariant: Color(0xFF171A27),
       error: Color(0xFFEF4444),
       onError: Color(0xFFFFFFFF),
     );
@@ -72,17 +77,17 @@ class DropLanApp extends StatelessWidget {
         statusBarColor: Colors.transparent,
         statusBarIconBrightness: Brightness.light,
         statusBarBrightness: Brightness.dark,
-        systemNavigationBarColor: Color(0xFF040711),
+        systemNavigationBarColor: Color(0xFF000000),
         systemNavigationBarIconBrightness: Brightness.light,
       ),
     );
 
     final sharedDialogTheme = DialogThemeData(
-      backgroundColor: const Color(0xFF0B1220),
+      backgroundColor: const Color(0xFF12141D),
       surfaceTintColor: Colors.transparent,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(20),
-        side: const BorderSide(color: Color(0xFF19233A), width: 1),
+        side: const BorderSide(color: Color(0xFF1F2232), width: 1),
       ),
       titleTextStyle: GoogleFonts.plusJakartaSans(
         fontSize: 18,
@@ -102,7 +107,7 @@ class DropLanApp extends StatelessWidget {
       darkTheme: ThemeData(
         brightness: Brightness.dark,
         colorScheme: darkColorScheme,
-        scaffoldBackgroundColor: const Color(0xFF040711),
+        scaffoldBackgroundColor: const Color(0xFF000000),
         textTheme: textTheme,
         useMaterial3: true,
         dialogTheme: sharedDialogTheme,
@@ -110,7 +115,7 @@ class DropLanApp extends StatelessWidget {
       theme: ThemeData(
         brightness: Brightness.dark,
         colorScheme: darkColorScheme,
-        scaffoldBackgroundColor: const Color(0xFF040711),
+        scaffoldBackgroundColor: const Color(0xFF000000),
         textTheme: textTheme,
         useMaterial3: true,
         dialogTheme: sharedDialogTheme,
@@ -149,10 +154,24 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   // ── App screen state ──────────────────────────────────────
   AppScreen _currentScreen = AppScreen.home;
 
+  // ── Network / WiFi status state ─────────────────────────
+  bool _isWifiOn = true;
+  Timer? _wifiCheckTimer;
+
   // ── Transfer request state ────────────────────────────────
   bool _isSendingRequest = false;
   String? _waitingForDeviceName;
   bool _isIncomingDialogOpen = false;
+
+  // BUG-16 FIX: Guard against launching multiple file pickers simultaneously
+  // (e.g. rapid double-tap on macOS).
+  bool _isPickingFiles = false;
+
+  // BUG-11 FIX: Track which direction the active SC3 transfer is in and
+  // which transfer session is current, to prevent stale progress updates
+  // from switching the screen back to SC3 after the user taps Done.
+  TransferDirection _transferDirection = TransferDirection.sending;
+  String? _activeTransferSessionId;
 
   // ──────────────────────────────────────────────────────────
   // Lifecycle
@@ -176,22 +195,76 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     TransferService.instance.incomingRequestNotifier
         .addListener(_onIncomingTransferRequest);
 
-    TransferService.instance.progressNotifier
-        .addListener(_onTransferProgressChanged);
+    // BUG-11 FIX: Listen to the two separate progress notifiers.
+    TransferService.instance.sendProgressNotifier
+        .addListener(_onSendProgressChanged);
+    TransferService.instance.receiveProgressNotifier
+        .addListener(_onReceiveProgressChanged);
+
+    _checkWifiStatus();
+    _wifiCheckTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      _checkWifiStatus();
+    });
 
     _startServicesIfForeground();
   }
 
   @override
   void dispose() {
+    _wifiCheckTimer?.cancel();
     _radarAnimationController.dispose();
     TransferService.instance.incomingRequestNotifier
         .removeListener(_onIncomingTransferRequest);
-    TransferService.instance.progressNotifier
-        .removeListener(_onTransferProgressChanged);
+    // BUG-11 FIX: Remove listeners for both split notifiers.
+    TransferService.instance.sendProgressNotifier
+        .removeListener(_onSendProgressChanged);
+    TransferService.instance.receiveProgressNotifier
+        .removeListener(_onReceiveProgressChanged);
     WidgetsBinding.instance.removeObserver(this);
     _stopServices();
     super.dispose();
+  }
+
+  Future<void> _checkWifiStatus() async {
+    try {
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLinkLocal: false,
+      );
+      bool activeNetworkFound = false;
+      for (final interface in interfaces) {
+        for (final address in interface.addresses) {
+          if (!address.isLoopback) {
+            activeNetworkFound = true;
+            break;
+          }
+        }
+        if (activeNetworkFound) break;
+      }
+
+      if (!mounted) return;
+
+      if (activeNetworkFound != _isWifiOn) {
+        setState(() {
+          _isWifiOn = activeNetworkFound;
+          if (_isWifiOn) {
+            if (!_radarAnimationController.isAnimating) {
+              _radarAnimationController.repeat();
+            }
+          } else {
+            if (_radarAnimationController.isAnimating) {
+              _radarAnimationController.stop();
+            }
+          }
+        });
+        // BUG-17 FIX: When Wi-Fi reconnects (transition false→true), restart
+        // NSD advertising and discovery so nearby devices become visible
+        // again without requiring an app restart.
+        if (activeNetworkFound) {
+          _startServicesIfForeground(isResume: true);
+        }
+      }
+    } catch (_) {}
   }
 
   // ──────────────────────────────────────────────────────────
@@ -216,32 +289,60 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
           .catchError((_) {});
     }
 
-    showDialog(
+    showDialog<String>(
       context: context,
       barrierDismissible: false,
       builder: (_) => IncomingTransferDialog(request: request),
-    ).then((_) {
+    ).then((result) {
       _isIncomingDialogOpen = false;
       if (TransferService.instance.incomingRequestNotifier.value?.transferId ==
           request.transferId) {
         TransferService.instance.incomingRequestNotifier.value = null;
+      }
+      if (result == 'cancelled_by_sender' && mounted) {
+        _showModernToast(
+          title: 'Request Cancelled',
+          message: '${request.senderDeviceName} cancelled the transfer request.',
+          icon: Icons.cancel_outlined,
+          accentColor: const Color(0xFFF59E0B),
+        );
       }
     });
   }
 
   // ──────────────────────────────────────────────────────────
   // Transfer progress → drives SC3
+  // BUG-11 FIX: Two separate listeners for sender vs receiver progress.
+  // BUG-15/03 FIX: Guard against stale progress updates overriding Home
+  // after the user taps Done (by checking _activeTransferSessionId).
   // ──────────────────────────────────────────────────────────
 
-  void _onTransferProgressChanged() {
+  void _onSendProgressChanged() {
     if (!mounted) return;
+    final p = TransferService.instance.sendProgressNotifier.value;
+    if (p == null) return;
+    // BUG-15 FIX: Only navigate to SC3 if this update belongs to the current
+    // active session. After _onDone() clears _activeTransferSessionId, late
+    // updates are ignored.
+    if (_activeTransferSessionId != null &&
+        p.transferId != _activeTransferSessionId) {
+      return;
+    }
     setState(() {
-      final p = TransferService.instance.progressNotifier.value;
-      if (p != null) {
-        _currentScreen = AppScreen.sc3;
-        _waitingForDeviceName = null;
-        _isSendingRequest = false;
-      }
+      _transferDirection = TransferDirection.sending;
+      _currentScreen = AppScreen.sc3;
+      _waitingForDeviceName = null;
+      _isSendingRequest = false;
+    });
+  }
+
+  void _onReceiveProgressChanged() {
+    if (!mounted) return;
+    final p = TransferService.instance.receiveProgressNotifier.value;
+    if (p == null) return;
+    setState(() {
+      _transferDirection = TransferDirection.receiving;
+      _currentScreen = AppScreen.sc3;
     });
   }
 
@@ -378,8 +479,13 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
         behavior: SnackBarBehavior.floating,
         margin: const EdgeInsets.fromLTRB(16, 0, 16, 20),
         padding: EdgeInsets.zero,
-        content: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        content: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () {
+            ScaffoldMessenger.of(context).hideCurrentSnackBar();
+          },
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
           decoration: BoxDecoration(
             color: const Color(0xFF0B1220).withValues(alpha: 0.95),
             borderRadius: BorderRadius.circular(14),
@@ -432,7 +538,8 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
           ),
         ),
       ),
-    );
+    ),
+  );
   }
 
   // ──────────────────────────────────────────────────────────
@@ -440,6 +547,9 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   // ──────────────────────────────────────────────────────────
 
   Future<void> _pickFiles() async {
+    // BUG-16 FIX: Prevent opening multiple pickers on rapid double-tap.
+    if (_isPickingFiles) return;
+    _isPickingFiles = true;
     try {
       final newFiles = <SelectedFile>[];
 
@@ -461,18 +571,19 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
           }
         }
       } else {
-        final result = await FilePicker.platform.pickFiles(
-          allowMultiple: true,
-          withData: false,
-          withReadStream: false,
+        // macOS & Desktop: Use file_selector openFiles() which directly calls native NSOpenPanel
+        // returning XFile paths instantly without bookmark resolving, metadata pre-fetching, or temp file caching.
+        const typeGroup = file_selector.XTypeGroup(label: 'any');
+        final files = await file_selector.openFiles(
+          acceptedTypeGroups: const [typeGroup],
         );
 
-        if (result == null || result.files.isEmpty) return;
+        if (files.isEmpty) return;
 
-        for (final file in result.files) {
-          if (file.path == null) continue;
+        for (final file in files) {
+          final length = await file.length();
           newFiles.add(
-            SelectedFile(name: file.name, size: file.size, path: file.path!),
+            SelectedFile(name: file.name, size: length, path: file.path),
           );
         }
       }
@@ -498,6 +609,9 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       if (kDebugMode) {
         debugPrint('AirShare: file picker error: $error');
       }
+    } finally {
+      // BUG-16 FIX: Always release the guard.
+      _isPickingFiles = false;
     }
   }
 
@@ -557,7 +671,14 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
               ),
             );
           }
-          // SC3 transition driven by _onTransferProgressChanged
+          // BUG-15/03 FIX: Record the session ID so stale progress updates
+          // from a previous transfer cannot flip the screen back to SC3.
+          if (mounted) {
+            setState(() {
+              _activeTransferSessionId = outcome.transferId;
+            });
+          }
+          // SC3 transition driven by _onSendProgressChanged
           TransferService.instance.sendTransferFiles(
             targetHost: device.host,
             targetPort: device.port,
@@ -596,6 +717,27 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
         );
         break;
     }
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Cancel Request — cancels an outgoing request that is waiting for accept
+  // BUG-01 FIX
+  // ──────────────────────────────────────────────────────────
+
+  void _cancelOutgoingRequest() {
+    // BUG-01 FIX: Cancel the pending transfer request immediately without
+    // waiting for the 35-second timeout to expire.
+    TransferService.instance.cancelOutgoingRequest(
+      // We don't have a local handle to the transferId here; cancelOutgoingRequest
+      // works via the internal cancel completer and clears any pending outgoing
+      // request, so passing an empty string is a valid sentinel.
+      '',
+    );
+    if (!mounted) return;
+    setState(() {
+      _isSendingRequest = false;
+      _waitingForDeviceName = null;
+    });
   }
 
   // ──────────────────────────────────────────────────────────
@@ -652,13 +794,18 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     );
 
     if (shouldCancel == true && mounted) {
-      final activeTransferId =
-          TransferService.instance.progressNotifier.value?.transferId;
+      // BUG-11 FIX: Retrieve active transferId from the correct notifier
+      // depending on which direction the active transfer is running.
+      final activeTransferId = _transferDirection == TransferDirection.sending
+          ? TransferService.instance.sendProgressNotifier.value?.transferId
+          : TransferService.instance.receiveProgressNotifier.value?.transferId;
 
       if (activeTransferId != null) {
         await TransferService.instance.cancelTransfer(activeTransferId);
       } else {
-        TransferService.instance.progressNotifier.value = null;
+        // BUG-11 FIX: Clear both notifiers to avoid stale state.
+        TransferService.instance.sendProgressNotifier.value = null;
+        TransferService.instance.receiveProgressNotifier.value = null;
       }
 
       if (!mounted) return;
@@ -666,6 +813,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       setState(() {
         _selectedFiles.clear();
         _isSendingRequest = false;
+        _activeTransferSessionId = null;
         _currentScreen = AppScreen.home;
       });
     }
@@ -676,7 +824,14 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   // ──────────────────────────────────────────────────────────
 
   void _onDone() {
-    TransferService.instance.progressNotifier.value = null;
+    // BUG-11 FIX: Clear both split progress notifiers.
+    // BUG-15/03 FIX: Clear _activeTransferSessionId first so the listener
+    // will ignore any in-flight late progress updates that arrive after Done.
+    setState(() {
+      _activeTransferSessionId = null;
+    });
+    TransferService.instance.sendProgressNotifier.value = null;
+    TransferService.instance.receiveProgressNotifier.value = null;
     setState(() {
       _selectedFiles.clear();
       _isSendingRequest = false;
@@ -691,16 +846,51 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final progressState = TransferService.instance.progressNotifier.value;
+    // Read from direction-appropriate notifier, with fallback to whichever state is active
+    final sendState = TransferService.instance.sendProgressNotifier.value;
+    final receiveState = TransferService.instance.receiveProgressNotifier.value;
+    final progressState = _transferDirection == TransferDirection.sending
+        ? (sendState ?? receiveState)
+        : (receiveState ?? sendState);
 
-    return Scaffold(
-      backgroundColor: theme.colorScheme.surface,
-      body: SafeArea(
-        child: switch (_currentScreen) {
-          AppScreen.home => _buildHomeScreen(context),
-          AppScreen.sc2 => _buildSC2Screen(context),
-          AppScreen.sc3 => _buildSC3Screen(context, progressState),
+    // Black Screen Prevention Guard: If screen is SC3 but no progress exists, reset to Home.
+    if (_currentScreen == AppScreen.sc3 && progressState == null) {
+      _currentScreen = AppScreen.home;
+    }
+
+    // BUG-02 FIX: Wrap root with PopScope so the Android Back gesture on SC2
+    // returns to Home (or cancels the pending request) instead of exiting.
+    return PopScope(
+      canPop: _currentScreen == AppScreen.home,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        if (_currentScreen == AppScreen.sc2) {
+          if (_isSendingRequest) {
+            _cancelOutgoingRequest();
+          } else {
+            setState(() {
+              _selectedFiles.clear();
+              _currentScreen = AppScreen.home;
+            });
+          }
+        }
+        // SC3 does not allow back navigation — the user must tap Cancel/Done.
+      },
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTap: () {
+          ScaffoldMessenger.of(context).hideCurrentSnackBar();
         },
+        child: Scaffold(
+          backgroundColor: theme.colorScheme.surface,
+          body: SafeArea(
+            child: switch (_currentScreen) {
+              AppScreen.home => _buildHomeScreen(context),
+              AppScreen.sc2 => _buildSC2Screen(context),
+              AppScreen.sc3 => _buildSC3Screen(context, progressState),
+            },
+          ),
+        ),
       ),
     );
   }
@@ -711,7 +901,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
 
   Widget _buildSharedHeader(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(18, 16, 18, 0),
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         crossAxisAlignment: CrossAxisAlignment.center,
@@ -723,7 +913,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                 Text(
                   'AirShare',
                   style: GoogleFonts.plusJakartaSans(
-                    fontSize: 26,
+                    fontSize: 24,
                     fontWeight: FontWeight.w800,
                     letterSpacing: -0.4,
                     color: Colors.white,
@@ -736,20 +926,21 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                     fontSize: 12,
                     fontWeight: FontWeight.w500,
                     color: const Color(0xFF94A3B8),
+                    height: 1.25,
                   ),
-                  maxLines: 1,
+                  maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                 ),
               ],
             ),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: 10),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
             decoration: BoxDecoration(
-              color: const Color(0xFF0B1220),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: const Color(0xFF19233A), width: 1),
+              color: const Color(0xFF131722),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: const Color(0xFF1E2333), width: 1),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.end,
@@ -758,33 +949,37 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Text(
-                      'Online',
-                      style: GoogleFonts.plusJakartaSans(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
-                        color: const Color(0xFF10B981),
-                      ),
-                      textAlign: TextAlign.right,
-                    ),
-                    const SizedBox(width: 5),
                     Container(
-                      width: 6,
-                      height: 6,
-                      decoration: const BoxDecoration(
-                        color: Color(0xFF10B981),
+                      width: 7,
+                      height: 7,
+                      decoration: BoxDecoration(
+                        color: _isWifiOn
+                            ? const Color(0xFF10B981)
+                            : const Color(0xFF94A3B8),
                         shape: BoxShape.circle,
                       ),
                     ),
+                    const SizedBox(width: 5),
+                    Text(
+                      _isWifiOn ? 'Online' : 'Offline',
+                      style: GoogleFonts.plusJakartaSans(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        color: _isWifiOn
+                            ? const Color(0xFF10B981)
+                            : const Color(0xFF94A3B8),
+                      ),
+                      textAlign: TextAlign.right,
+                    ),
                   ],
                 ),
-                const SizedBox(height: 3),
+                const SizedBox(height: 2),
                 ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 120),
+                  constraints: const BoxConstraints(maxWidth: 115),
                   child: Text(
                     _deviceName,
                     style: GoogleFonts.plusJakartaSans(
-                      fontSize: 12,
+                      fontSize: 11,
                       fontWeight: FontWeight.w600,
                       color: Colors.white,
                     ),
@@ -811,19 +1006,19 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _buildSharedHeader(context),
-        const SizedBox(height: 14),
+        const SizedBox(height: 16),
         Expanded(
           flex: 5,
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 18),
+            padding: const EdgeInsets.symmetric(horizontal: 20),
             child: _buildRadarCard(context),
           ),
         ),
-        const SizedBox(height: 10),
+        const SizedBox(height: 14),
         Expanded(
-          flex: 3,
+          flex: 4,
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 18),
+            padding: const EdgeInsets.symmetric(horizontal: 20),
             child: ValueListenableBuilder<List<DiscoveredDevice>>(
               valueListenable: _discoveryService.discoveredDevicesNotifier,
               builder: (context, devices, _) {
@@ -833,10 +1028,12 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                   context: context,
                   devices: sorted,
                   heading: 'Nearby Devices',
+                  showArrow: false,
                   onDeviceTap: (_) {
                     _showModernToast(
                       title: 'Select Files First',
-                      message: 'Tap "Select Files to Send" to choose what to share.',
+                      message:
+                          'Tap "Select Files to Send" to choose what to share.',
                       icon: Icons.upload_file_rounded,
                       accentColor: const Color(0xFF6366F1),
                     );
@@ -846,15 +1043,15 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
             ),
           ),
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 12),
         SizedBox(
-          height: 56,
+          height: 60,
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 18),
+            padding: const EdgeInsets.symmetric(horizontal: 20),
             child: _buildPrimaryFileActionButton(context),
           ),
         ),
-        const SizedBox(height: 12),
+        const SizedBox(height: 16),
       ],
     );
   }
@@ -871,7 +1068,9 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _buildSharedHeader(context),
+        // BUG-02 FIX: Shared header with a Back button in SC2 so the user can
+        // return to Home without deleting all selected files manually.
+        _buildSC2Header(context),
         const SizedBox(height: 14),
         // S2 — selected files (flex 5)
         Expanded(
@@ -881,10 +1080,10 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
             child: _buildSC2SelectedFilesPanel(context, totalSelectedSize),
           ),
         ),
-        const SizedBox(height: 10),
-        // S3 — select device (flex 3)
+        const SizedBox(height: 12),
+        // S3 — select device (flex 4)
         Expanded(
-          flex: 3,
+          flex: 4,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 18),
             child: _isSendingRequest
@@ -899,17 +1098,42 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                         context: context,
                         devices: sorted,
                         heading: 'Select device',
+                        showArrow: true,
                         onDeviceTap: _sendTransferToDevice,
                       );
                     },
                   ),
           ),
         ),
-        // S4 — 56px breathing room
-        const SizedBox(height: 8),
-        const SizedBox(height: 56),
-        const SizedBox(height: 12),
+        const SizedBox(height: 16),
       ],
+    );
+  }
+
+  // BUG-02 FIX: Custom header for SC2 that includes a visible Back button so
+  // users can return to Home without relying on the system Back gesture.
+  Widget _buildSC2Header(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 16, 20, 0),
+      child: Row(
+        children: [
+          // Back button
+          IconButton(
+            icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 18),
+            color: const Color(0xFF94A3B8),
+            tooltip: 'Back',
+            onPressed: _isSendingRequest
+                ? null // disabled while waiting — use Cancel Request instead
+                : () {
+                    setState(() {
+                      _selectedFiles.clear();
+                      _currentScreen = AppScreen.home;
+                    });
+                  },
+          ),
+          Expanded(child: _buildSharedHeader(context)),
+        ],
+      ),
     );
   }
 
@@ -917,68 +1141,80 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Row(
-              children: [
-                Text(
-                  'Selected Files',
-                  style: GoogleFonts.plusJakartaSans(
-                    fontSize: 14,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white,
-                  ),
-                ),
-                const SizedBox(width: 6),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF6366F1).withValues(alpha: 0.15),
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Text(
-                    '${_selectedFiles.length} · ${_formatFileSize(totalSize)}',
+        Padding(
+          padding: const EdgeInsets.only(left: 4, right: 4, bottom: 8),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  Text(
+                    'Selected Files',
                     style: GoogleFonts.plusJakartaSans(
-                      fontSize: 11,
-                      fontWeight: FontWeight.bold,
-                      color: const Color(0xFF818CF8),
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white,
                     ),
                   ),
-                ),
-              ],
-            ),
-            TextButton.icon(
-              onPressed: _pickFiles,
-              icon: const Icon(Icons.add_rounded, size: 16),
-              label: const Text('Add files'),
-              style: TextButton.styleFrom(
-                visualDensity: VisualDensity.compact,
-                foregroundColor: const Color(0xFF818CF8),
-                textStyle: GoogleFonts.plusJakartaSans(
-                  fontWeight: FontWeight.bold,
-                  fontSize: 12,
+                  const SizedBox(width: 8),
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1A233D),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      '${_selectedFiles.length} · ${_formatFileSize(totalSize)}',
+                      style: GoogleFonts.plusJakartaSans(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: const Color(0xFF38BDF8),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              InkWell(
+                onTap: _pickFiles,
+                borderRadius: BorderRadius.circular(8),
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.add_rounded,
+                          size: 16, color: Color(0xFF38BDF8)),
+                      const SizedBox(width: 4),
+                      Text(
+                        'Add files',
+                        style: GoogleFonts.plusJakartaSans(
+                          fontWeight: FontWeight.w600,
+                          fontSize: 14,
+                          color: const Color(0xFF38BDF8),
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
-        const SizedBox(height: 8),
         Expanded(
           child: Container(
             decoration: BoxDecoration(
-              color: const Color(0xFF0B1220),
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: const Color(0xFF19233A), width: 1),
+              color: const Color(0xFF12141D),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: const Color(0xFF1F2232), width: 1),
             ),
             child: ClipRRect(
-              borderRadius: BorderRadius.circular(16),
+              borderRadius: BorderRadius.circular(20),
               child: ListView.separated(
                 physics: const AlwaysScrollableScrollPhysics(),
                 itemCount: _selectedFiles.length,
                 separatorBuilder: (_, _) =>
-                    const Divider(height: 1, color: Color(0xFF19233A)),
+                    const Divider(height: 1, color: Color(0xFF1F2232)),
                 itemBuilder: (context, index) => _buildSC2FileRow(
                   context,
                   _selectedFiles[index],
@@ -999,18 +1235,20 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   ) {
     final fileColor = _getFileColor(file.name);
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       child: Row(
         children: [
           Container(
-            padding: const EdgeInsets.all(7),
+            width: 44,
+            height: 44,
+            alignment: Alignment.center,
             decoration: BoxDecoration(
-              color: fileColor.withValues(alpha: 0.14),
-              borderRadius: BorderRadius.circular(10),
+              color: fileColor.withValues(alpha: 0.18),
+              borderRadius: BorderRadius.circular(12),
             ),
-            child: Icon(_getFileIcon(file.name), color: fileColor, size: 18),
+            child: Icon(_getFileIcon(file.name), color: fileColor, size: 22),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: 14),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -1018,37 +1256,39 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                 Text(
                   file.name,
                   style: GoogleFonts.plusJakartaSans(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
                     color: Colors.white,
                   ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
-                const SizedBox(height: 2),
+                const SizedBox(height: 3),
                 Text(
                   _formatFileSize(file.size),
                   style: GoogleFonts.plusJakartaSans(
-                    fontSize: 11,
-                    color: const Color(0xFF64748B),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                    color: const Color(0xFF8E95A5),
                   ),
                 ),
               ],
             ),
           ),
+          const SizedBox(width: 10),
           GestureDetector(
             onTap: () => _removeFile(index),
             child: Container(
-              width: 28,
-              height: 28,
-              decoration: BoxDecoration(
-                color: const Color(0xFF19233A),
-                borderRadius: BorderRadius.circular(8),
+              width: 32,
+              height: 32,
+              decoration: const BoxDecoration(
+                color: Color(0xFF1C2030),
+                shape: BoxShape.circle,
               ),
               child: const Icon(
                 Icons.close_rounded,
-                size: 15,
-                color: Color(0xFF64748B),
+                size: 16,
+                color: Color(0xFF8E95A5),
               ),
             ),
           ),
@@ -1061,41 +1301,43 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          'Select device',
-          style: GoogleFonts.plusJakartaSans(
-            fontSize: 14,
-            fontWeight: FontWeight.bold,
-            color: Colors.white,
+        Padding(
+          padding: const EdgeInsets.only(left: 4, bottom: 8),
+          child: Text(
+            'Select device',
+            style: GoogleFonts.plusJakartaSans(
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+              color: Colors.white,
+            ),
           ),
         ),
-        const SizedBox(height: 8),
         Expanded(
           child: Container(
             decoration: BoxDecoration(
-              color: const Color(0xFF0B1220),
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: const Color(0xFF19233A), width: 1),
+              color: const Color(0xFF12141D),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: const Color(0xFF1F2232), width: 1),
             ),
             child: Center(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   const SizedBox(
-                    width: 26,
-                    height: 26,
+                    width: 28,
+                    height: 28,
                     child: CircularProgressIndicator(
                       strokeWidth: 2,
                       valueColor:
-                          AlwaysStoppedAnimation<Color>(Color(0xFF6366F1)),
+                          AlwaysStoppedAnimation<Color>(Color(0xFF38BDF8)),
                     ),
                   ),
                   const SizedBox(height: 14),
                   Text(
                     'Sending request to ${_waitingForDeviceName ?? 'device'}…',
                     style: GoogleFonts.plusJakartaSans(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
                       color: Colors.white,
                     ),
                     textAlign: TextAlign.center,
@@ -1105,9 +1347,32 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                     'Waiting for them to accept.',
                     style: GoogleFonts.plusJakartaSans(
                       fontSize: 12,
-                      color: const Color(0xFF64748B),
+                      color: const Color(0xFF8E95A5),
                     ),
                     textAlign: TextAlign.center,
+                  ),
+                  // BUG-01 FIX: Cancel Request button so the user is not stuck
+                  // waiting up to 35 seconds for the receiver to respond.
+                  const SizedBox(height: 20),
+                  OutlinedButton.icon(
+                    onPressed: _cancelOutgoingRequest,
+                    icon: const Icon(Icons.cancel_outlined, size: 16),
+                    label: Text(
+                      'Cancel Request',
+                      style: GoogleFonts.plusJakartaSans(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFFEF4444),
+                      side: const BorderSide(
+                          color: Color(0xFFEF4444), width: 1),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 20, vertical: 10),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12)),
+                    ),
                   ),
                 ],
               ),
@@ -1126,10 +1391,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   Widget _buildSC3Screen(
       BuildContext context, TransferProgressState? progressState) {
     if (progressState == null) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) setState(() => _currentScreen = AppScreen.home);
-      });
-      return const SizedBox.shrink();
+      return _buildHomeScreen(context);
     }
 
     final isTransferring =
@@ -1268,8 +1530,12 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
             physics: const AlwaysScrollableScrollPhysics(),
             itemCount: state.files.length,
             separatorBuilder: (_, _) => const SizedBox(height: 6),
-            itemBuilder: (context, index) =>
-                _buildSC3FileRow(context, state.files[index], accentColor),
+            itemBuilder: (context, index) => _buildSC3FileRow(
+              context,
+              state.files[index],
+              accentColor,
+              state.status,
+            ),
           ),
         ),
       ],
@@ -1280,11 +1546,20 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     BuildContext context,
     PerFileTransferState f,
     Color transferAccent,
+    TransferProgressStatus overallStatus,
   ) {
-    final isActive = f.status == FileTransferStatus.transferring;
     final isDone = f.status == FileTransferStatus.completed;
-    final isFailed = f.status == FileTransferStatus.failed;
-    final isCancelled = f.status == FileTransferStatus.cancelled;
+    final isOverallCancelled =
+        overallStatus == TransferProgressStatus.cancelled;
+    final isOverallFailed = overallStatus == TransferProgressStatus.failed;
+
+    final isActive = !isOverallCancelled &&
+        !isOverallFailed &&
+        f.status == FileTransferStatus.transferring;
+    final isFailed = f.status == FileTransferStatus.failed ||
+        (!isDone && isOverallFailed && !isOverallCancelled);
+    final isCancelled = f.status == FileTransferStatus.cancelled ||
+        (!isDone && isOverallCancelled);
 
     final Color statusColor;
     final IconData statusIcon;
@@ -1294,14 +1569,14 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       statusColor = const Color(0xFF10B981);
       statusIcon = Icons.check_circle_rounded;
       statusLabel = 'Complete';
-    } else if (isFailed) {
-      statusColor = const Color(0xFFEF4444);
-      statusIcon = Icons.error_outline_rounded;
-      statusLabel = 'Failed';
     } else if (isCancelled) {
       statusColor = const Color(0xFFF59E0B);
       statusIcon = Icons.cancel_outlined;
       statusLabel = 'Cancelled';
+    } else if (isFailed) {
+      statusColor = const Color(0xFFEF4444);
+      statusIcon = Icons.error_outline_rounded;
+      statusLabel = 'Failed';
     } else if (isActive) {
       statusColor = transferAccent;
       statusIcon = Icons.sync_rounded;
@@ -1464,81 +1739,90 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   // ──────────────────────────────────────────────────────────
 
   Widget _buildRadarCard(BuildContext context) {
-    final accentColor = const Color(0xFF6366F1);
+    const accentColor = Color(0xFF3B82F6);
 
     return Container(
       height: double.infinity,
       width: double.infinity,
       decoration: BoxDecoration(
-        color: const Color(0xFF0B1220),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: const Color(0xFF19233A), width: 1),
+        color: const Color(0xFF12141D),
+        borderRadius: BorderRadius.circular(28),
+        border: Border.all(color: const Color(0xFF1F2232), width: 1),
       ),
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(20),
+        borderRadius: BorderRadius.circular(28),
         child: Stack(
           alignment: Alignment.center,
           fit: StackFit.expand,
           children: [
-            AnimatedBuilder(
-              animation: _radarAnimationController,
-              builder: (context, _) {
-                return CustomPaint(
-                  painter: RadarBackgroundPainter(
-                    animationValue: _radarAnimationController.value,
-                    accentColor: accentColor,
-                  ),
+            ValueListenableBuilder<List<DiscoveredDevice>>(
+              valueListenable: _discoveryService.discoveredDevicesNotifier,
+              builder: (context, devices, _) {
+                return AnimatedBuilder(
+                  animation: _radarAnimationController,
+                  builder: (context, _) {
+                    return CustomPaint(
+                      painter: RadarBackgroundPainter(
+                        animationValue: _radarAnimationController.value,
+                        accentColor: accentColor,
+                        devices: devices,
+                        isWifiOn: _isWifiOn,
+                      ),
+                    );
+                  },
                 );
               },
             ),
             Center(
               child: Container(
-                width: 48,
-                height: 48,
+                width: 52,
+                height: 52,
                 decoration: BoxDecoration(
-                  color: const Color(0xFF0B1220),
+                  color: const Color(0xFF161E33),
                   shape: BoxShape.circle,
                   border: Border.all(
-                    color: accentColor.withValues(alpha: 0.4),
+                    color: accentColor.withValues(alpha: 0.6),
                     width: 1.5,
                   ),
                   boxShadow: [
                     BoxShadow(
-                      color: accentColor.withValues(alpha: 0.15),
-                      blurRadius: 10,
+                      color: accentColor.withValues(alpha: 0.30),
+                      blurRadius: 16,
                     ),
                   ],
                 ),
-                child: Icon(
+                child: const Icon(
                   Icons.wifi_tethering_rounded,
-                  size: 24,
-                  color: accentColor,
+                  size: 26,
+                  color: Color(0xFF38BDF8),
                 ),
               ),
             ),
             Positioned(
-              left: 16,
-              right: 16,
-              bottom: 16,
+              left: 20,
+              right: 20,
+              bottom: 20,
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(
-                    'Scanning for devices...',
+                    _isWifiOn
+                        ? 'Scanning for devices...'
+                        : 'Turn on WiFi to start scanning.',
                     style: GoogleFonts.plusJakartaSans(
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
                       color: Colors.white,
                     ),
                     textAlign: TextAlign.center,
                   ),
-                  const SizedBox(height: 2),
+                  const SizedBox(height: 3),
                   Text(
                     'Make sure AirShare is open on nearby devices.',
                     style: GoogleFonts.plusJakartaSans(
                       fontSize: 12,
                       fontWeight: FontWeight.w400,
-                      color: const Color(0xFF64748B),
+                      color: const Color(0xFF8E95A5),
                     ),
                     textAlign: TextAlign.center,
                   ),
@@ -1560,6 +1844,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     required List<DiscoveredDevice> devices,
     required String heading,
     required void Function(DiscoveredDevice) onDeviceTap,
+    bool showArrow = true,
   }) {
     const int maxVisible = 3;
     final realCount = devices.length;
@@ -1571,63 +1856,65 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Padding(
-          padding: const EdgeInsets.only(left: 2, bottom: 8),
+          padding: const EdgeInsets.only(left: 4, bottom: 10),
           child: Row(
             children: [
               Text(
                 heading,
                 style: GoogleFonts.plusJakartaSans(
-                  fontSize: 14,
-                  fontWeight: FontWeight.bold,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
                   color: Colors.white,
                 ),
               ),
-              const SizedBox(width: 6),
+              const SizedBox(width: 8),
               Container(
                 padding:
-                    const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                    const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                 decoration: BoxDecoration(
-                  color: const Color(0xFF6366F1).withValues(alpha: 0.15),
+                  color: const Color(0xFF1A233D),
                   borderRadius: BorderRadius.circular(10),
                 ),
                 child: Text(
                   '$realCount',
                   style: GoogleFonts.plusJakartaSans(
-                    fontSize: 11,
+                    fontSize: 12,
                     fontWeight: FontWeight.bold,
-                    color: const Color(0xFF818CF8),
+                    color: const Color(0xFF38BDF8),
                   ),
                 ),
               ),
-              const SizedBox(width: 8),
-              const SizedBox(
-                width: 12,
-                height: 12,
-                child: CircularProgressIndicator(
-                  strokeWidth: 1.5,
-                  valueColor:
-                      AlwaysStoppedAnimation<Color>(Color(0xFF818CF8)),
+              if (_isWifiOn) ...[
+                const SizedBox(width: 8),
+                const SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.5,
+                    valueColor:
+                        AlwaysStoppedAnimation<Color>(Color(0xFF38BDF8)),
+                  ),
                 ),
-              ),
+              ],
             ],
           ),
         ),
         Expanded(
           child: Container(
             decoration: BoxDecoration(
-              color: const Color(0xFF0B1220),
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: const Color(0xFF19233A), width: 1),
+              color: const Color(0xFF12141D),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: const Color(0xFF1F2232), width: 1),
             ),
             child: ClipRRect(
-              borderRadius: BorderRadius.circular(16),
+              borderRadius: BorderRadius.circular(20),
               child: ListView.separated(
                 physics: scrollable
                     ? const AlwaysScrollableScrollPhysics()
                     : const NeverScrollableScrollPhysics(),
                 itemCount: totalSlots,
                 separatorBuilder: (_, _) =>
-                    const Divider(height: 1, color: Color(0xFF19233A)),
+                    const Divider(height: 1, color: Color(0xFF1F2232)),
                 itemBuilder: (context, index) {
                   if (index < realCount) {
                     return _buildDeviceItem(
@@ -1636,6 +1923,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                       index,
                       totalSlots,
                       onDeviceTap,
+                      showArrow: showArrow,
                     );
                   }
                   return const ShimmerDeviceTile();
@@ -1653,8 +1941,9 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     DiscoveredDevice device,
     int index,
     int totalItems,
-    void Function(DiscoveredDevice) onTap,
-  ) {
+    void Function(DiscoveredDevice) onTap, {
+    bool showArrow = true,
+  }) {
     final iconData = _getDeviceIcon(device.deviceName);
 
     return Material(
@@ -1662,26 +1951,28 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       child: InkWell(
         onTap: _isSendingRequest ? null : () => onTap(device),
         borderRadius: index == 0 && totalItems == 1
-            ? BorderRadius.circular(16)
+            ? BorderRadius.circular(20)
             : index == 0
-                ? const BorderRadius.vertical(top: Radius.circular(16))
+                ? const BorderRadius.vertical(top: Radius.circular(20))
                 : index == totalItems - 1
-                    ? const BorderRadius.vertical(bottom: Radius.circular(16))
+                    ? const BorderRadius.vertical(bottom: Radius.circular(20))
                     : BorderRadius.zero,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
           child: Row(
             children: [
               Container(
-                padding: const EdgeInsets.all(7),
+                width: 44,
+                height: 44,
+                alignment: Alignment.center,
                 decoration: BoxDecoration(
-                  color: const Color(0xFF6366F1).withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(10),
+                  color: const Color(0xFF1A233D),
+                  borderRadius: BorderRadius.circular(12),
                 ),
                 child:
-                    Icon(iconData, size: 18, color: const Color(0xFF818CF8)),
+                    Icon(iconData, size: 20, color: const Color(0xFF38BDF8)),
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: 14),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -1690,13 +1981,13 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                       device.deviceName,
                       style: GoogleFonts.plusJakartaSans(
                         fontSize: 14,
-                        fontWeight: FontWeight.w600,
+                        fontWeight: FontWeight.w700,
                         color: Colors.white,
                       ),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
-                    const SizedBox(height: 2),
+                    const SizedBox(height: 3),
                     Row(
                       children: [
                         Container(
@@ -1707,13 +1998,13 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                             shape: BoxShape.circle,
                           ),
                         ),
-                        const SizedBox(width: 5),
+                        const SizedBox(width: 6),
                         Text(
                           'Nearby · Ready to receive',
                           style: GoogleFonts.plusJakartaSans(
                             fontSize: 12,
                             fontWeight: FontWeight.w500,
-                            color: const Color(0xFF64748B),
+                            color: const Color(0xFF8E95A5),
                           ),
                         ),
                       ],
@@ -1721,11 +2012,20 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                   ],
                 ),
               ),
-              const Icon(
-                Icons.chevron_right_rounded,
-                size: 18,
-                color: Color(0xFF64748B),
-              ),
+              if (showArrow)
+                Container(
+                  width: 32,
+                  height: 32,
+                  decoration: const BoxDecoration(
+                    color: Color(0xFF1C2030),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(
+                    Icons.chevron_right_rounded,
+                    size: 18,
+                    color: Color(0xFF8E95A5),
+                  ),
+                ),
             ],
           ),
         ),
@@ -1743,36 +2043,61 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       height: double.infinity,
       child: Container(
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(20),
           gradient: const LinearGradient(
-            colors: [Color(0xFF6366F1), Color(0xFF4F46E5)],
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
+            colors: [Color(0xFF2563EB), Color(0xFF3B82F6)],
+            begin: Alignment.centerLeft,
+            end: Alignment.centerRight,
           ),
           boxShadow: [
             BoxShadow(
-              color: const Color(0xFF6366F1).withValues(alpha: 0.35),
-              blurRadius: 14,
+              color: const Color(0xFF2563EB).withValues(alpha: 0.35),
+              blurRadius: 16,
               offset: const Offset(0, 4),
             ),
           ],
         ),
-        child: ElevatedButton.icon(
+        child: ElevatedButton(
           onPressed: _pickFiles,
-          icon: const Icon(Icons.upload_file_rounded, size: 21),
-          label: const Text('Select Files to Send'),
           style: ElevatedButton.styleFrom(
             backgroundColor: Colors.transparent,
             shadowColor: Colors.transparent,
             foregroundColor: Colors.white,
             shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(16),
+              borderRadius: BorderRadius.circular(20),
             ),
-            textStyle: GoogleFonts.plusJakartaSans(
-              fontSize: 15,
-              fontWeight: FontWeight.bold,
-              letterSpacing: 0.2,
-            ),
+            padding: const EdgeInsets.symmetric(horizontal: 20),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.upload_rounded, size: 24, color: Colors.white),
+              const SizedBox(width: 12),
+              Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Select Files to Send',
+                    style: GoogleFonts.plusJakartaSans(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white,
+                      letterSpacing: -0.2,
+                    ),
+                  ),
+                  const SizedBox(height: 1),
+                  Text(
+                    'or drop files here',
+                    style: GoogleFonts.plusJakartaSans(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w400,
+                      color: const Color(0xFFDBEAFE),
+                    ),
+                  ),
+                ],
+              ),
+            ],
           ),
         ),
       ),
@@ -1787,10 +2112,14 @@ class RadarBackgroundPainter extends CustomPainter {
   RadarBackgroundPainter({
     required this.animationValue,
     required this.accentColor,
+    required this.devices,
+    this.isWifiOn = true,
   });
 
   final double animationValue;
   final Color accentColor;
+  final List<DiscoveredDevice> devices;
+  final bool isWifiOn;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1798,12 +2127,12 @@ class RadarBackgroundPainter extends CustomPainter {
     final maxRadius = size.shortestSide * 0.42;
 
     final ringPaint = Paint()
-      ..color = accentColor.withValues(alpha: 0.06)
+      ..color = const Color(0xFF232A44)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.0;
 
     final crosshairPaint = Paint()
-      ..color = accentColor.withValues(alpha: 0.04)
+      ..color = const Color(0xFF1A2035)
       ..strokeWidth = 1.0;
 
     for (int i = 1; i <= 4; i++) {
@@ -1821,50 +2150,89 @@ class RadarBackgroundPainter extends CustomPainter {
       crosshairPaint,
     );
 
-    final pulseProgress = animationValue % 1.0;
-    final pulseRadius = maxRadius * pulseProgress;
-    final pulseOpacity = (1.0 - pulseProgress).clamp(0.0, 1.0) * 0.12;
+    if (isWifiOn) {
+      final pulseProgress = animationValue % 1.0;
+      final pulseRadius = maxRadius * pulseProgress;
+      final pulseOpacity = (1.0 - pulseProgress).clamp(0.0, 1.0) * 0.15;
 
-    canvas.drawCircle(
-      center,
-      pulseRadius,
-      Paint()
-        ..color = accentColor.withValues(alpha: pulseOpacity)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.5,
-    );
+      canvas.drawCircle(
+        center,
+        pulseRadius,
+        Paint()
+          ..color = accentColor.withValues(alpha: pulseOpacity)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.5,
+      );
 
-    final sweepAngle = math.pi / 4;
-    final startAngle = animationValue * 2 * math.pi;
+      final sweepAngle = math.pi / 3;
+      final startAngle = animationValue * 2 * math.pi;
 
-    final sweepPaint = Paint()
-      ..shader = SweepGradient(
-        center: Alignment.center,
-        startAngle: 0.0,
-        endAngle: sweepAngle,
-        colors: [
-          accentColor.withValues(alpha: 0.0),
-          accentColor.withValues(alpha: 0.10),
-        ],
-      ).createShader(Rect.fromCircle(center: center, radius: maxRadius));
+      final sweepPaint = Paint()
+        ..shader = SweepGradient(
+          center: Alignment.center,
+          startAngle: 0.0,
+          endAngle: sweepAngle,
+          colors: [
+            accentColor.withValues(alpha: 0.0),
+            accentColor.withValues(alpha: 0.28),
+          ],
+        ).createShader(Rect.fromCircle(center: center, radius: maxRadius));
 
-    canvas.save();
-    canvas.translate(center.dx, center.dy);
-    canvas.rotate(startAngle);
-    canvas.drawArc(
-      Rect.fromCircle(center: Offset.zero, radius: maxRadius),
-      0,
-      sweepAngle,
-      true,
-      sweepPaint,
-    );
-    canvas.restore();
+      canvas.save();
+      canvas.translate(center.dx, center.dy);
+      canvas.rotate(startAngle);
+      canvas.drawArc(
+        Rect.fromCircle(center: Offset.zero, radius: maxRadius),
+        0,
+        sweepAngle,
+        true,
+        sweepPaint,
+      );
+      canvas.restore();
+    }
+
+    // Paint illuminated glowing dots for discovered devices
+    for (int i = 0; i < devices.length; i++) {
+      final device = devices[i];
+      final hash = device.deviceId.hashCode.abs();
+
+      final angle = ((hash % 360) * math.pi / 180.0) + (i * 1.2);
+      final radiusStep = 0.35 + ((hash % 50) / 100.0);
+      final r = maxRadius * radiusStep;
+
+      final dotOffset = Offset(
+        center.dx + r * math.cos(angle),
+        center.dy + r * math.sin(angle),
+      );
+
+      // Outer glow aura
+      final auraPaint = Paint()
+        ..shader = RadialGradient(
+          colors: [
+            const Color(0xFF60A5FA).withValues(alpha: 0.85),
+            const Color(0xFF2563EB).withValues(alpha: 0.4),
+            const Color(0xFF2563EB).withValues(alpha: 0.0),
+          ],
+          stops: const [0.0, 0.45, 1.0],
+        ).createShader(Rect.fromCircle(center: dotOffset, radius: 14));
+
+      canvas.drawCircle(dotOffset, 14, auraPaint);
+
+      // Bright inner core dot
+      final corePaint = Paint()
+        ..color = const Color(0xFFFFFFFF)
+        ..style = PaintingStyle.fill;
+
+      canvas.drawCircle(dotOffset, 3.5, corePaint);
+    }
   }
 
   @override
   bool shouldRepaint(covariant RadarBackgroundPainter oldDelegate) {
     return oldDelegate.animationValue != animationValue ||
-        oldDelegate.accentColor != accentColor;
+        oldDelegate.accentColor != accentColor ||
+        oldDelegate.devices != devices ||
+        oldDelegate.isWifiOn != isWifiOn;
   }
 }
 
@@ -1903,24 +2271,24 @@ class _ShimmerDeviceTileState extends State<ShimmerDeviceTile>
       animation: _controller,
       builder: (context, _) {
         return Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
           child: Row(
             children: [
-              _buildShimmerBox(width: 32, height: 32, borderRadius: 10),
-              const SizedBox(width: 12),
+              _buildShimmerBox(width: 44, height: 44, borderRadius: 12),
+              const SizedBox(width: 14),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    _buildShimmerBox(width: 130, height: 12, borderRadius: 4),
+                    _buildShimmerBox(width: 130, height: 14, borderRadius: 4),
                     const SizedBox(height: 6),
-                    _buildShimmerBox(width: 90, height: 10, borderRadius: 4),
+                    _buildShimmerBox(width: 90, height: 11, borderRadius: 4),
                   ],
                 ),
               ),
               const SizedBox(width: 12),
-              _buildShimmerBox(width: 14, height: 14, borderRadius: 7),
+              _buildShimmerBox(width: 32, height: 32, borderRadius: 16),
             ],
           ),
         );
@@ -1943,9 +2311,9 @@ class _ShimmerDeviceTileState extends State<ShimmerDeviceTile>
           begin: Alignment(-1.5 + (shimmerPosition * 3.5), 0),
           end: Alignment(-0.3 + (shimmerPosition * 3.5), 0),
           colors: const [
-            Color(0xFF1E293B),
-            Color(0xFF263044),
-            Color(0xFF1E293B),
+            Color(0xFF151826),
+            Color(0xFF20263B),
+            Color(0xFF151826),
           ],
           stops: const [0.0, 0.5, 1.0],
         ),

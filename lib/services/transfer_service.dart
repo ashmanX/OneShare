@@ -39,11 +39,36 @@ class TransferService {
 
   final ValueNotifier<PendingTransferRequest?> incomingRequestNotifier =
       ValueNotifier(null);
-  final ValueNotifier<TransferProgressState?> progressNotifier =
+
+  // BUG-11 FIX: Split into separate sender/receiver notifiers so simultaneous
+  // send+receive operations do not overwrite each other's progress display.
+  final ValueNotifier<TransferProgressState?> sendProgressNotifier =
+      ValueNotifier(null);
+  final ValueNotifier<TransferProgressState?> receiveProgressNotifier =
       ValueNotifier(null);
 
-  final Set<String> _processedTransferIds = {};
-  final Set<String> _cancelledTransferIds = {};
+  // BUG-07 FIX: Use LinkedHashSet so we can evict oldest entries when the
+  // sets grow beyond the max cap, preventing unbounded memory growth.
+  final _processedTransferIds = <String>{};
+  final _cancelledTransferIds = <String>{};
+  static const int _maxIdSetSize = 500;
+  static const int _idSetEvictCount = 100;
+
+  void _addProcessedId(String id) {
+    if (_processedTransferIds.length >= _maxIdSetSize) {
+      final toRemove = _processedTransferIds.take(_idSetEvictCount).toList();
+      _processedTransferIds.removeAll(toRemove);
+    }
+    _processedTransferIds.add(id);
+  }
+
+  void _addCancelledId(String id) {
+    if (_cancelledTransferIds.length >= _maxIdSetSize) {
+      final toRemove = _cancelledTransferIds.take(_idSetEvictCount).toList();
+      _cancelledTransferIds.removeAll(toRemove);
+    }
+    _cancelledTransferIds.add(id);
+  }
 
   HttpClientRequest? _activeOutgoingRequest;
   IOSink? _activeIncomingSink;
@@ -51,6 +76,10 @@ class TransferService {
   HttpRequest? _activeIncomingHttpRequest;
   String? _activeTargetHost;
   int? _activeTargetPort;
+
+  // BUG-01 FIX: Completer used to cancel a pending outgoing transfer request
+  // before the 35-second timeout fires.
+  Completer<TransferRequestOutcome>? _outgoingCancelCompleter;
 
   final Map<String, TransferToken> _activeTokens = {};
   final Map<String, Completer<TransferRequestOutcome>> _outgoingRequests = {};
@@ -65,14 +94,82 @@ class TransferService {
     return _cancelledTransferIds.contains(transferId);
   }
 
+  // ──────────────────────────────────────────────────────────
+  // BUG-01 FIX: Cancel an outgoing request that is waiting for acceptance.
+  // ──────────────────────────────────────────────────────────
+
+  /// Cancels an outgoing transfer request that is currently waiting for the
+  /// receiver to accept/reject. This resolves [sendTransferRequest]'s future
+  /// immediately with a [cancelled] outcome instead of waiting 35 seconds,
+  /// and sends an HTTP POST cancel notification to the peer so their incoming
+  /// dialog auto-dismisses.
+  void cancelOutgoingRequest([String? transferId]) {
+    final targetId = (transferId != null && transferId.isNotEmpty)
+        ? transferId
+        : _outgoingRequests.keys.firstOrNull;
+
+    final host = _activeTargetHost;
+    final port = _activeTargetPort;
+    if (targetId != null && host != null && port != null) {
+      _sendCancelNotificationToPeer(host, port, targetId);
+    }
+
+    final cancelCompleter = _outgoingCancelCompleter;
+    if (cancelCompleter != null && !cancelCompleter.isCompleted) {
+      cancelCompleter.complete(
+        const TransferRequestOutcome(
+          status: TransferResultStatus.failed,
+          message: 'Transfer request cancelled by user',
+        ),
+      );
+    }
+    // Also complete any pending completer waiting on accept/reject
+    if (targetId != null && _outgoingRequests.containsKey(targetId)) {
+      _outgoingFileItems.remove(targetId);
+      _outgoingRequests.remove(targetId)?.complete(
+            const TransferRequestOutcome(
+              status: TransferResultStatus.failed,
+              message: 'Transfer request cancelled by user',
+            ),
+          );
+    }
+  }
+
+  Future<void> _sendCancelNotificationToPeer(
+      String host, int port, String transferId) async {
+    try {
+      final uri = Uri.http('$host:$port', DropLanConfig.transferCancelPath);
+      final req = await _client.postUrl(uri);
+      req.headers.contentType = ContentType.json;
+      req.write(jsonEncode({
+        'transferId': transferId,
+        'senderDeviceId': DeviceIdentityService.identity.deviceId,
+      }));
+      final resp = await req.close();
+      await resp.drain();
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('[DropLAN TransferService] Peer cancel notify error: $e');
+      }
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Cancel transfer
+  // ──────────────────────────────────────────────────────────
+
   Future<void> cancelTransfer(String transferId) async {
     if (kDebugMode) {
       debugPrint('[DropLAN TransferService] cancelTransfer called for: $transferId');
     }
-    _cancelledTransferIds.add(transferId);
+    _addCancelledId(transferId);
 
-    // 1. Instantly set progress status to cancelled
-    final current = progressNotifier.value;
+    // BUG-08 FIX: Clean up _acceptedRequests and _activeTokens on cancel so
+    // stale tokens cannot be used after a transfer is cancelled.
+    _cleanupTransferState(transferId);
+
+    // 1. Instantly set progress status to cancelled on the SENDER notifier.
+    final current = sendProgressNotifier.value;
     final cancelledFiles = current?.files.map((f) {
       if (f.status == FileTransferStatus.completed) return f;
       return PerFileTransferState(
@@ -85,7 +182,7 @@ class TransferService {
       );
     }).toList() ?? const [];
 
-    progressNotifier.value = TransferProgressState(
+    sendProgressNotifier.value = TransferProgressState(
       transferId: transferId,
       currentFileName: current?.currentFileName ?? 'Transfer',
       currentFileIndex: current?.currentFileIndex ?? 1,
@@ -99,7 +196,28 @@ class TransferService {
       errorMessage: 'Transfer cancelled by user',
     );
 
-    // 2. Abort active outgoing HTTP upload request if present
+    // BUG-04 FIX: Send cancel notification to peer BEFORE aborting the local
+    // HTTP request. This gives the receiver a chance to set the "cancelled"
+    // state before the connection drop triggers a "failed" state.
+    final host = _activeTargetHost;
+    final port = _activeTargetPort;
+    if (host != null && port != null) {
+      try {
+        final uri = Uri.http('$host:$port', DropLanConfig.transferCancelPath);
+        final req = await _client.postUrl(uri);
+        req.headers.contentType = ContentType.json;
+        req.write(jsonEncode({
+          'transferId': transferId,
+          'senderDeviceId': DeviceIdentityService.identity.deviceId,
+        }));
+        final resp = await req.close();
+        await resp.drain();
+      } catch (e) {
+        if (kDebugMode) debugPrint('[DropLAN TransferService] Peer cancel notify error: $e');
+      }
+    }
+
+    // 2. Abort active outgoing HTTP upload request if present.
     if (_activeOutgoingRequest != null) {
       try {
         _activeOutgoingRequest?.abort();
@@ -109,7 +227,7 @@ class TransferService {
       _activeOutgoingRequest = null;
     }
 
-    // 3. Abort active incoming file sink & temp file if present
+    // 3. Abort active incoming file sink & temp file if present.
     if (_activeIncomingSink != null) {
       try {
         await _activeIncomingSink?.close();
@@ -138,24 +256,21 @@ class TransferService {
       } catch (_) {}
       _activeIncomingHttpRequest = null;
     }
+  }
 
-    // 4. Send cancellation notification HTTP POST to peer device
-    final host = _activeTargetHost;
-    final port = _activeTargetPort;
-    if (host != null && port != null) {
-      try {
-        final uri = Uri.http('$host:$port', DropLanConfig.transferCancelPath);
-        final req = await _client.postUrl(uri);
-        req.headers.contentType = ContentType.json;
-        req.write(jsonEncode({
-          'transferId': transferId,
-          'senderDeviceId': DeviceIdentityService.identity.deviceId,
-        }));
-        final resp = await req.close();
-        await resp.drain();
-      } catch (e) {
-        if (kDebugMode) debugPrint('[DropLAN TransferService] Peer cancel notify error: $e');
-      }
+  /// Cleans up per-transfer state (accepted request entry + token).
+  /// Called on both cancel and normal completion to prevent leaks.
+  void _cleanupTransferState(String transferId) {
+    // BUG-08 FIX: Remove acceptedRequest entry.
+    _acceptedRequests.remove(transferId);
+
+    // BUG-08 FIX: Find and invalidate the token for this transfer.
+    final tokenKey = _activeTokens.entries
+        .where((e) => e.value.transferId == transferId)
+        .map((e) => e.key)
+        .firstOrNull;
+    if (tokenKey != null) {
+      _activeTokens.remove(tokenKey);
     }
   }
 
@@ -163,7 +278,17 @@ class TransferService {
     if (kDebugMode) {
       debugPrint('[DropLAN TransferService] Peer notification cancelled transfer: $transferId');
     }
-    _cancelledTransferIds.add(transferId);
+    _addCancelledId(transferId);
+
+    // If an incoming request dialog is open on this device for this transferId,
+    // cancel its timer and clear the notifier so the dialog auto-dismisses.
+    if (incomingRequestNotifier.value?.transferId == transferId) {
+      incomingRequestNotifier.value?.timer?.cancel();
+      incomingRequestNotifier.value = null;
+    }
+
+    // BUG-08 FIX: Clean up receiver-side state on peer cancel.
+    _cleanupTransferState(transferId);
 
     if (_activeIncomingSink != null) {
       try {
@@ -188,7 +313,8 @@ class TransferService {
       _activeOutgoingRequest = null;
     }
 
-    final current = progressNotifier.value;
+    // Update the RECEIVER progress notifier on cancel notification.
+    final current = receiveProgressNotifier.value;
     final cancelledFiles = current?.files.map((f) {
       if (f.status == FileTransferStatus.completed) return f;
       return PerFileTransferState(
@@ -201,7 +327,7 @@ class TransferService {
       );
     }).toList() ?? const [];
 
-    progressNotifier.value = TransferProgressState(
+    receiveProgressNotifier.value = TransferProgressState(
       transferId: transferId,
       currentFileName: current?.currentFileName ?? 'Transfer',
       currentFileIndex: current?.currentFileIndex ?? 1,
@@ -223,6 +349,8 @@ class TransferService {
     String? localHost,
     int? senderPort,
   }) async {
+    _activeTargetHost = targetHost;
+    _activeTargetPort = targetPort;
     final transferId = _generateUuidV4();
     final ownIdentity = DeviceIdentityService.identity;
 
@@ -252,6 +380,11 @@ class TransferService {
 
     final completer = Completer<TransferRequestOutcome>();
     _outgoingRequests[transferId] = completer;
+
+    // BUG-01 FIX: Set up the cancel completer so cancelOutgoingRequest() can
+    // resolve this future immediately without waiting for the 35s timeout.
+    final cancelCompleter = Completer<TransferRequestOutcome>();
+    _outgoingCancelCompleter = cancelCompleter;
 
     // 35 second fallback timeout for sender
     final timer = Timer(const Duration(seconds: 35), () {
@@ -295,6 +428,7 @@ class TransferService {
 
       if (response.statusCode != HttpStatus.ok) {
         timer.cancel();
+        _outgoingCancelCompleter = null;
         _outgoingFileItems.remove(transferId);
         _outgoingRequests.remove(transferId);
         return TransferRequestOutcome(
@@ -303,8 +437,14 @@ class TransferService {
         );
       }
 
-      final result = await completer.future;
+      // BUG-01 FIX: Race the response completer against the cancel completer.
+      // Whichever fires first wins.
+      final result = await Future.any([
+        completer.future,
+        cancelCompleter.future,
+      ]);
       timer.cancel();
+      _outgoingCancelCompleter = null;
       return result;
     } catch (e) {
       if (kDebugMode) {
@@ -312,6 +452,7 @@ class TransferService {
             '[DropLAN Timestamp] MAC REQUEST RESPONSE/TIMEOUT transferId=$transferId status=EXCEPTION error=$e time=${DateTime.now().toIso8601String()}');
       }
       timer.cancel();
+      _outgoingCancelCompleter = null;
       _outgoingFileItems.remove(transferId);
       _outgoingRequests.remove(transferId);
       return TransferRequestOutcome(
@@ -382,235 +523,243 @@ class TransferService {
         filesToSend.fold<int>(0, (sum, f) => sum + f.fileItem.fileSize);
     int completedFilesBytes = 0;
 
-    for (int i = 0; i < filesToSend.length; i++) {
-      if (isTransferCancelled(transferId)) {
-        if (kDebugMode) {
-          debugPrint(
-              '[DropLAN Stream Sender] Transfer $transferId was cancelled before file ${i + 1}');
-        }
-        _activeOutgoingRequest = null;
-        return false;
-      }
-
-      final fileToSend = filesToSend[i];
-      final fileItem = fileToSend.fileItem;
-      final isContentUri = fileToSend.localPath.startsWith('content://');
-
-      if (!isContentUri) {
-        final file = File(fileToSend.localPath);
-        if (!await file.exists()) {
+    try {
+      for (int i = 0; i < filesToSend.length; i++) {
+        if (isTransferCancelled(transferId)) {
           if (kDebugMode) {
             debugPrint(
-                '[DropLAN Stream Sender] File not found on sender: ${fileToSend.localPath}');
+                '[DropLAN Stream Sender] Transfer $transferId was cancelled before file ${i + 1}');
           }
-          if (!isTransferCancelled(transferId)) {
-            progressNotifier.value = TransferProgressState(
-              transferId: transferId,
-              currentFileName: fileItem.fileName,
-              currentFileIndex: i + 1,
-              totalFiles: filesToSend.length,
-              currentFileBytesTransferred: 0,
-              currentFileSizeBytes: fileItem.fileSize,
-              overallBytesTransferred: completedFilesBytes,
-              overallTotalBytes: overallTotalBytes,
-              status: TransferProgressStatus.failed,
-              errorMessage: 'File not found on sender device: ${fileItem.fileName}',
-            );
-          }
-          return false;
-        }
-      }
-
-      if (!isTransferCancelled(transferId)) {
-        progressNotifier.value = TransferProgressState(
-          transferId: transferId,
-          currentFileName: fileItem.fileName,
-          currentFileIndex: i + 1,
-          totalFiles: filesToSend.length,
-          currentFileBytesTransferred: 0,
-          currentFileSizeBytes: fileItem.fileSize,
-          overallBytesTransferred: completedFilesBytes,
-          overallTotalBytes: overallTotalBytes,
-          status: TransferProgressStatus.transferring,
-          files: _buildSenderFileStates(
-              filesToSend, i, 0, FileTransferStatus.transferring),
-        );
-      }
-
-      try {
-        final uri =
-            Uri.http('$targetHost:$targetPort', DropLanConfig.transferFilePath);
-        if (kDebugMode) {
-          debugPrint('[DropLAN Stream Sender] Opening connection to $uri');
-          debugPrint(
-              '[DropLAN Stream Sender] transferId: $transferId, fileId: ${fileItem.fileId}, fileName: ${fileItem.fileName}, expectedSize: ${fileItem.fileSize}');
-        }
-        final request = await _client.postUrl(uri);
-        _activeOutgoingRequest = request;
-
-        request.headers.contentType = ContentType.binary;
-        request.headers.set('authorization', 'Bearer $transferToken');
-        request.headers.set('x-transfer-id', transferId);
-        request.headers.set('x-file-id', fileItem.fileId);
-        request.headers.set(
-            'x-file-name', Uri.encodeComponent(fileItem.fileName));
-        request.contentLength = fileItem.fileSize;
-
-        if (kDebugMode) {
-          debugPrint(
-              '[DropLAN Stream Sender] Connection opened. Streaming file data...');
-        }
-
-        int currentFileSent = 0;
-        int lastProgressUpdateMs = 0;
-        final fileStream = _openFileStream(
-          fileToSend.localPath,
-          transferId,
-          (chunkLength) {
-            currentFileSent += chunkLength;
-            final nowMs = DateTime.now().millisecondsSinceEpoch;
-            if (nowMs - lastProgressUpdateMs >= 50 ||
-                currentFileSent == fileItem.fileSize) {
-              lastProgressUpdateMs = nowMs;
-              if (!isTransferCancelled(transferId)) {
-                progressNotifier.value = TransferProgressState(
-                  transferId: transferId,
-                  currentFileName: fileItem.fileName,
-                  currentFileIndex: i + 1,
-                  totalFiles: filesToSend.length,
-                  currentFileBytesTransferred: currentFileSent,
-                  currentFileSizeBytes: fileItem.fileSize,
-                  overallBytesTransferred: completedFilesBytes + currentFileSent,
-                  overallTotalBytes: overallTotalBytes,
-                  status: TransferProgressStatus.transferring,
-                  files: _buildSenderFileStates(
-                      filesToSend, i, currentFileSent, FileTransferStatus.transferring),
-                );
-              }
-            }
-          },
-        );
-
-        await request.addStream(fileStream);
-        if (isTransferCancelled(transferId)) {
-          request.abort();
           _activeOutgoingRequest = null;
           return false;
         }
 
-        if (kDebugMode) {
-          debugPrint(
-              '[DropLAN Stream Sender] Finished writing stream to socket. Bytes sent: $currentFileSent / ${fileItem.fileSize}');
+        final fileToSend = filesToSend[i];
+        final fileItem = fileToSend.fileItem;
+        final isContentUri = fileToSend.localPath.startsWith('content://');
+
+        if (!isContentUri) {
+          final file = File(fileToSend.localPath);
+          if (!await file.exists()) {
+            if (kDebugMode) {
+              debugPrint(
+                  '[DropLAN Stream Sender] File not found on sender: ${fileToSend.localPath}');
+            }
+            if (!isTransferCancelled(transferId)) {
+              sendProgressNotifier.value = TransferProgressState(
+                transferId: transferId,
+                currentFileName: fileItem.fileName,
+                currentFileIndex: i + 1,
+                totalFiles: filesToSend.length,
+                currentFileBytesTransferred: 0,
+                currentFileSizeBytes: fileItem.fileSize,
+                overallBytesTransferred: completedFilesBytes,
+                overallTotalBytes: overallTotalBytes,
+                status: TransferProgressStatus.failed,
+                errorMessage: 'File not found on sender device: ${fileItem.fileName}',
+              );
+            }
+            return false;
+          }
         }
 
-        final response = await request.close();
-        _activeOutgoingRequest = null;
-
-        if (isTransferCancelled(transferId)) {
-          return false;
+        if (!isTransferCancelled(transferId)) {
+          sendProgressNotifier.value = TransferProgressState(
+            transferId: transferId,
+            currentFileName: fileItem.fileName,
+            currentFileIndex: i + 1,
+            totalFiles: filesToSend.length,
+            currentFileBytesTransferred: 0,
+            currentFileSizeBytes: fileItem.fileSize,
+            overallBytesTransferred: completedFilesBytes,
+            overallTotalBytes: overallTotalBytes,
+            status: TransferProgressStatus.transferring,
+            files: _buildSenderFileStates(
+                filesToSend, i, 0, FileTransferStatus.transferring),
+          );
         }
 
-        if (kDebugMode) {
-          debugPrint(
-              '[DropLAN Stream Sender] Response HTTP Status: ${response.statusCode}');
-        }
+        try {
+          final uri =
+              Uri.http('$targetHost:$targetPort', DropLanConfig.transferFilePath);
+          if (kDebugMode) {
+            debugPrint('[DropLAN Stream Sender] Opening connection to $uri');
+            debugPrint(
+                '[DropLAN Stream Sender] transferId: $transferId, fileId: ${fileItem.fileId}, fileName: ${fileItem.fileName}, expectedSize: ${fileItem.fileSize}');
+          }
+          final request = await _client.postUrl(uri);
+          _activeOutgoingRequest = request;
 
-        if (response.statusCode != HttpStatus.ok) {
-          final responseBody = await utf8.decoder.bind(response).join();
+          request.headers.contentType = ContentType.binary;
+          request.headers.set('authorization', 'Bearer $transferToken');
+          request.headers.set('x-transfer-id', transferId);
+          request.headers.set('x-file-id', fileItem.fileId);
+          request.headers.set(
+              'x-file-name', Uri.encodeComponent(fileItem.fileName));
+          request.contentLength = fileItem.fileSize;
+
           if (kDebugMode) {
             debugPrint(
-                '[DropLAN Stream Sender] Upload failed status ${response.statusCode}, body: $responseBody');
+                '[DropLAN Stream Sender] Connection opened. Streaming file data...');
           }
-          if (!isTransferCancelled(transferId)) {
-            progressNotifier.value = TransferProgressState(
-              transferId: transferId,
-              currentFileName: fileItem.fileName,
-              currentFileIndex: i + 1,
-              totalFiles: filesToSend.length,
-              currentFileBytesTransferred: currentFileSent,
-              currentFileSizeBytes: fileItem.fileSize,
-              overallBytesTransferred: completedFilesBytes + currentFileSent,
-              overallTotalBytes: overallTotalBytes,
-              status: TransferProgressStatus.failed,
-              errorMessage:
-                  'Upload failed (${response.statusCode}): $responseBody',
-              files: _buildSenderFileStates(
-                  filesToSend, i, currentFileSent, FileTransferStatus.failed,
-                  errorMessage: 'Upload failed (${response.statusCode})'),
-            );
+
+          int currentFileSent = 0;
+          int lastProgressUpdateMs = 0;
+          final fileStream = _openFileStream(
+            fileToSend.localPath,
+            transferId,
+            (chunkLength) {
+              currentFileSent += chunkLength;
+              final nowMs = DateTime.now().millisecondsSinceEpoch;
+              if (nowMs - lastProgressUpdateMs >= 50 ||
+                  currentFileSent == fileItem.fileSize) {
+                lastProgressUpdateMs = nowMs;
+                if (!isTransferCancelled(transferId)) {
+                  sendProgressNotifier.value = TransferProgressState(
+                    transferId: transferId,
+                    currentFileName: fileItem.fileName,
+                    currentFileIndex: i + 1,
+                    totalFiles: filesToSend.length,
+                    currentFileBytesTransferred: currentFileSent,
+                    currentFileSizeBytes: fileItem.fileSize,
+                    overallBytesTransferred: completedFilesBytes + currentFileSent,
+                    overallTotalBytes: overallTotalBytes,
+                    status: TransferProgressStatus.transferring,
+                    files: _buildSenderFileStates(
+                        filesToSend, i, currentFileSent, FileTransferStatus.transferring),
+                  );
+                }
+              }
+            },
+          );
+
+          await request.addStream(fileStream);
+          if (isTransferCancelled(transferId)) {
+            request.abort();
+            _activeOutgoingRequest = null;
+            return false;
           }
-          return false;
-        }
 
-        await response.drain();
-        if (kDebugMode) {
-          debugPrint(
-              '[DropLAN Stream Sender] Connection closed cleanly for ${fileItem.fileName}');
-        }
-
-        completedFilesBytes += fileItem.fileSize;
-      } catch (e, st) {
-        _activeOutgoingRequest = null;
-
-        if (isTransferCancelled(transferId) || e is TransferCancelledException) {
           if (kDebugMode) {
             debugPrint(
-                '[DropLAN Stream Sender] Outgoing transfer cancelled for $transferId');
+                '[DropLAN Stream Sender] Finished writing stream to socket. Bytes sent: $currentFileSent / ${fileItem.fileSize}');
           }
+
+          final response = await request.close();
+          _activeOutgoingRequest = null;
+
+          if (isTransferCancelled(transferId)) {
+            return false;
+          }
+
+          if (kDebugMode) {
+            debugPrint(
+                '[DropLAN Stream Sender] Response HTTP Status: ${response.statusCode}');
+          }
+
+          if (response.statusCode != HttpStatus.ok) {
+            final responseBody = await utf8.decoder.bind(response).join();
+            if (kDebugMode) {
+              debugPrint(
+                  '[DropLAN Stream Sender] Upload failed status ${response.statusCode}, body: $responseBody');
+            }
+            if (!isTransferCancelled(transferId)) {
+              sendProgressNotifier.value = TransferProgressState(
+                transferId: transferId,
+                currentFileName: fileItem.fileName,
+                currentFileIndex: i + 1,
+                totalFiles: filesToSend.length,
+                currentFileBytesTransferred: currentFileSent,
+                currentFileSizeBytes: fileItem.fileSize,
+                overallBytesTransferred: completedFilesBytes + currentFileSent,
+                overallTotalBytes: overallTotalBytes,
+                status: TransferProgressStatus.failed,
+                errorMessage:
+                    'Upload failed (${response.statusCode}): $responseBody',
+                files: _buildSenderFileStates(
+                    filesToSend, i, currentFileSent, FileTransferStatus.failed,
+                    errorMessage: 'Upload failed (${response.statusCode})'),
+              );
+            }
+            return false;
+          }
+
+          await response.drain();
+          if (kDebugMode) {
+            debugPrint(
+                '[DropLAN Stream Sender] Connection closed cleanly for ${fileItem.fileName}');
+          }
+
+          completedFilesBytes += fileItem.fileSize;
+        } catch (e, st) {
+          _activeOutgoingRequest = null;
+
+          if (isTransferCancelled(transferId) || e is TransferCancelledException) {
+            if (kDebugMode) {
+              debugPrint(
+                  '[DropLAN Stream Sender] Outgoing transfer cancelled for $transferId');
+            }
+            return false;
+          }
+
+          if (kDebugMode) {
+            debugPrint(
+                '[DropLAN Stream Sender] Exception during file upload: $e\n$st');
+          }
+          sendProgressNotifier.value = TransferProgressState(
+            transferId: transferId,
+            currentFileName: fileItem.fileName,
+            currentFileIndex: i + 1,
+            totalFiles: filesToSend.length,
+            currentFileBytesTransferred: 0,
+            currentFileSizeBytes: fileItem.fileSize,
+            overallBytesTransferred: completedFilesBytes,
+            overallTotalBytes: overallTotalBytes,
+            status: TransferProgressStatus.failed,
+            errorMessage: 'Transfer network error: $e',
+            files: _buildSenderFileStates(
+                filesToSend, i, 0, FileTransferStatus.failed,
+                errorMessage: 'Network error'),
+          );
           return false;
         }
+      }
 
-        if (kDebugMode) {
-          debugPrint(
-              '[DropLAN Stream Sender] Exception during file upload: $e\n$st');
-        }
-        progressNotifier.value = TransferProgressState(
-          transferId: transferId,
-          currentFileName: fileItem.fileName,
-          currentFileIndex: i + 1,
-          totalFiles: filesToSend.length,
-          currentFileBytesTransferred: 0,
-          currentFileSizeBytes: fileItem.fileSize,
-          overallBytesTransferred: completedFilesBytes,
-          overallTotalBytes: overallTotalBytes,
-          status: TransferProgressStatus.failed,
-          errorMessage: 'Transfer network error: $e',
-          files: _buildSenderFileStates(
-              filesToSend, i, 0, FileTransferStatus.failed,
-              errorMessage: 'Network error'),
-        );
+      if (isTransferCancelled(transferId)) {
         return false;
       }
-    }
 
-    if (isTransferCancelled(transferId)) {
-      return false;
-    }
+      final completedFiles = filesToSend.map((f) {
+        return PerFileTransferState(
+          fileId: f.fileItem.fileId,
+          fileName: f.fileItem.fileName,
+          fileSize: f.fileItem.fileSize,
+          bytesTransferred: f.fileItem.fileSize,
+          status: FileTransferStatus.completed,
+        );
+      }).toList();
 
-    final completedFiles = filesToSend.map((f) {
-      return PerFileTransferState(
-        fileId: f.fileItem.fileId,
-        fileName: f.fileItem.fileName,
-        fileSize: f.fileItem.fileSize,
-        bytesTransferred: f.fileItem.fileSize,
-        status: FileTransferStatus.completed,
+      sendProgressNotifier.value = TransferProgressState(
+        transferId: transferId,
+        currentFileName: filesToSend.last.fileItem.fileName,
+        currentFileIndex: filesToSend.length,
+        totalFiles: filesToSend.length,
+        currentFileBytesTransferred: filesToSend.last.fileItem.fileSize,
+        currentFileSizeBytes: filesToSend.last.fileItem.fileSize,
+        overallBytesTransferred: overallTotalBytes,
+        overallTotalBytes: overallTotalBytes,
+        status: TransferProgressStatus.completed,
+        files: completedFiles,
       );
-    }).toList();
 
-    progressNotifier.value = TransferProgressState(
-      transferId: transferId,
-      currentFileName: filesToSend.last.fileItem.fileName,
-      currentFileIndex: filesToSend.length,
-      totalFiles: filesToSend.length,
-      currentFileBytesTransferred: filesToSend.last.fileItem.fileSize,
-      currentFileSizeBytes: filesToSend.last.fileItem.fileSize,
-      overallBytesTransferred: overallTotalBytes,
-      overallTotalBytes: overallTotalBytes,
-      status: TransferProgressStatus.completed,
-      files: completedFiles,
-    );
-
-    return true;
+      return true;
+    } finally {
+      // BUG-22 FIX: Always clear _activeTargetHost/Port after a transfer ends
+      // (success, failure, or cancellation) to prevent stale cancel
+      // notifications being sent to the wrong peer on the next transfer.
+      _activeTargetHost = null;
+      _activeTargetPort = null;
+    }
   }
 
   Future<Map<String, dynamic>> handleIncomingRequest(
@@ -658,7 +807,7 @@ class TransferService {
       };
     }
 
-    _processedTransferIds.add(pendingRequest.transferId);
+    _addProcessedId(pendingRequest.transferId);
 
     final requestWithHost = PendingTransferRequest(
       transferId: pendingRequest.transferId,
@@ -735,6 +884,27 @@ class TransferService {
         debugPrint(
             '[DropLAN] Accept request completed with status: ${res.statusCode}');
       }
+
+      // BUG-05/06 FIX: If the sender returns 410 Gone, the request was
+      // accepted too late. Clean up receiver state and notify the user.
+      if (res.statusCode == HttpStatus.gone) {
+        if (kDebugMode) {
+          debugPrint('[DropLAN] Sender returned 410 — request expired. Cleaning up receiver state.');
+        }
+        _cleanupTransferState(transferId);
+        receiveProgressNotifier.value = TransferProgressState(
+          transferId: transferId,
+          currentFileName: 'Transfer',
+          currentFileIndex: 1,
+          totalFiles: request.files.length,
+          currentFileBytesTransferred: 0,
+          currentFileSizeBytes: 0,
+          overallBytesTransferred: 0,
+          overallTotalBytes: request.totalSize,
+          status: TransferProgressStatus.failed,
+          errorMessage: 'The sender is no longer waiting — request expired.',
+        );
+      }
     } catch (e, st) {
       if (kDebugMode) {
         debugPrint('[DropLAN] Error sending accept request: $e\n$st');
@@ -781,7 +951,10 @@ class TransferService {
     }
   }
 
-  void handleAcceptResponse(Map<String, dynamic> body) {
+  /// Handles an accept response from the receiver.
+  /// Returns [true] if the accept was processed, [false] if the request had
+  /// already timed out (BUG-05/06 fix — caller should respond with HTTP 410).
+  bool handleAcceptResponse(Map<String, dynamic> body) {
     final transferId = body['transferId'] as String?;
     final token = body['transferToken'] as String?;
 
@@ -795,7 +968,10 @@ class TransferService {
               fileItems: fileItems,
             ),
           );
+      return true;
     }
+    // BUG-05/06: Transfer already timed out — signal the HTTP layer to 410.
+    return false;
   }
 
   void handleRejectResponse(Map<String, dynamic> body) {
@@ -944,7 +1120,7 @@ class TransferService {
       return;
     }
 
-    // 6. Expected filename & file size checks
+    // 6. Expected filename check
     if (rawFileName.isNotEmpty && rawFileName != expectedFileItem.fileName) {
       if (kDebugMode) {
         debugPrint(
@@ -959,7 +1135,13 @@ class TransferService {
       return;
     }
 
-    if (declaredSize != -1 && declaredSize != expectedFileItem.fileSize) {
+    // 7. Size check — BUG-12 FIX: Skip the pre-flight content-length check
+    // when expectedFileItem.fileSize == 0 (e.g. cloud files whose size was
+    // not known at selection time). The actual byte-count check after the
+    // stream is complete serves as the real guard for known-size files.
+    if (expectedFileItem.fileSize > 0 &&
+        declaredSize != -1 &&
+        declaredSize != expectedFileItem.fileSize) {
       if (kDebugMode) {
         debugPrint(
             '[DropLAN Stream Receiver] Size mismatch: got $declaredSize, expected ${expectedFileItem.fileSize}');
@@ -973,25 +1155,27 @@ class TransferService {
       return;
     }
 
-    final expectedSize = expectedFileItem.fileSize;
+    // BUG-12 FIX: When expectedSize is 0 (unknown at selection time), use the
+    // declared content-length as the authoritative expected size so the
+    // byte-count verification after the stream will pass.
+    final expectedSize = (expectedFileItem.fileSize == 0 && declaredSize > 0)
+        ? declaredSize
+        : expectedFileItem.fileSize;
 
     late final File targetFile;
     late final File tempFile;
     late final IOSink sink;
 
     try {
-      // Resolve target file path first to place temp file on the EXACT SAME storage filesystem/volume
+      // Resolve target file path first to place temp file in the EXACT SAME destination directory
       targetFile =
           await _resolveSafeDestinationFile(expectedFileItem.fileName);
 
-      // Create temp file in a .tmp directory INSIDE the same destination directory
-      final tempDir = Directory(p.join(targetFile.parent.path, '.tmp'));
-      if (!await tempDir.exists()) {
-        await tempDir.create(recursive: true);
-      }
-
+      // Create temp file directly in the destination directory with a hidden dot prefix.
+      // Keeping tempFile and targetFile in the exact same directory guarantees that
+      // tempFile.rename() is an instant, atomic OS inode operation (0ms, 0 extra disk I/O, 0 memory allocated).
       tempFile =
-          File(p.join(tempDir.path, 'droplan_${transferId}_$fileId.tmp'));
+          File(p.join(targetFile.parent.path, '.droplan_${transferId}_$fileId.tmp'));
 
       if (kDebugMode) {
         debugPrint(
@@ -1035,6 +1219,8 @@ class TransferService {
     }
 
     int actualBytesReceived = 0;
+    int unflushedBytes = 0;
+    const flushThreshold = 2 * 1024 * 1024; // 2 MB backpressure threshold
     bool sizeExceeded = false;
 
     if (kDebugMode) {
@@ -1062,11 +1248,21 @@ class TransferService {
         }
 
         actualBytesReceived += chunk.length;
-        if (actualBytesReceived > expectedSize) {
+        unflushedBytes += chunk.length;
+
+        // Only enforce the size ceiling when the expected size is known (> 0).
+        if (expectedSize > 0 && actualBytesReceived > expectedSize) {
           sizeExceeded = true;
           break;
         }
         sink.add(chunk);
+
+        // Periodically flush sink every 2MB to apply backpressure on socket stream,
+        // preventing RAM buffers from expanding infinitely during multi-gigabyte transfers.
+        if (unflushedBytes >= flushThreshold) {
+          unflushedBytes = 0;
+          await sink.flush();
+        }
 
         _updateReceiverProgress(
           transferId: transferId,
@@ -1131,7 +1327,10 @@ class TransferService {
       return;
     }
 
-    if (sizeExceeded || actualBytesReceived != expectedSize) {
+    // BUG-12 FIX: For files with known size, verify byte count. For
+    // expectedSize==0 (unknown at selection time but stream EOF reached), skip
+    // the strict equality check — accept whatever was received.
+    if (sizeExceeded || (expectedSize > 0 && actualBytesReceived != expectedSize)) {
       if (kDebugMode) {
         debugPrint(
             '[DropLAN Stream Receiver] Byte count mismatch: expected $expectedSize, got $actualBytesReceived (sizeExceeded: $sizeExceeded)');
@@ -1168,7 +1367,13 @@ class TransferService {
       debugPrint('  finalPath=${targetFile.path}');
     }
 
-    if (!tempExists || tempSize != expectedSize || isTransferCancelled(transferId)) {
+    // BUG-12 FIX: For size=0 expected (unknown-size cloud files), skip the
+    // pre-finalization size comparison.
+    final prefinalizationOk = tempExists &&
+        (expectedSize == 0 || tempSize == expectedSize) &&
+        !isTransferCancelled(transferId);
+
+    if (!prefinalizationOk) {
       if (kDebugMode) {
         debugPrint(
             '[DropLAN Stream Receiver] ANDROID RECEIVE: Pre-finalization verification failed or cancelled');
@@ -1255,10 +1460,15 @@ class TransferService {
       debugPrint('  finalFileExists=$finalExists');
       debugPrint('  finalFileSize=$finalSize');
       debugPrint(
-          '  finalization completed=${finalExists && finalSize == expectedSize}');
+          '  finalization completed=${finalExists && (expectedSize == 0 || finalSize == expectedSize)}');
     }
 
-    if (!finalExists || finalSize != expectedSize) {
+    // BUG-12 FIX: For expected size 0, accept any non-empty (or zero-byte)
+    // final file. For known sizes, verify exact match.
+    final finalVerificationOk = finalExists &&
+        (expectedSize == 0 || finalSize == expectedSize);
+
+    if (!finalVerificationOk) {
       if (kDebugMode) {
         debugPrint(
             '[DropLAN Stream Receiver] ANDROID RECEIVE: Final file verification failed: exists=$finalExists, expectedSize=$expectedSize, finalSize=$finalSize');
@@ -1376,7 +1586,8 @@ class TransferService {
       }
     }
 
-    progressNotifier.value = TransferProgressState(
+    // BUG-11 FIX: Write receiver updates to the dedicated receiveProgressNotifier.
+    receiveProgressNotifier.value = TransferProgressState(
       transferId: transferId,
       currentFileName: currentFileName,
       currentFileIndex: currentFileIndex,
@@ -1396,9 +1607,10 @@ class TransferService {
       return;
     }
 
-    final current = progressNotifier.value;
+    final current = receiveProgressNotifier.value;
     if (current != null) {
-      progressNotifier.value = TransferProgressState(
+      // BUG-11 FIX: Write to receiveProgressNotifier.
+      receiveProgressNotifier.value = TransferProgressState(
         transferId: transferId,
         currentFileName: current.currentFileName,
         currentFileIndex: current.currentFileIndex,
@@ -1451,7 +1663,8 @@ class TransferService {
         );
       }).toList();
 
-      progressNotifier.value = TransferProgressState(
+      // BUG-11 FIX: Write completion to receiveProgressNotifier.
+      receiveProgressNotifier.value = TransferProgressState(
         transferId: transferId,
         currentFileName: pendingReq.files.last.fileName,
         currentFileIndex: pendingReq.files.length,
@@ -1465,7 +1678,7 @@ class TransferService {
         files: completedFiles,
       );
 
-      // Invalidate token after batch completion
+      // Invalidate token after batch completion.
       invalidateToken(tokenString);
 
       _acceptedRequests.remove(transferId);

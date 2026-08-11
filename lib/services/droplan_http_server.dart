@@ -111,13 +111,31 @@ class DropLanHttpServer {
           debugPrint(
               '[DropLAN HttpServer] Parsed transfer accept JSON body: $jsonBody');
         }
-        request.response
-          ..statusCode = HttpStatus.ok
-          ..headers.contentType = ContentType.json
-          ..write(jsonEncode({'status': 'accepted_acknowledged'}));
+        // BUG-05/06 FIX: handleAcceptResponse returns false when the sender's
+        // transfer request has already timed out. In that case, respond with
+        // HTTP 410 Gone so the receiver knows the request is stale and can
+        // display a proper error rather than being silently stuck.
+        final wasLive = TransferService.instance.handleAcceptResponse(jsonBody);
+        if (wasLive) {
+          request.response
+            ..statusCode = HttpStatus.ok
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode({'status': 'accepted_acknowledged'}));
+        } else {
+          if (kDebugMode) {
+            debugPrint(
+                '[DropLAN HttpServer] Transfer accept arrived after sender timeout — responding 410 Gone');
+          }
+          request.response
+            ..statusCode = HttpStatus.gone
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode({
+              'status': 'expired',
+              'error': 'Sender is no longer waiting',
+              'code': 'REQUEST_EXPIRED',
+            }));
+        }
         await request.response.close();
-
-        TransferService.instance.handleAcceptResponse(jsonBody);
         return;
       }
 

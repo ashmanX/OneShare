@@ -194,7 +194,7 @@ void main() {
       );
 
       expect(success, isTrue);
-      expect(service.progressNotifier.value?.status, TransferProgressStatus.completed);
+      expect(service.sendProgressNotifier.value?.status, TransferProgressStatus.completed);
 
       await server.close(force: true);
       await senderServer.close(force: true);
@@ -299,7 +299,7 @@ void main() {
       );
 
       expect(success, isTrue);
-      expect(service.progressNotifier.value?.status, TransferProgressStatus.completed);
+      expect(service.sendProgressNotifier.value?.status, TransferProgressStatus.completed);
 
       await server.close(force: true);
       await senderServer.close(force: true);
@@ -388,7 +388,7 @@ void main() {
   }) async {
     final service = TransferService.instance;
     service.incomingRequestNotifier.value = null;
-    service.progressNotifier.value = null;
+    service.sendProgressNotifier.value = null; service.receiveProgressNotifier.value = null;
 
     final server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
     final port = server.port;
@@ -490,16 +490,16 @@ void main() {
     expect(resp.statusCode, equals(HttpStatus.ok));
     await resp.drain();
 
-    expect(service.progressNotifier.value?.status, TransferProgressStatus.completed);
+    expect(service.receiveProgressNotifier.value?.status, TransferProgressStatus.completed);
 
-    final destPath = service.progressNotifier.value?.destinationPath;
+    final destPath = service.receiveProgressNotifier.value?.destinationPath;
     expect(destPath, isNotNull);
     final destFile = File(destPath!);
     expect(destFile.existsSync(), isTrue);
     expect(destFile.lengthSync(), equals(declaredFileSize));
 
     // Verify temp file is cleaned up
-    final tempFile = File(p.join(destFile.parent.path, '.tmp', 'droplan_${transferId}_${fileItem.fileId}.tmp'));
+    final tempFile = File(p.join(destFile.parent.path, '.droplan_${transferId}_${fileItem.fileId}.tmp'));
     expect(tempFile.existsSync(), isFalse);
 
     // Cleanup destination file
@@ -546,7 +546,7 @@ void main() {
     test('Single-file transfer cancellation stops transfer and sets status to cancelled', () async {
       final service = TransferService.instance;
       service.incomingRequestNotifier.value = null;
-      service.progressNotifier.value = null;
+      service.sendProgressNotifier.value = null; service.receiveProgressNotifier.value = null;
 
       final server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
       final port = server.port;
@@ -640,7 +640,7 @@ void main() {
       // Invoke cancelTransfer while transfer is running
       await service.cancelTransfer(transferId);
 
-      expect(service.progressNotifier.value?.status, TransferProgressStatus.cancelled);
+      expect(service.sendProgressNotifier.value?.status, TransferProgressStatus.cancelled);
       expect(service.isTransferCancelled(transferId), isTrue);
 
       try {
@@ -656,7 +656,7 @@ void main() {
     test('Multi-file batch cancellation stops after current file and prevents next file', () async {
       final service = TransferService.instance;
       service.incomingRequestNotifier.value = null;
-      service.progressNotifier.value = null;
+      service.sendProgressNotifier.value = null; service.receiveProgressNotifier.value = null;
 
       final tempDir = Directory.systemTemp.createTempSync('droplan_multi_test_');
       final f1 = File(p.join(tempDir.path, 'file1.txt'))..writeAsBytesSync(List.generate(1000, (i) => i % 256));
@@ -684,7 +684,7 @@ void main() {
       );
 
       expect(result, isFalse);
-      expect(service.progressNotifier.value?.status, TransferProgressStatus.cancelled);
+      expect(service.sendProgressNotifier.value?.status, TransferProgressStatus.cancelled);
 
       await mockReceiverServer.close(force: true);
       tempDir.deleteSync(recursive: true);
@@ -693,13 +693,13 @@ void main() {
     test('Receiver cancellation cleans up temporary files and notifies sender', () async {
       final service = TransferService.instance;
       service.incomingRequestNotifier.value = null;
-      service.progressNotifier.value = null;
+      service.sendProgressNotifier.value = null; service.receiveProgressNotifier.value = null;
 
       const transferId = 'rcv-cancel-999';
       await service.handleCancelNotification(transferId);
 
       expect(service.isTransferCancelled(transferId), isTrue);
-      expect(service.progressNotifier.value?.status, TransferProgressStatus.cancelled);
+      expect(service.receiveProgressNotifier.value?.status, TransferProgressStatus.cancelled);
     });
   });
 }
