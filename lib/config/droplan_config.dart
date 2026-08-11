@@ -8,4 +8,5 @@ class DropLanConfig {
   static const String transferRejectPath = '/api/v1/transfer/reject';
   static const String transferFilePath = '/api/v1/transfer/file';
   static const String transferCancelPath = '/api/v1/transfer/cancel';
+  static const String transferCancelFilePath = '/api/v1/transfer/cancel-file';
 }

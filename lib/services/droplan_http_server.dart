@@ -177,6 +177,28 @@ class DropLanHttpServer {
       }
 
       if (request.method == 'POST' &&
+          request.uri.path == DropLanConfig.transferCancelFilePath) {
+        final jsonBody = await _readJsonBody(request);
+        if (kDebugMode) {
+          debugPrint(
+              '[DropLAN HttpServer] Parsed transfer file cancel JSON body: $jsonBody');
+        }
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..headers.contentType = ContentType.json
+          ..write(jsonEncode({'status': 'file_cancellation_acknowledged'}));
+        await request.response.close();
+
+        final transferId = jsonBody['transferId'] as String?;
+        final fileId = jsonBody['fileId'] as String?;
+        if (transferId != null && fileId != null) {
+          await TransferService.instance
+              .handleCancelFileNotification(transferId, fileId);
+        }
+        return;
+      }
+
+      if (request.method == 'POST' &&
           request.uri.path == DropLanConfig.transferFilePath) {
         await TransferService.instance.handleIncomingFileUpload(request);
         return;

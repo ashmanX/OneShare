@@ -1535,6 +1535,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
               state.files[index],
               accentColor,
               state.status,
+              state.transferId,
             ),
           ),
         ),
@@ -1547,6 +1548,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     PerFileTransferState f,
     Color transferAccent,
     TransferProgressStatus overallStatus,
+    String transferId,
   ) {
     final isDone = f.status == FileTransferStatus.completed;
     final isOverallCancelled =
@@ -1586,6 +1588,9 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       statusIcon = Icons.insert_drive_file_outlined;
       statusLabel = 'Waiting';
     }
+
+    final canCancelSingleFile =
+        !isDone && !isCancelled && !isFailed && !isOverallCancelled && !isOverallFailed;
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -1660,6 +1665,34 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
               color: statusColor,
             ),
           ),
+          if (canCancelSingleFile) ...[
+            const SizedBox(width: 8),
+            Tooltip(
+              message: 'Cancel this file',
+              child: InkWell(
+                borderRadius: BorderRadius.circular(14),
+                onTap: () {
+                  TransferService.instance.cancelSingleFile(transferId, f.fileId);
+                },
+                child: Container(
+                  padding: const EdgeInsets.all(4),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF19233A),
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: const Color(0xFF2A3654),
+                      width: 1,
+                    ),
+                  ),
+                  child: const Icon(
+                    Icons.close_rounded,
+                    size: 14,
+                    color: Color(0xFF94A3B8),
+                  ),
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );

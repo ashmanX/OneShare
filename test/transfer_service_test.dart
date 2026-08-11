@@ -701,5 +701,42 @@ void main() {
       expect(service.isTransferCancelled(transferId), isTrue);
       expect(service.receiveProgressNotifier.value?.status, TransferProgressStatus.cancelled);
     });
+
+    test('Single-file cancellation marks specific file as cancelled and triggers peer notification', () async {
+      final service = TransferService.instance;
+      service.incomingRequestNotifier.value = null;
+      service.sendProgressNotifier.value = null;
+      service.receiveProgressNotifier.value = null;
+
+      const transferId = 'single-file-cancel-100';
+      const fileIdToCancel = 'f2_cancel';
+
+      service.sendProgressNotifier.value = const TransferProgressState(
+        transferId: transferId,
+        currentFileName: 'file1.txt',
+        currentFileIndex: 1,
+        totalFiles: 3,
+        currentFileBytesTransferred: 500,
+        currentFileSizeBytes: 1000,
+        overallBytesTransferred: 500,
+        overallTotalBytes: 3000,
+        status: TransferProgressStatus.transferring,
+        files: [
+          PerFileTransferState(fileId: 'f1', fileName: 'file1.txt', fileSize: 1000, bytesTransferred: 500, status: FileTransferStatus.transferring),
+          PerFileTransferState(fileId: 'f2_cancel', fileName: 'file2.txt', fileSize: 1000, bytesTransferred: 0, status: FileTransferStatus.waiting),
+          PerFileTransferState(fileId: 'f3', fileName: 'file3.txt', fileSize: 1000, bytesTransferred: 0, status: FileTransferStatus.waiting),
+        ],
+      );
+
+      await service.cancelSingleFile(transferId, fileIdToCancel);
+
+      expect(service.isFileCancelled(transferId, fileIdToCancel), isTrue);
+      expect(service.isFileCancelled(transferId, 'f1'), isFalse);
+
+      final state = service.sendProgressNotifier.value;
+      expect(state, isNotNull);
+      final cancelledFileState = state!.files.firstWhere((f) => f.fileId == fileIdToCancel);
+      expect(cancelledFileState.status, FileTransferStatus.cancelled);
+    });
   });
 }
