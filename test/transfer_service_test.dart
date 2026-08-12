@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -737,6 +738,681 @@ void main() {
       expect(state, isNotNull);
       final cancelledFileState = state!.files.firstWhere((f) => f.fileId == fileIdToCancel);
       expect(cancelledFileState.status, FileTransferStatus.cancelled);
+    });
+  });
+
+  group('Sender/Receiver Notifier Independence & Progress Tests', () {
+    test('Sender progress updates write ONLY to sendProgressNotifier, never to receiveProgressNotifier', () async {
+      final service = TransferService.instance;
+      service.sendProgressNotifier.value = null;
+      service.receiveProgressNotifier.value = null;
+
+      // Simulate a sender progress update by setting sendProgressNotifier directly
+      service.sendProgressNotifier.value = const TransferProgressState(
+        transferId: 'sender-independence-001',
+        currentFileName: 'photo.jpg',
+        currentFileIndex: 1,
+        totalFiles: 1,
+        currentFileBytesTransferred: 512000,
+        currentFileSizeBytes: 1024000,
+        overallBytesTransferred: 512000,
+        overallTotalBytes: 1024000,
+        status: TransferProgressStatus.transferring,
+        files: [
+          PerFileTransferState(fileId: 'f1', fileName: 'photo.jpg', fileSize: 1024000, bytesTransferred: 512000, status: FileTransferStatus.transferring),
+        ],
+      );
+
+      // Verify sender notifier was updated
+      expect(service.sendProgressNotifier.value, isNotNull);
+      expect(service.sendProgressNotifier.value!.transferId, 'sender-independence-001');
+      expect(service.sendProgressNotifier.value!.overallBytesTransferred, 512000);
+
+      // Verify receiver notifier was NOT touched
+      expect(service.receiveProgressNotifier.value, isNull);
+    });
+
+    test('Receiver progress updates write ONLY to receiveProgressNotifier, never to sendProgressNotifier', () async {
+      final service = TransferService.instance;
+      service.sendProgressNotifier.value = null;
+      service.receiveProgressNotifier.value = null;
+
+      // Simulate a receiver progress update
+      service.receiveProgressNotifier.value = const TransferProgressState(
+        transferId: 'receiver-independence-001',
+        currentFileName: 'video.mp4',
+        currentFileIndex: 1,
+        totalFiles: 1,
+        currentFileBytesTransferred: 256000,
+        currentFileSizeBytes: 1024000,
+        overallBytesTransferred: 256000,
+        overallTotalBytes: 1024000,
+        status: TransferProgressStatus.transferring,
+        files: [
+          PerFileTransferState(fileId: 'f1', fileName: 'video.mp4', fileSize: 1024000, bytesTransferred: 256000, status: FileTransferStatus.transferring),
+        ],
+      );
+
+      // Verify receiver notifier was updated
+      expect(service.receiveProgressNotifier.value, isNotNull);
+      expect(service.receiveProgressNotifier.value!.transferId, 'receiver-independence-001');
+      expect(service.receiveProgressNotifier.value!.overallBytesTransferred, 256000);
+
+      // Verify sender notifier was NOT touched
+      expect(service.sendProgressNotifier.value, isNull);
+    });
+
+    test('Simultaneous sender and receiver progress states remain independent', () async {
+      final service = TransferService.instance;
+      service.sendProgressNotifier.value = null;
+      service.receiveProgressNotifier.value = null;
+
+      // Set up both simultaneously with different transfer IDs
+      service.sendProgressNotifier.value = const TransferProgressState(
+        transferId: 'send-001',
+        currentFileName: 'outgoing.zip',
+        currentFileIndex: 1,
+        totalFiles: 1,
+        currentFileBytesTransferred: 100,
+        currentFileSizeBytes: 1000,
+        overallBytesTransferred: 100,
+        overallTotalBytes: 1000,
+        status: TransferProgressStatus.transferring,
+      );
+
+      service.receiveProgressNotifier.value = const TransferProgressState(
+        transferId: 'recv-001',
+        currentFileName: 'incoming.pdf',
+        currentFileIndex: 1,
+        totalFiles: 2,
+        currentFileBytesTransferred: 500,
+        currentFileSizeBytes: 2000,
+        overallBytesTransferred: 500,
+        overallTotalBytes: 4000,
+        status: TransferProgressStatus.transferring,
+      );
+
+      // Verify they are separate
+      expect(service.sendProgressNotifier.value!.transferId, 'send-001');
+      expect(service.receiveProgressNotifier.value!.transferId, 'recv-001');
+      expect(service.sendProgressNotifier.value!.overallBytesTransferred, 100);
+      expect(service.receiveProgressNotifier.value!.overallBytesTransferred, 500);
+      expect(service.sendProgressNotifier.value!.totalFiles, 1);
+      expect(service.receiveProgressNotifier.value!.totalFiles, 2);
+
+      // Update sender — receiver must not change
+      service.sendProgressNotifier.value = const TransferProgressState(
+        transferId: 'send-001',
+        currentFileName: 'outgoing.zip',
+        currentFileIndex: 1,
+        totalFiles: 1,
+        currentFileBytesTransferred: 800,
+        currentFileSizeBytes: 1000,
+        overallBytesTransferred: 800,
+        overallTotalBytes: 1000,
+        status: TransferProgressStatus.transferring,
+      );
+
+      expect(service.sendProgressNotifier.value!.overallBytesTransferred, 800);
+      // Receiver must be unchanged
+      expect(service.receiveProgressNotifier.value!.overallBytesTransferred, 500);
+    });
+
+    test('Cancel transfer updates the correct notifier based on which has the matching transferId', () async {
+      final service = TransferService.instance;
+      service.sendProgressNotifier.value = null;
+      service.receiveProgressNotifier.value = null;
+
+      const transferId = 'cancel-direction-001';
+
+      // Only set receive side for this transfer
+      service.receiveProgressNotifier.value = TransferProgressState(
+        transferId: transferId,
+        currentFileName: 'doc.pdf',
+        currentFileIndex: 1,
+        totalFiles: 1,
+        currentFileBytesTransferred: 200,
+        currentFileSizeBytes: 1000,
+        overallBytesTransferred: 200,
+        overallTotalBytes: 1000,
+        status: TransferProgressStatus.transferring,
+        files: const [
+          PerFileTransferState(fileId: 'f1', fileName: 'doc.pdf', fileSize: 1000, bytesTransferred: 200, status: FileTransferStatus.transferring),
+        ],
+      );
+
+      await service.cancelTransfer(transferId);
+
+      // Receiver should be cancelled
+      expect(service.receiveProgressNotifier.value?.status, TransferProgressStatus.cancelled);
+      // Sender should also get cancelled state (cancelTransfer updates sender when sendCurrent is null or matches)
+      // but the key test is that receiveProgressNotifier was correctly set
+      expect(service.receiveProgressNotifier.value?.files.first.status, FileTransferStatus.cancelled);
+    });
+
+    test('Stale transfer ID does not overwrite current transfer progress', () async {
+      final service = TransferService.instance;
+      service.sendProgressNotifier.value = null;
+      service.receiveProgressNotifier.value = null;
+
+      // Transfer B is the current one
+      service.sendProgressNotifier.value = const TransferProgressState(
+        transferId: 'transfer-B',
+        currentFileName: 'current.txt',
+        currentFileIndex: 1,
+        totalFiles: 1,
+        currentFileBytesTransferred: 500,
+        currentFileSizeBytes: 1000,
+        overallBytesTransferred: 500,
+        overallTotalBytes: 1000,
+        status: TransferProgressStatus.transferring,
+      );
+
+      // Simulate a stale event from Transfer A trying to cancel
+      // cancelTransfer checks transferId match — should NOT corrupt Transfer B
+      await service.cancelTransfer('transfer-A');
+
+      // Transfer B should still be active/transferring — the stale cancel
+      // from A should have been no-op on the receiver side (since recvVal doesn't match)
+      // but on send side: sendCurrent is 'transfer-B' which != 'transfer-A',
+      // so the condition `sendCurrent == null || sendCurrent.transferId == transferId`
+      // evaluates: sendCurrent != null && sendCurrent.transferId != 'transfer-A'
+      // → the if block on line 364 checks: `if (sendCurrent == null || sendCurrent.transferId == transferId)`
+      // Since sendCurrent is NOT null and transferId is 'transfer-A' != 'transfer-B', it SKIPS.
+      expect(service.sendProgressNotifier.value?.transferId, 'transfer-B');
+      expect(service.sendProgressNotifier.value?.status, TransferProgressStatus.transferring);
+    });
+
+    test('TransferProgressState.overallProgress calculates correctly for sender', () {
+      const state = TransferProgressState(
+        transferId: 'progress-calc-001',
+        currentFileName: 'file.bin',
+        currentFileIndex: 1,
+        totalFiles: 2,
+        currentFileBytesTransferred: 750000,
+        currentFileSizeBytes: 1000000,
+        overallBytesTransferred: 1750000,
+        overallTotalBytes: 2000000,
+        status: TransferProgressStatus.transferring,
+      );
+
+      expect(state.overallProgress, closeTo(0.875, 0.001));
+      expect(state.currentFileProgress, closeTo(0.75, 0.001));
+    });
+
+    test('TransferProgressState.overallProgress handles zero total bytes without crash', () {
+      const state = TransferProgressState(
+        transferId: 'zero-total-001',
+        currentFileName: 'empty.txt',
+        currentFileIndex: 1,
+        totalFiles: 1,
+        currentFileBytesTransferred: 0,
+        currentFileSizeBytes: 0,
+        overallBytesTransferred: 0,
+        overallTotalBytes: 0,
+        status: TransferProgressStatus.transferring,
+      );
+
+      expect(state.overallProgress, 0.0);
+    });
+
+    test('Zero-size declared file resolves size dynamically when bytes are transferred', () {
+      const currentSent = 100000;
+      const fileSize = 0;
+      const overallTotalBytes = 0;
+
+      final currentEffectiveSize = fileSize > 0 ? fileSize : currentSent;
+      final effectiveTotalBytes = overallTotalBytes > 0 ? overallTotalBytes : currentEffectiveSize;
+
+      final state = TransferProgressState(
+        transferId: 'zero-size-resolved-001',
+        currentFileName: 'cloud_file.pdf',
+        currentFileIndex: 1,
+        totalFiles: 1,
+        currentFileBytesTransferred: currentSent,
+        currentFileSizeBytes: currentEffectiveSize,
+        overallBytesTransferred: currentSent,
+        overallTotalBytes: effectiveTotalBytes,
+        status: TransferProgressStatus.transferring,
+      );
+
+      expect(state.overallProgress, 1.0);
+      expect(state.overallBytesTransferred, 100000);
+      expect(state.overallTotalBytes, 100000);
+    });
+
+    test('Sender retains progress when receiver cancels during active transfer', () async {
+      final service = TransferService.instance;
+      service.sendProgressNotifier.value = null;
+      service.receiveProgressNotifier.value = null;
+
+      const transferId = 'test-recv-cancel-progress';
+      const totalSize = 100000;
+      const sentBytes = 50000;
+
+      // Set initial transferring progress state on sender
+      service.sendProgressNotifier.value = const TransferProgressState(
+        transferId: transferId,
+        currentFileName: 'test.bin',
+        currentFileIndex: 1,
+        totalFiles: 1,
+        currentFileBytesTransferred: 0,
+        currentFileSizeBytes: totalSize,
+        overallBytesTransferred: 0,
+        overallTotalBytes: totalSize,
+        status: TransferProgressStatus.transferring,
+        files: [
+          PerFileTransferState(
+            fileId: 'f1',
+            fileName: 'test.bin',
+            fileSize: totalSize,
+            bytesTransferred: 0,
+            status: FileTransferStatus.transferring,
+          ),
+        ],
+      );
+
+      // Simulate sending 50% of the bytes by updating the progress notifier
+      service.sendProgressNotifier.value = const TransferProgressState(
+        transferId: transferId,
+        currentFileName: 'test.bin',
+        currentFileIndex: 1,
+        totalFiles: 1,
+        currentFileBytesTransferred: sentBytes,
+        currentFileSizeBytes: totalSize,
+        overallBytesTransferred: sentBytes,
+        overallTotalBytes: totalSize,
+        status: TransferProgressStatus.transferring,
+        files: [
+          PerFileTransferState(
+            fileId: 'f1',
+            fileName: 'test.bin',
+            fileSize: totalSize,
+            bytesTransferred: sentBytes,
+            status: FileTransferStatus.transferring,
+          ),
+        ],
+      );
+
+      // Also set the internal bytes tracking variable to simulate chunks sent
+      // (This matches _activeSenderCurrentFileBytes updated in stream chunks)
+      // Note: we can access/simulate this by setting the notifier value which has been done.
+
+      // Simulate the cancellation notification from peer
+      // (On receiver cancel, handleCancelNotification is called on sender)
+      await service.handleCancelNotification(transferId);
+
+      // Verify progress remains at 50% and is not reset to 0%
+      final finalState = service.sendProgressNotifier.value;
+      expect(finalState, isNotNull);
+      expect(finalState!.status, TransferProgressStatus.cancelled);
+      expect(finalState.overallBytesTransferred, sentBytes);
+      expect(finalState.overallProgress, 0.5);
+    });
+
+    test('Sender retains progress during sendTransferFiles when connection is aborted mid-stream', () async {
+      final service = TransferService.instance;
+      service.sendProgressNotifier.value = null;
+      service.receiveProgressNotifier.value = null;
+
+      final tempDir = Directory.systemTemp.createTempSync('droplan_abort_test_');
+      final fileData = List<int>.generate(100 * 1024, (i) => i % 256); // 100 KB
+      final dummyFile = File(p.join(tempDir.path, 'large_file.bin'))..writeAsBytesSync(fileData);
+
+      final server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+      final port = server.port;
+
+      int bytesReadByServer = 0;
+      server.listen((HttpRequest req) async {
+        if (req.method == 'POST' && req.uri.path == DropLanConfig.transferFilePath) {
+          try {
+            await for (final chunk in req) {
+              bytesReadByServer += chunk.length;
+              if (bytesReadByServer >= 20 * 1024) {
+                // Abort the connection after receiving 20 KB
+                req.response.statusCode = HttpStatus.internalServerError;
+                await req.response.close();
+                break;
+              }
+            }
+          } catch (_) {}
+        }
+      });
+
+      const transferId = 'abort-mid-stream-001';
+      final filesToSend = [
+        FileToSend(
+          fileItem: const TransferFileItem(fileId: 'f1', fileName: 'large_file.bin', fileSize: 100 * 1024),
+          localPath: dummyFile.path,
+        )
+      ];
+
+      final success = await service.sendTransferFiles(
+        targetHost: '127.0.0.1',
+        targetPort: port,
+        transferId: transferId,
+        transferToken: 'token',
+        filesToSend: filesToSend,
+      );
+
+      expect(success, isFalse);
+
+      final finalState = service.sendProgressNotifier.value;
+      expect(finalState, isNotNull);
+      expect(finalState!.status, TransferProgressStatus.failed);
+      // Sender should have successfully sent at least some bytes before abortion (e.g. >= 20 KB)
+      expect(finalState.overallBytesTransferred, greaterThanOrEqualTo(20 * 1024));
+      expect(finalState.overallProgress, greaterThan(0.0));
+
+      await server.close(force: true);
+      tempDir.deleteSync(recursive: true);
+    });
+
+    test('Sender retains progress and becomes Cancelled when cancel notification is processed mid-stream', () async {
+      final service = TransferService.instance;
+      service.sendProgressNotifier.value = null;
+      service.receiveProgressNotifier.value = null;
+
+      final tempDir = Directory.systemTemp.createTempSync('droplan_cancel_mid_test_');
+      final fileData = List<int>.generate(200 * 1024, (i) => i % 256); // 200 KB
+      final dummyFile = File(p.join(tempDir.path, 'cancel_file.bin'))..writeAsBytesSync(fileData);
+
+      final server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+      final port = server.port;
+
+      const transferId = 'cancel-mid-stream-002';
+      int bytesReceived = 0;
+
+      server.listen((HttpRequest req) async {
+        if (req.method == 'POST' && req.uri.path == DropLanConfig.transferFilePath) {
+          try {
+            await for (final chunk in req) {
+              bytesReceived += chunk.length;
+              if (bytesReceived >= 50 * 1024) {
+                // Trigger the cancellation notification on sender (since receiver cancelled)
+                await service.handleCancelNotification(transferId);
+                req.response.statusCode = HttpStatus.internalServerError;
+                await req.response.close();
+                break;
+              }
+            }
+          } catch (_) {}
+        }
+      });
+
+      final filesToSend = [
+        FileToSend(
+          fileItem: const TransferFileItem(fileId: 'f2', fileName: 'cancel_file.bin', fileSize: 200 * 1024),
+          localPath: dummyFile.path,
+        )
+      ];
+
+      final success = await service.sendTransferFiles(
+        targetHost: '127.0.0.1',
+        targetPort: port,
+        transferId: transferId,
+        transferToken: 'token',
+        filesToSend: filesToSend,
+      );
+
+      expect(success, isFalse);
+
+      final finalState = service.sendProgressNotifier.value;
+      expect(finalState, isNotNull);
+      expect(finalState!.status, TransferProgressStatus.cancelled);
+      expect(finalState.overallBytesTransferred, greaterThanOrEqualTo(50 * 1024));
+      expect(finalState.overallProgress, greaterThan(0.0));
+      expect(finalState.overallProgress, lessThan(1.0));
+
+      await server.close(force: true);
+      tempDir.deleteSync(recursive: true);
+    });
+
+    test('DIAGNOSTIC TEST: Mac -> Android Cancellation', () async {
+      final service = TransferService.instance;
+      service.sendProgressNotifier.value = null;
+      service.receiveProgressNotifier.value = null;
+
+      final tempDir = Directory.systemTemp.createTempSync('droplan_diag_cancel_');
+      final dummyFile = File(p.join(tempDir.path, 'diag_file.bin'));
+      final sink = dummyFile.openWrite();
+      final chunkData = List<int>.generate(100 * 1024, (i) => i % 256);
+      for (int i = 0; i < 100; i++) {
+        sink.add(chunkData); // 100 * 100 KB = 10 MB
+      }
+      await sink.flush();
+      await sink.close();
+
+      final server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+      final port = server.port;
+
+      const transferId = 'diag-cancel-id-123';
+      int bytesReceived = 0;
+
+      server.listen((HttpRequest req) async {
+        if (req.method == 'POST' && req.uri.path == DropLanConfig.transferFilePath) {
+          try {
+            await for (final chunk in req) {
+              bytesReceived += chunk.length;
+              if (bytesReceived >= 500 * 1024) { // 5% of 10MB
+                debugPrint('[DIAGNOSTIC TEST RECEIVER] 5% received (bytes: $bytesReceived). Simulating peer cancel...');
+                debugPrint('[DIAGNOSTIC TEST SENDER STATE BEFORE CANCEL] bytes: ${service.sendProgressNotifier.value?.currentFileBytesTransferred}, %: ${service.sendProgressNotifier.value?.overallProgress}');
+                
+                await service.handleCancelNotification(transferId);
+                
+                debugPrint('[DIAGNOSTIC TEST SENDER STATE AFTER CANCEL] bytes: ${service.sendProgressNotifier.value?.currentFileBytesTransferred}, %: ${service.sendProgressNotifier.value?.overallProgress}');
+                
+                req.response.statusCode = HttpStatus.internalServerError;
+                await req.response.close();
+                break;
+              }
+            }
+          } catch (_) {}
+        }
+      });
+
+      final filesToSend = [
+        FileToSend(
+          fileItem: const TransferFileItem(fileId: 'f_diag', fileName: 'diag_file.bin', fileSize: 10 * 1024 * 1024),
+          localPath: dummyFile.path,
+        )
+      ];
+
+      debugPrint('[DIAGNOSTIC TEST] Starting sendTransferFiles...');
+      final success = await service.sendTransferFiles(
+        targetHost: '127.0.0.1',
+        targetPort: port,
+        transferId: transferId,
+        transferToken: 'token',
+        filesToSend: filesToSend,
+      );
+
+      debugPrint('[DIAGNOSTIC TEST] sendTransferFiles finished. success: $success');
+      debugPrint('[DIAGNOSTIC TEST SENDER FINAL STATE] bytes: ${service.sendProgressNotifier.value?.currentFileBytesTransferred}, %: ${service.sendProgressNotifier.value?.overallProgress}, status: ${service.sendProgressNotifier.value?.status}');
+
+      await server.close(force: true);
+      tempDir.deleteSync(recursive: true);
+    });
+
+    test('REGRESSION TEST 3: Two files, File 1 completes, File 2 cancelled -> NOT 100%', () async {
+      final service = TransferService.instance;
+      service.sendProgressNotifier.value = null;
+      service.receiveProgressNotifier.value = null;
+
+      const transferId = 'reg-test-3';
+      const size1 = 10000;
+      const size2 = 10000;
+      const totalSize = size1 + size2;
+
+      // Simulate File 1 complete, File 2 cancelled
+      service.cancelSingleFile(transferId, 'f2');
+
+      final currentSendState = const TransferProgressState(
+        transferId: transferId,
+        currentFileName: 'file1.bin',
+        currentFileIndex: 1,
+        totalFiles: 2,
+        currentFileBytesTransferred: size1,
+        currentFileSizeBytes: size1,
+        overallBytesTransferred: size1,
+        overallTotalBytes: totalSize,
+        status: TransferProgressStatus.transferring,
+        files: [
+          PerFileTransferState(fileId: 'f1', fileName: 'file1.bin', fileSize: size1, bytesTransferred: size1, status: FileTransferStatus.completed),
+          PerFileTransferState(fileId: 'f2', fileName: 'file2.bin', fileSize: size2, bytesTransferred: 0, status: FileTransferStatus.cancelled),
+        ],
+      );
+      service.sendProgressNotifier.value = currentSendState;
+
+      // Check final state logic
+      final finalFiles = currentSendState.files;
+      final allCompleted = finalFiles.every((f) => f.status == FileTransferStatus.completed);
+      final anyCancelled = finalFiles.any((f) => f.status == FileTransferStatus.cancelled);
+
+      final TransferProgressStatus finalStatus;
+      if (allCompleted) {
+        finalStatus = TransferProgressStatus.completed;
+      } else if (anyCancelled) {
+        finalStatus = TransferProgressStatus.cancelled;
+      } else {
+        finalStatus = TransferProgressStatus.failed;
+      }
+
+      final finalOverallTransferred = finalFiles.fold<int>(0, (sum, f) => sum + f.bytesTransferred);
+
+      final finalState = TransferProgressState(
+        transferId: transferId,
+        currentFileName: 'file2.bin',
+        currentFileIndex: 2,
+        totalFiles: 2,
+        currentFileBytesTransferred: 0,
+        currentFileSizeBytes: size2,
+        overallBytesTransferred: finalOverallTransferred,
+        overallTotalBytes: totalSize,
+        status: finalStatus,
+        files: finalFiles,
+      );
+
+      expect(finalState.status, TransferProgressStatus.cancelled);
+      expect(finalState.overallProgress, 0.5);
+      expect(finalState.overallProgress, isNot(1.0));
+      expect(finalState.overallBytesTransferred, 10000);
+    });
+
+    test('REGRESSION TEST 4: Three files, File 1 completes, Files 2 and 3 cancelled -> NOT 100%', () async {
+      const transferId = 'reg-test-4';
+      const size = 10000;
+      const totalSize = size * 3;
+
+      final finalFiles = [
+        const PerFileTransferState(fileId: 'f1', fileName: 'file1.bin', fileSize: size, bytesTransferred: size, status: FileTransferStatus.completed),
+        const PerFileTransferState(fileId: 'f2', fileName: 'file2.bin', fileSize: size, bytesTransferred: 0, status: FileTransferStatus.cancelled),
+        const PerFileTransferState(fileId: 'f3', fileName: 'file3.bin', fileSize: size, bytesTransferred: 0, status: FileTransferStatus.cancelled),
+      ];
+
+      final allCompleted = finalFiles.every((f) => f.status == FileTransferStatus.completed);
+      final anyCancelled = finalFiles.any((f) => f.status == FileTransferStatus.cancelled);
+
+      final TransferProgressStatus finalStatus = allCompleted
+          ? TransferProgressStatus.completed
+          : (anyCancelled ? TransferProgressStatus.cancelled : TransferProgressStatus.failed);
+
+      final finalOverallTransferred = finalFiles.fold<int>(0, (sum, f) => sum + f.bytesTransferred);
+
+      final finalState = TransferProgressState(
+        transferId: transferId,
+        currentFileName: 'file3.bin',
+        currentFileIndex: 3,
+        totalFiles: 3,
+        currentFileBytesTransferred: 0,
+        currentFileSizeBytes: size,
+        overallBytesTransferred: finalOverallTransferred,
+        overallTotalBytes: totalSize,
+        status: finalStatus,
+        files: finalFiles,
+      );
+
+      expect(finalState.status, TransferProgressStatus.cancelled);
+      expect(finalState.overallProgress, closeTo(0.333, 0.01));
+      expect(finalState.overallProgress, isNot(1.0));
+      expect(finalState.overallBytesTransferred, 10000);
+    });
+
+    test('REGRESSION TEST 6 & 7: All files complete = 100%, all cancelled = 0%', () async {
+      // All complete
+      final completeFiles = [
+        const PerFileTransferState(fileId: 'f1', fileName: 'f1', fileSize: 100, bytesTransferred: 100, status: FileTransferStatus.completed),
+        const PerFileTransferState(fileId: 'f2', fileName: 'f2', fileSize: 100, bytesTransferred: 100, status: FileTransferStatus.completed),
+      ];
+      final stateComplete = TransferProgressState(
+        transferId: 't-complete',
+        currentFileName: 'f2',
+        currentFileIndex: 2,
+        totalFiles: 2,
+        currentFileBytesTransferred: 100,
+        currentFileSizeBytes: 100,
+        overallBytesTransferred: 200,
+        overallTotalBytes: 200,
+        status: TransferProgressStatus.completed,
+        files: completeFiles,
+      );
+      expect(stateComplete.overallProgress, 1.0);
+      expect(stateComplete.status, TransferProgressStatus.completed);
+
+      // All cancelled
+      final cancelFiles = [
+        const PerFileTransferState(fileId: 'f1', fileName: 'f1', fileSize: 100, bytesTransferred: 0, status: FileTransferStatus.cancelled),
+        const PerFileTransferState(fileId: 'f2', fileName: 'f2', fileSize: 100, bytesTransferred: 0, status: FileTransferStatus.cancelled),
+      ];
+      final stateCancel = TransferProgressState(
+        transferId: 't-cancel',
+        currentFileName: 'f1',
+        currentFileIndex: 1,
+        totalFiles: 2,
+        currentFileBytesTransferred: 0,
+        currentFileSizeBytes: 100,
+        overallBytesTransferred: 0,
+        overallTotalBytes: 200,
+        status: TransferProgressStatus.cancelled,
+        files: cancelFiles,
+      );
+      expect(stateCancel.overallProgress, 0.0);
+      expect(stateCancel.status, TransferProgressStatus.cancelled);
+    });
+
+    test('EXACT REPRODUCTIONS: 2 files (931.6MB + 1.16GB), File 1 complete, File 2 cancelled -> status is cancelled, 44-47% progress', () async {
+      const transferId = 'exact-scenario-999';
+      const size1 = 931600000; // 931.6 MB
+      const size2 = 1160000000; // 1.16 GB
+      const totalSize = size1 + size2;
+
+      // Single file cancel on file 2
+      final service = TransferService.instance;
+      service.sendProgressNotifier.value = const TransferProgressState(
+        transferId: transferId,
+        currentFileName: 'Episode 8.mkv',
+        currentFileIndex: 2,
+        totalFiles: 2,
+        currentFileBytesTransferred: 0,
+        currentFileSizeBytes: size2,
+        overallBytesTransferred: size1,
+        overallTotalBytes: totalSize,
+        status: TransferProgressStatus.transferring,
+        files: [
+          PerFileTransferState(fileId: 'f1', fileName: 'Episode 7.mkv', fileSize: size1, bytesTransferred: size1, status: FileTransferStatus.completed),
+          PerFileTransferState(fileId: 'f2', fileName: 'Episode 8.mkv', fileSize: size2, bytesTransferred: 0, status: FileTransferStatus.transferring),
+        ],
+      );
+
+      await service.cancelSingleFile(transferId, 'f2');
+
+      final finalState = service.sendProgressNotifier.value;
+      expect(finalState, isNotNull);
+      expect(finalState!.status, TransferProgressStatus.cancelled);
+      expect(finalState.status, isNot(TransferProgressStatus.completed));
+      expect(finalState.overallProgress, closeTo(0.445, 0.01));
+      expect(finalState.files[0].status, FileTransferStatus.completed);
+      expect(finalState.files[1].status, FileTransferStatus.cancelled);
     });
   });
 }

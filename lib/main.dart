@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:file_selector/file_selector.dart' as file_selector;
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -34,6 +35,9 @@ class SelectedFile {
 
 /// Three clear application states.
 enum AppScreen { home, sc2, sc3 }
+
+/// Bottom navigation tabs on Home screen.
+enum NavTab { home, settings }
 
 // BUG-11 FIX: Track which direction the active SC3 transfer is going so we
 // can read the correct progress notifier (send vs receive).
@@ -151,8 +155,9 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   // ── File selection ────────────────────────────────────────
   final List<SelectedFile> _selectedFiles = [];
 
-  // ── App screen state ──────────────────────────────────────
+  // ── App screen & tab state ──────────────────────────────────
   AppScreen _currentScreen = AppScreen.home;
+  NavTab _currentTab = NavTab.home;
 
   // ── Network / WiFi status state ─────────────────────────
   bool _isWifiOn = true;
@@ -172,6 +177,11 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   // from switching the screen back to SC3 after the user taps Done.
   TransferDirection _transferDirection = TransferDirection.sending;
   String? _activeTransferSessionId;
+
+  // BUG-E FIX: Track transfer IDs that have been dismissed via Done,
+  // so late progress events on BOTH sender and receiver notifiers cannot
+  // flip the screen back to SC3.
+  final Set<String> _dismissedTransferIds = {};
 
   // ──────────────────────────────────────────────────────────
   // Lifecycle
@@ -320,6 +330,10 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   void _onSendProgressChanged() {
     if (!mounted) return;
     final p = TransferService.instance.sendProgressNotifier.value;
+    if (kDebugMode) {
+      debugPrint('[DIAGNOSTIC] _onSendProgressChanged called. p: $p');
+      debugPrint('[DIAGNOSTIC] _activeTransferSessionId: $_activeTransferSessionId, dismissed contains: ${p != null ? _dismissedTransferIds.contains(p.transferId) : false}');
+    }
     if (p == null) return;
     // BUG-15 FIX: Only navigate to SC3 if this update belongs to the current
     // active session. After _onDone() clears _activeTransferSessionId, late
@@ -328,6 +342,8 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
         p.transferId != _activeTransferSessionId) {
       return;
     }
+    // BUG-E FIX: Ignore events from dismissed transfers.
+    if (_dismissedTransferIds.contains(p.transferId)) return;
     setState(() {
       _transferDirection = TransferDirection.sending;
       _currentScreen = AppScreen.sc3;
@@ -339,7 +355,13 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   void _onReceiveProgressChanged() {
     if (!mounted) return;
     final p = TransferService.instance.receiveProgressNotifier.value;
+    if (kDebugMode) {
+      debugPrint('[DIAGNOSTIC] _onReceiveProgressChanged called. p: $p');
+      debugPrint('[DIAGNOSTIC] dismissed contains: ${p != null ? _dismissedTransferIds.contains(p.transferId) : false}');
+    }
     if (p == null) return;
+    // BUG-E FIX: Ignore events from dismissed transfers.
+    if (_dismissedTransferIds.contains(p.transferId)) return;
     setState(() {
       _transferDirection = TransferDirection.receiving;
       _currentScreen = AppScreen.sc3;
@@ -638,6 +660,23 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       _waitingForDeviceName = device.deviceName;
     });
 
+    // Resolve any zero file sizes in _selectedFiles before sending transfer request
+    for (int i = 0; i < _selectedFiles.length; i++) {
+      final f = _selectedFiles[i];
+      if (f.size == 0 && !f.path.startsWith('content://')) {
+        try {
+          final file = File(f.path);
+          if (file.existsSync()) {
+            _selectedFiles[i] = SelectedFile(
+              name: f.name,
+              size: file.lengthSync(),
+              path: f.path,
+            );
+          }
+        } catch (_) {}
+      }
+    }
+
     final filePayloads = _selectedFiles.map((f) {
       return {'name': f.name, 'size': f.size};
     }).toList();
@@ -928,6 +967,18 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   // ──────────────────────────────────────────────────────────
 
   void _onDone() {
+    // BUG-E FIX: Record the transfer ID(s) being dismissed so late events
+    // from either notifier cannot flip the screen back to SC3.
+    final sendId = TransferService.instance.sendProgressNotifier.value?.transferId;
+    final recvId = TransferService.instance.receiveProgressNotifier.value?.transferId;
+    if (sendId != null) _dismissedTransferIds.add(sendId);
+    if (recvId != null) _dismissedTransferIds.add(recvId);
+    // Cap the set size to prevent unbounded growth.
+    if (_dismissedTransferIds.length > 50) {
+      final toRemove = _dismissedTransferIds.take(10).toList();
+      _dismissedTransferIds.removeAll(toRemove);
+    }
+
     // Clear split progress notifiers first
     TransferService.instance.sendProgressNotifier.value = null;
     TransferService.instance.receiveProgressNotifier.value = null;
@@ -956,6 +1007,14 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
         ? (sendState ?? receiveState)
         : (receiveState ?? sendState);
 
+    if (kDebugMode) {
+      debugPrint('[DIAGNOSTIC] build called. _transferDirection: $_transferDirection');
+      debugPrint('[DIAGNOSTIC] sendState: $sendState');
+      debugPrint('[DIAGNOSTIC] receiveState: $receiveState');
+      debugPrint('[DIAGNOSTIC] progressState: $progressState');
+      debugPrint('[DIAGNOSTIC] _currentScreen: $_currentScreen');
+    }
+
     // Compute effective screen immutably without mutating _currentScreen during build
     final effectiveScreen = (_currentScreen == AppScreen.sc3 && progressState == null)
         ? AppScreen.home
@@ -972,11 +1031,25 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     }
 
     final isMacOS = defaultTargetPlatform == TargetPlatform.macOS;
-    final Widget screenContent = switch (effectiveScreen) {
-      AppScreen.home => _buildHomeScreen(context),
-      AppScreen.sc2 => _buildSC2Screen(context),
-      AppScreen.sc3 => _buildSC3Screen(context, progressState),
-    };
+    final Widget activeMainContent;
+    if (effectiveScreen == AppScreen.home) {
+      final tabContent = switch (_currentTab) {
+        NavTab.home => _buildHomeScreen(context),
+        NavTab.settings => _buildSettingsScreen(context),
+      };
+
+      activeMainContent = Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(child: tabContent),
+          _buildBottomNavigationBar(context),
+        ],
+      );
+    } else if (effectiveScreen == AppScreen.sc2) {
+      activeMainContent = _buildSC2Screen(context);
+    } else {
+      activeMainContent = _buildSC3Screen(context, progressState, _transferDirection);
+    }
 
     final Widget bodyWidget = isMacOS
         ? Center(
@@ -984,11 +1057,11 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
               constraints: const BoxConstraints(maxWidth: 720),
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16),
-                child: screenContent,
+                child: activeMainContent,
               ),
             ),
           )
-        : screenContent;
+        : activeMainContent;
 
     // BUG-02 FIX: Wrap root with PopScope so the Android Back gesture on SC2
     // returns to Home (or cancels the pending request) instead of exiting.
@@ -1024,7 +1097,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   }
 
   // ──────────────────────────────────────────────────────────
-  // SHARED HEADER — identical on HOME / SC2 / SC3
+  // SHARED HEADER — identical on HOME / SC2 / SC3 / SETTINGS
   // ──────────────────────────────────────────────────────────
 
   Widget _buildSharedHeader(BuildContext context) {
@@ -1130,11 +1203,14 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   // ──────────────────────────────────────────────────────────
 
   Widget _buildHomeScreen(BuildContext context) {
+    final isMacOS = defaultTargetPlatform == TargetPlatform.macOS;
+    final buttonHeight = isMacOS ? 56.0 : 52.0;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _buildSharedHeader(context),
-        const SizedBox(height: 16),
+        const SizedBox(height: 14),
         Expanded(
           flex: 5,
           child: Padding(
@@ -1142,7 +1218,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
             child: _buildRadarCard(context),
           ),
         ),
-        const SizedBox(height: 14),
+        const SizedBox(height: 12),
         Expanded(
           flex: 4,
           child: Padding(
@@ -1173,14 +1249,331 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
         ),
         const SizedBox(height: 12),
         SizedBox(
-          height: 60,
+          height: buttonHeight,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 20),
             child: _buildPrimaryFileActionButton(context),
           ),
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 10),
       ],
+    );
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // SETTINGS SCREEN
+  // ──────────────────────────────────────────────────────────
+
+  Widget _buildSettingsScreen(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _buildSharedHeader(context),
+        const SizedBox(height: 14),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20),
+            child: ListView(
+              physics: const BouncingScrollPhysics(),
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(left: 4, bottom: 10),
+                  child: Text(
+                    'Settings',
+                    style: GoogleFonts.plusJakartaSans(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w800,
+                      color: Colors.white,
+                      letterSpacing: -0.3,
+                    ),
+                  ),
+                ),
+                _buildSettingsCard(
+                  title: 'Device Identity',
+                  icon: Icons.perm_identity_rounded,
+                  children: [
+                    _buildSettingsRow(
+                      label: 'Device Name',
+                      value: _deviceName,
+                      icon: Icons.laptop_mac_rounded,
+                    ),
+                    const Divider(height: 1, color: Color(0xFF1F2232)),
+                    _buildSettingsRow(
+                      label: 'Device ID',
+                      value: DeviceIdentityService.identity.deviceId,
+                      icon: Icons.fingerprint_rounded,
+                    ),
+                    const Divider(height: 1, color: Color(0xFF1F2232)),
+                    _buildSettingsRow(
+                      label: 'Status',
+                      value: _isWifiOn
+                          ? 'Online & Discoverable'
+                          : 'Offline (WiFi Off)',
+                      icon: Icons.wifi_tethering_rounded,
+                      valueColor: _isWifiOn
+                          ? const Color(0xFF10B981)
+                          : const Color(0xFF94A3B8),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                _buildSettingsCard(
+                  title: 'Network & Protocol',
+                  icon: Icons.hub_rounded,
+                  children: [
+                    _buildSettingsRow(
+                      label: 'Service Port',
+                      value: '${DropLanConfig.port}',
+                      icon: Icons.numbers_rounded,
+                    ),
+                    const Divider(height: 1, color: Color(0xFF1F2232)),
+                    _buildSettingsRow(
+                      label: 'Protocol Version',
+                      value: 'v${DropLanConfig.protocolVersion}',
+                      icon: Icons.code_rounded,
+                    ),
+                    const Divider(height: 1, color: Color(0xFF1F2232)),
+                    _buildSettingsRow(
+                      label: 'NSD Service Type',
+                      value: '_droplan._tcp.',
+                      icon: Icons.dns_rounded,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                _buildSettingsCard(
+                  title: 'About AirShare',
+                  icon: Icons.info_outline_rounded,
+                  children: [
+                    _buildSettingsRow(
+                      label: 'Application',
+                      value: DropLanConfig.appName,
+                      icon: Icons.share_rounded,
+                    ),
+                    const Divider(height: 1, color: Color(0xFF1F2232)),
+                    _buildSettingsRow(
+                      label: 'Version',
+                      value: '1.0.0',
+                      icon: Icons.verified_rounded,
+                    ),
+                    const Divider(height: 1, color: Color(0xFF1F2232)),
+                    Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Text(
+                        'AirShare enables seamless, fast, secure peer-to-peer file transfers between nearby Android and macOS devices over your local Wi-Fi network.',
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w400,
+                          color: const Color(0xFF8E95A5),
+                          height: 1.4,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSettingsCard({
+    required String title,
+    required IconData icon,
+    required List<Widget> children,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF12141D),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: const Color(0xFF1F2232), width: 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
+            child: Row(
+              children: [
+                Icon(icon, size: 18, color: const Color(0xFF38BDF8)),
+                const SizedBox(width: 8),
+                Text(
+                  title,
+                  style: GoogleFonts.plusJakartaSans(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1, color: Color(0xFF1F2232)),
+          ...children,
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSettingsRow({
+    required String label,
+    required String value,
+    required IconData icon,
+    Color? valueColor,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      child: Row(
+        children: [
+          Container(
+            width: 34,
+            height: 34,
+            decoration: BoxDecoration(
+              color: const Color(0xFF1A233D),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Icon(icon, size: 16, color: const Color(0xFF38BDF8)),
+          ),
+          const SizedBox(width: 12),
+          Text(
+            label,
+            style: GoogleFonts.plusJakartaSans(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: const Color(0xFFCBD5E1),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              value,
+              textAlign: TextAlign.end,
+              style: GoogleFonts.plusJakartaSans(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: valueColor ?? Colors.white,
+              ),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // BOTTOM NAVIGATION BAR (HOME | SETTINGS)
+  // ──────────────────────────────────────────────────────────
+
+  Widget _buildBottomNavigationBar(BuildContext context) {
+    final isMacOS = defaultTargetPlatform == TargetPlatform.macOS;
+
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        20,
+        4,
+        20,
+        isMacOS ? 12 : 8,
+      ),
+      child: Container(
+        height: 56,
+        decoration: BoxDecoration(
+          color: const Color(0xFF12141D),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: const Color(0xFF1F2232), width: 1),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.25),
+              blurRadius: 12,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          children: [
+            _buildNavItem(
+              context,
+              tab: NavTab.home,
+              icon: Icons.radar_rounded,
+              activeIcon: Icons.radar_rounded,
+              label: 'Home',
+            ),
+            Container(
+              width: 1,
+              height: 24,
+              color: const Color(0xFF1F2232),
+            ),
+            _buildNavItem(
+              context,
+              tab: NavTab.settings,
+              icon: Icons.settings_outlined,
+              activeIcon: Icons.settings_rounded,
+              label: 'Settings',
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildNavItem(
+    BuildContext context, {
+    required NavTab tab,
+    required IconData icon,
+    required IconData activeIcon,
+    required String label,
+  }) {
+    final isActive = _currentTab == tab;
+    final color = isActive ? const Color(0xFF38BDF8) : const Color(0xFF8E95A5);
+
+    return Expanded(
+      child: InkWell(
+        onTap: () {
+          if (_currentTab != tab) {
+            setState(() {
+              _currentTab = tab;
+            });
+          }
+        },
+        borderRadius: BorderRadius.circular(20),
+        child: Container(
+          height: double.infinity,
+          alignment: Alignment.center,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+            decoration: BoxDecoration(
+              color: isActive ? const Color(0xFF1A233D) : Colors.transparent,
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  isActive ? activeIcon : icon,
+                  size: 20,
+                  color: color,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  label,
+                  style: GoogleFonts.plusJakartaSans(
+                    fontSize: 13,
+                    fontWeight: isActive ? FontWeight.w700 : FontWeight.w500,
+                    color: color,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -1516,8 +1909,12 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   // S1: header  S2: transfer info + file list  S3: Cancel / Done
   // ──────────────────────────────────────────────────────────
 
+  // ──────────────────────────────────────────────────────────
+  // SC3: TRANSFER IN PROGRESS / COMPLETION / CANCELLED / FAILED
+  // ──────────────────────────────────────────────────────────
+
   Widget _buildSC3Screen(
-      BuildContext context, TransferProgressState? progressState) {
+      BuildContext context, TransferProgressState? progressState, TransferDirection direction) {
     if (progressState == null) {
       return _buildHomeScreen(context);
     }
@@ -1531,15 +1928,14 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
         _buildSharedHeader(context),
         const SizedBox(height: 14),
         Expanded(
-          flex: 7,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 18),
-            child: _buildSC3TransferContent(context, progressState),
+            child: _buildSC3TransferContent(context, progressState, direction),
           ),
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 12),
         SizedBox(
-          height: 56,
+          height: 54,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 18),
             child: isTransferring
@@ -1547,33 +1943,33 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                 : _buildDoneButton(context, progressState),
           ),
         ),
-        const SizedBox(height: 12),
+        const SizedBox(height: 14),
       ],
     );
   }
 
   Widget _buildSC3TransferContent(
-      BuildContext context, TransferProgressState state) {
-    final theme = Theme.of(context);
+      BuildContext context, TransferProgressState state, TransferDirection direction) {
     final isCompleted = state.status == TransferProgressStatus.completed;
     final isFailed = state.status == TransferProgressStatus.failed;
     final isCancelled = state.status == TransferProgressStatus.cancelled;
+    final isSending = direction == TransferDirection.sending;
 
-    final Color accentColor;
+    final Color statusAccentColor;
     final String titleText;
 
     if (isCompleted) {
-      titleText = 'Transfer Complete';
-      accentColor = const Color(0xFF10B981);
+      titleText = isSending ? 'Files Sent' : 'Files Received';
+      statusAccentColor = const Color(0xFF22C55E);
     } else if (isFailed) {
       titleText = 'Transfer Failed';
-      accentColor = const Color(0xFFEF4444);
+      statusAccentColor = const Color(0xFFFF4D4F);
     } else if (isCancelled) {
       titleText = 'Transfer Cancelled';
-      accentColor = const Color(0xFFF59E0B);
+      statusAccentColor = const Color(0xFFFF8A00);
     } else {
-      titleText = 'Transferring Files';
-      accentColor = theme.colorScheme.primary;
+      titleText = isSending ? 'Sending Files' : 'Receiving Files';
+      statusAccentColor = const Color(0xFF5C7CFA);
     }
 
     final completedCount = state.files
@@ -1581,43 +1977,53 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
         .length;
     final fileCountText = isCompleted
         ? '$completedCount of ${state.totalFiles} files'
-        : '${state.currentFileIndex} of ${state.totalFiles} files';
+        : '${state.currentFileIndex > 0 ? state.currentFileIndex : 1} of ${state.totalFiles} files';
+
+    final percentText =
+        '${(state.overallProgress * 100).toStringAsFixed(0)}%';
 
     return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        // ── 1. Status / Progress Section ──────────────────────────────
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          crossAxisAlignment: CrossAxisAlignment.start,
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
             Text(
               titleText,
               style: GoogleFonts.plusJakartaSans(
-                fontSize: 20,
+                fontSize: 22,
                 fontWeight: FontWeight.w800,
-                color: Colors.white,
-                letterSpacing: -0.3,
+                color: isCancelled
+                    ? const Color(0xFFFF8A00)
+                    : isFailed
+                        ? const Color(0xFFFF4D4F)
+                        : isCompleted
+                            ? const Color(0xFF22C55E)
+                            : Colors.white,
+                letterSpacing: -0.4,
               ),
             ),
             Text(
-              '${(state.overallProgress * 100).toStringAsFixed(0)}%',
+              percentText,
               style: GoogleFonts.plusJakartaSans(
-                fontSize: 30,
+                fontSize: 28,
                 fontWeight: FontWeight.w800,
-                color: accentColor,
+                color: statusAccentColor,
                 letterSpacing: -0.5,
               ),
             ),
           ],
         ),
-        const SizedBox(height: 12),
+        const SizedBox(height: 10),
         ClipRRect(
-          borderRadius: BorderRadius.circular(6),
+          borderRadius: BorderRadius.circular(4),
           child: LinearProgressIndicator(
             value: state.overallProgress,
             minHeight: 6,
-            backgroundColor: const Color(0xFF0B1220),
-            valueColor: AlwaysStoppedAnimation<Color>(accentColor),
+            backgroundColor: const Color(0xFF141926),
+            valueColor: AlwaysStoppedAnimation<Color>(statusAccentColor),
           ),
         ),
         const SizedBox(height: 8),
@@ -1629,7 +2035,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
               style: GoogleFonts.plusJakartaSans(
                 fontSize: 12,
                 fontWeight: FontWeight.w600,
-                color: const Color(0xFFCBD5E1),
+                color: const Color(0xFFA7AFC2),
               ),
             ),
             Text(
@@ -1637,37 +2043,300 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
               style: GoogleFonts.plusJakartaSans(
                 fontSize: 12,
                 fontWeight: FontWeight.w600,
-                color: const Color(0xFF64748B),
+                color: const Color(0xFFA7AFC2),
               ),
             ),
           ],
         ),
-        const SizedBox(height: 16),
-        Text(
-          'FILES',
-          style: GoogleFonts.plusJakartaSans(
-            fontSize: 11,
-            fontWeight: FontWeight.w700,
-            color: const Color(0xFF64748B),
-            letterSpacing: 1.0,
+        const SizedBox(height: 14),
+
+        // ── 2. Notice / Summary Card ──────────────────────────────────
+        _buildSC3NoticeCard(context, state, statusAccentColor, direction),
+        const SizedBox(height: 14),
+
+        // ── 3. Files List Section ─────────────────────────────────────
+        Padding(
+          padding: const EdgeInsets.only(left: 4, bottom: 8),
+          child: Text(
+            'FILES',
+            style: GoogleFonts.plusJakartaSans(
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+              color: const Color(0xFF64748B),
+              letterSpacing: 1.0,
+            ),
           ),
         ),
-        const SizedBox(height: 8),
         Expanded(
           child: ListView.separated(
             physics: const AlwaysScrollableScrollPhysics(),
             itemCount: state.files.length,
-            separatorBuilder: (_, _) => const SizedBox(height: 6),
+            separatorBuilder: (_, _) => const SizedBox(height: 8),
             itemBuilder: (context, index) => _buildSC3FileRow(
               context,
               state.files[index],
-              accentColor,
+              statusAccentColor,
               state.status,
               state.transferId,
             ),
           ),
         ),
       ],
+    );
+  }
+
+  Widget _buildSC3NoticeCard(
+    BuildContext context,
+    TransferProgressState state,
+    Color statusAccentColor,
+    TransferDirection direction,
+  ) {
+    final isTransferring = state.status == TransferProgressStatus.transferring;
+    final isCancelled = state.status == TransferProgressStatus.cancelled;
+    final isCompleted = state.status == TransferProgressStatus.completed;
+    final isSending = direction == TransferDirection.sending;
+
+    if (isTransferring) {
+      final noticeIcon = isSending ? Icons.upload_rounded : Icons.download_rounded;
+      final noticeTitle = isSending
+          ? "Sending files — don't close the app."
+          : "Receiving files — don't close the app.";
+      final noticeBody = isSending
+          ? 'Keep both devices connected until all files are sent.'
+          : 'Keep both devices connected until all files are received.';
+
+      return Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFF12141D),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: const Color(0xFF1F2232), width: 1),
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(16),
+          child: CustomPaint(
+            painter: NoticeRadarPainter(),
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Row(
+                children: [
+                  Container(
+                    width: 42,
+                    height: 42,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1A233D),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Icon(
+                      noticeIcon,
+                      color: const Color(0xFF5C7CFA),
+                      size: 22,
+                    ),
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          noticeTitle,
+                          style: GoogleFonts.plusJakartaSans(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
+                          ),
+                        ),
+                        const SizedBox(height: 3),
+                        Text(
+                          noticeBody,
+                          style: GoogleFonts.plusJakartaSans(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w400,
+                            color: const Color(0xFFA7AFC2),
+                            height: 1.35,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    final IconData noticeIcon;
+    final String noticeTitle;
+    final String noticeSubtitle;
+    final String statusLabelText;
+
+    final completedCount = state.files
+        .where((f) => f.status == FileTransferStatus.completed)
+        .length;
+
+    if (isCancelled) {
+      noticeIcon = Icons.cancel_outlined;
+      noticeTitle = 'Transfer was cancelled';
+      if (completedCount > 0) {
+        noticeSubtitle = isSending
+            ? '$completedCount of ${state.totalFiles} files sent before cancellation.'
+            : '$completedCount of ${state.totalFiles} files received before cancellation.';
+      } else {
+        noticeSubtitle = isSending
+            ? 'Your files were not sent.'
+            : 'The files were not received.';
+      }
+      statusLabelText = 'Cancelled';
+    } else if (isCompleted) {
+      noticeIcon = Icons.check_circle_outline_rounded;
+      noticeTitle = isSending ? 'Files sent' : 'Files received';
+      noticeSubtitle = isSending
+          ? 'All files were sent successfully.'
+          : 'All files were received successfully.';
+      statusLabelText = 'Completed';
+    } else {
+      noticeIcon = Icons.error_outline_rounded;
+      noticeTitle = 'Transfer failed';
+      if (completedCount > 0) {
+        noticeSubtitle = isSending
+            ? '$completedCount of ${state.totalFiles} files sent before failure.'
+            : '$completedCount of ${state.totalFiles} files received before failure.';
+      } else {
+        noticeSubtitle = isSending
+            ? 'The files could not be sent.'
+            : 'The files could not be received.';
+      }
+      statusLabelText = 'Failed';
+    }
+
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF12141D),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFF1F2232), width: 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: [
+                Container(
+                  width: 42,
+                  height: 42,
+                  decoration: BoxDecoration(
+                    color: statusAccentColor.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Icon(noticeIcon, color: statusAccentColor, size: 22),
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        noticeTitle,
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        noticeSubtitle,
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 12,
+                          color: const Color(0xFFA7AFC2),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1, color: Color(0xFF1F2232)),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Summary',
+                  style: GoogleFonts.plusJakartaSans(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    color: const Color(0xFF64748B),
+                    letterSpacing: 0.5,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.description_outlined,
+                            size: 16, color: Color(0xFFA7AFC2)),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Total size',
+                          style: GoogleFonts.plusJakartaSans(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w500,
+                            color: const Color(0xFFA7AFC2),
+                          ),
+                        ),
+                      ],
+                    ),
+                    Text(
+                      _formatFileSize(state.overallTotalBytes),
+                      style: GoogleFonts.plusJakartaSans(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(noticeIcon,
+                            size: 16, color: const Color(0xFFA7AFC2)),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Status',
+                          style: GoogleFonts.plusJakartaSans(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w500,
+                            color: const Color(0xFFA7AFC2),
+                          ),
+                        ),
+                      ],
+                    ),
+                    Text(
+                      statusLabelText,
+                      style: GoogleFonts.plusJakartaSans(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                        color: statusAccentColor,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -1696,19 +2365,19 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     final String statusLabel;
 
     if (isDone) {
-      statusColor = const Color(0xFF10B981);
+      statusColor = const Color(0xFF22C55E);
       statusIcon = Icons.check_circle_rounded;
       statusLabel = 'Complete';
     } else if (isCancelled) {
-      statusColor = const Color(0xFFF59E0B);
+      statusColor = const Color(0xFFFF8A00);
       statusIcon = Icons.cancel_outlined;
       statusLabel = 'Cancelled';
     } else if (isFailed) {
-      statusColor = const Color(0xFFEF4444);
+      statusColor = const Color(0xFFFF4D4F);
       statusIcon = Icons.error_outline_rounded;
       statusLabel = 'Failed';
     } else if (isActive) {
-      statusColor = transferAccent;
+      statusColor = const Color(0xFF5C7CFA);
       statusIcon = Icons.sync_rounded;
       statusLabel = '${(f.progress * 100).toStringAsFixed(0)}%';
     } else {
@@ -1717,31 +2386,37 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       statusLabel = 'Waiting';
     }
 
-    final canCancelSingleFile =
-        !isDone && !isCancelled && !isFailed && !isOverallCancelled && !isOverallFailed;
+    final canCancelSingleFile = !isDone &&
+        !isCancelled &&
+        !isFailed &&
+        !isOverallCancelled &&
+        !isOverallFailed;
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       decoration: BoxDecoration(
-        color: isActive ? const Color(0xFF0F1A2E) : const Color(0xFF080E1C),
-        borderRadius: BorderRadius.circular(12),
+        color: const Color(0xFF12141D),
+        borderRadius: BorderRadius.circular(16),
         border: Border.all(
           color: isActive
-              ? transferAccent.withValues(alpha: 0.35)
-              : const Color(0xFF19233A),
+              ? statusColor.withValues(alpha: 0.4)
+              : const Color(0xFF1F2232),
+          width: 1,
         ),
       ),
       child: Row(
         children: [
           Container(
-            padding: const EdgeInsets.all(6),
+            width: 40,
+            height: 40,
+            alignment: Alignment.center,
             decoration: BoxDecoration(
-              color: statusColor.withValues(alpha: 0.14),
-              borderRadius: BorderRadius.circular(8),
+              color: statusColor.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(12),
             ),
-            child: Icon(statusIcon, color: statusColor, size: 16),
+            child: Icon(statusIcon, color: statusColor, size: 20),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 12),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -1749,74 +2424,54 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                 Text(
                   f.fileName,
                   style: GoogleFonts.plusJakartaSans(
-                    fontSize: 13,
-                    fontWeight: isActive ? FontWeight.bold : FontWeight.w600,
-                    color: isActive ? Colors.white : const Color(0xFFCBD5E1),
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
                   ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
-                const SizedBox(height: 2),
+                const SizedBox(height: 3),
                 Text(
-                  isDone
-                      ? _formatFileSize(f.fileSize)
-                      : isActive
-                          ? '${_formatFileSize(f.bytesTransferred)} / ${_formatFileSize(f.fileSize)}'
-                          : _formatFileSize(f.fileSize),
+                  isActive
+                      ? '${_formatFileSize(f.bytesTransferred)} / ${_formatFileSize(f.fileSize)}'
+                      : _formatFileSize(f.fileSize),
                   style: GoogleFonts.plusJakartaSans(
-                    fontSize: 11,
-                    color: const Color(0xFF64748B),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                    color: const Color(0xFFA7AFC2),
                   ),
                 ),
-                if (isActive) ...[
-                  const SizedBox(height: 5),
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(3),
-                    child: LinearProgressIndicator(
-                      value: f.progress,
-                      minHeight: 3,
-                      backgroundColor: const Color(0xFF040711),
-                      valueColor:
-                          AlwaysStoppedAnimation<Color>(transferAccent),
-                    ),
-                  ),
-                ],
               ],
             ),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 10),
           Text(
             statusLabel,
             style: GoogleFonts.plusJakartaSans(
-              fontSize: 11,
-              fontWeight: FontWeight.bold,
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
               color: statusColor,
             ),
           ),
           if (canCancelSingleFile) ...[
             const SizedBox(width: 8),
-            Tooltip(
-              message: 'Cancel this file',
-              child: InkWell(
-                borderRadius: BorderRadius.circular(14),
-                onTap: () {
-                  TransferService.instance.cancelSingleFile(transferId, f.fileId);
-                },
-                child: Container(
-                  padding: const EdgeInsets.all(4),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF19233A),
-                    shape: BoxShape.circle,
-                    border: Border.all(
-                      color: const Color(0xFF2A3654),
-                      width: 1,
-                    ),
-                  ),
-                  child: const Icon(
-                    Icons.close_rounded,
-                    size: 14,
-                    color: Color(0xFF94A3B8),
-                  ),
+            InkWell(
+              borderRadius: BorderRadius.circular(14),
+              onTap: () {
+                TransferService.instance
+                    .cancelSingleFile(transferId, f.fileId);
+              },
+              child: Container(
+                padding: const EdgeInsets.all(5),
+                decoration: const BoxDecoration(
+                  color: Color(0xFF1C2030),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(
+                  Icons.close_rounded,
+                  size: 14,
+                  color: Color(0xFFA7AFC2),
                 ),
               ),
             ),
@@ -1835,12 +2490,13 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
         icon: const Icon(Icons.cancel_outlined, size: 18),
         label: const Text('Cancel Transfer'),
         style: OutlinedButton.styleFrom(
-          foregroundColor: const Color(0xFFEF4444),
-          side: const BorderSide(color: Color(0xFFEF4444), width: 1),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          foregroundColor: const Color(0xFFFF4D4F),
+          side: const BorderSide(color: Color(0xFFFF4D4F), width: 1.5),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           textStyle: GoogleFonts.plusJakartaSans(
-            fontWeight: FontWeight.bold,
-            fontSize: 14,
+            fontWeight: FontWeight.w700,
+            fontSize: 15,
           ),
         ),
       ),
@@ -1849,9 +2505,12 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
 
   Widget _buildDoneButton(BuildContext context, TransferProgressState state) {
     final isCompleted = state.status == TransferProgressStatus.completed;
-    final shadowColor = isCompleted
-        ? const Color(0xFF10B981)
-        : const Color(0xFF6366F1);
+    final List<Color> gradientColors = isCompleted
+        ? const [Color(0xFF22C55E), Color(0xFF16A34A)]
+        : const [Color(0xFF5C7CFA), Color(0xFF4C6EF5)];
+    final Color shadowColor = isCompleted
+        ? const Color(0xFF22C55E)
+        : const Color(0xFF5C7CFA);
 
     return SizedBox(
       width: double.infinity,
@@ -1860,15 +2519,13 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(16),
           gradient: LinearGradient(
-            colors: isCompleted
-                ? [const Color(0xFF10B981), const Color(0xFF059669)]
-                : [const Color(0xFF6366F1), const Color(0xFF4F46E5)],
+            colors: gradientColors,
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
           ),
           boxShadow: [
             BoxShadow(
-              color: shadowColor.withValues(alpha: 0.30),
+              color: shadowColor.withValues(alpha: 0.35),
               blurRadius: 14,
               offset: const Offset(0, 4),
             ),
@@ -1887,7 +2544,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
             ),
             textStyle: GoogleFonts.plusJakartaSans(
               fontSize: 15,
-              fontWeight: FontWeight.bold,
+              fontWeight: FontWeight.w700,
             ),
           ),
         ),
@@ -2017,7 +2674,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Padding(
-          padding: const EdgeInsets.only(left: 4, bottom: 10),
+          padding: const EdgeInsets.only(left: 4, right: 4, bottom: 10),
           child: Row(
             children: [
               Text(
@@ -2047,14 +2704,9 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
               ),
               if (_isWifiOn) ...[
                 const SizedBox(width: 8),
-                const SizedBox(
-                  width: 12,
-                  height: 12,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 1.5,
-                    valueColor:
-                        AlwaysStoppedAnimation<Color>(Color(0xFF38BDF8)),
-                  ),
+                const CupertinoActivityIndicator(
+                  radius: 10,
+                  color: Color(0xFF38BDF8),
                 ),
               ],
             ],
@@ -2199,69 +2851,100 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   // ──────────────────────────────────────────────────────────
 
   Widget _buildPrimaryFileActionButton(BuildContext context) {
-    return SizedBox(
-      width: double.infinity,
-      height: double.infinity,
-      child: Container(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(20),
-          gradient: const LinearGradient(
-            colors: [Color(0xFF2563EB), Color(0xFF3B82F6)],
-            begin: Alignment.centerLeft,
-            end: Alignment.centerRight,
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: const Color(0xFF2563EB).withValues(alpha: 0.35),
-              blurRadius: 16,
-              offset: const Offset(0, 4),
-            ),
-          ],
-        ),
-        child: ElevatedButton(
-          onPressed: _pickFiles,
-          style: ElevatedButton.styleFrom(
-            backgroundColor: Colors.transparent,
-            shadowColor: Colors.transparent,
-            foregroundColor: Colors.white,
-            shape: RoundedRectangleBorder(
+    return ValueListenableBuilder<List<DiscoveredDevice>>(
+      valueListenable: _discoveryService.discoveredDevicesNotifier,
+      builder: (context, devices, _) {
+        final hasDevices = devices.isNotEmpty;
+
+        return SizedBox(
+          width: double.infinity,
+          height: double.infinity,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 250),
+            decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(20),
+              gradient: hasDevices
+                  ? const LinearGradient(
+                      colors: [Color(0xFF2563EB), Color(0xFF3B82F6)],
+                      begin: Alignment.centerLeft,
+                      end: Alignment.centerRight,
+                    )
+                  : const LinearGradient(
+                      colors: [Color(0xFF161B29), Color(0xFF1A2133)],
+                      begin: Alignment.centerLeft,
+                      end: Alignment.centerRight,
+                    ),
+              border: hasDevices
+                  ? null
+                  : Border.all(color: const Color(0xFF222B3F), width: 1),
+              boxShadow: hasDevices
+                  ? [
+                      BoxShadow(
+                        color: const Color(0xFF2563EB).withValues(alpha: 0.35),
+                        blurRadius: 16,
+                        offset: const Offset(0, 4),
+                      ),
+                    ]
+                  : [],
             ),
-            padding: const EdgeInsets.symmetric(horizontal: 20),
-          ),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Icon(Icons.upload_rounded, size: 24, color: Colors.white),
-              const SizedBox(width: 12),
-              Column(
+            child: ElevatedButton(
+              onPressed: hasDevices ? _pickFiles : null,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.transparent,
+                shadowColor: Colors.transparent,
+                disabledBackgroundColor: Colors.transparent,
+                disabledForegroundColor: const Color(0xFF64748B),
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+              ),
+              child: Row(
                 mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    'Select Files to Send',
-                    style: GoogleFonts.plusJakartaSans(
-                      fontSize: 15,
-                      fontWeight: FontWeight.w700,
-                      color: Colors.white,
-                      letterSpacing: -0.2,
-                    ),
+                  Icon(
+                    Icons.upload_rounded,
+                    size: 24,
+                    color: hasDevices ? Colors.white : const Color(0xFF64748B),
                   ),
-                  const SizedBox(height: 1),
-                  Text(
-                    'or drop files here',
-                    style: GoogleFonts.plusJakartaSans(
-                      fontSize: 11,
-                      fontWeight: FontWeight.w400,
-                      color: const Color(0xFFDBEAFE),
-                    ),
+                  const SizedBox(width: 12),
+                  Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Select Files to Send',
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                          color: hasDevices
+                              ? Colors.white
+                              : const Color(0xFF64748B),
+                          letterSpacing: -0.2,
+                        ),
+                      ),
+                      const SizedBox(height: 1),
+                      Text(
+                        hasDevices
+                            ? 'or drop files here'
+                            : 'waiting for nearby devices…',
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w400,
+                          color: hasDevices
+                              ? const Color(0xFFDBEAFE)
+                              : const Color(0xFF475569),
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
-            ],
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }
@@ -2482,3 +3165,25 @@ class _ShimmerDeviceTileState extends State<ShimmerDeviceTile>
     );
   }
 }
+
+// ============================================================
+// NOTICE CARD RADAR BACKGROUND PAINTER
+// ============================================================
+class NoticeRadarPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width * 0.88, size.height * 0.5);
+    final ringPaint = Paint()
+      ..color = const Color(0xFF1E2B4D).withValues(alpha: 0.35)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.0;
+
+    for (int i = 1; i <= 5; i++) {
+      canvas.drawCircle(center, i * 22.0, ringPaint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
