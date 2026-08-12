@@ -177,6 +177,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   // from switching the screen back to SC3 after the user taps Done.
   TransferDirection _transferDirection = TransferDirection.sending;
   String? _activeTransferSessionId;
+  String? _activePeerDeviceName;
 
   // BUG-E FIX: Track transfer IDs that have been dismissed via Done,
   // so late progress events on BOTH sender and receiver notifiers cannot
@@ -305,6 +306,9 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       builder: (_) => IncomingTransferDialog(request: request),
     ).then((result) {
       _isIncomingDialogOpen = false;
+      if (result == 'accepted') {
+        _activePeerDeviceName = request.senderDeviceName;
+      }
       if (TransferService.instance.incomingRequestNotifier.value?.transferId ==
           request.transferId) {
         TransferService.instance.incomingRequestNotifier.value = null;
@@ -658,6 +662,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     setState(() {
       _isSendingRequest = true;
       _waitingForDeviceName = device.deviceName;
+      _activePeerDeviceName = device.deviceName;
     });
 
     // Resolve any zero file sizes in _selectedFiles before sending transfer request
@@ -987,6 +992,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     // Perform a single atomic setState call to avoid mid-frame rebuild flashes
     setState(() {
       _activeTransferSessionId = null;
+      _activePeerDeviceName = null;
       _selectedFiles.clear();
       _isSendingRequest = false;
       _currentScreen = AppScreen.home;
@@ -2057,14 +2063,43 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
         // ── 3. Files List Section ─────────────────────────────────────
         Padding(
           padding: const EdgeInsets.only(left: 4, bottom: 8),
-          child: Text(
-            'FILES',
-            style: GoogleFonts.plusJakartaSans(
-              fontSize: 11,
-              fontWeight: FontWeight.w700,
-              color: const Color(0xFF64748B),
-              letterSpacing: 1.0,
-            ),
+          child: Row(
+            children: [
+              Text(
+                'FILES',
+                style: GoogleFonts.plusJakartaSans(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  color: const Color(0xFF64748B),
+                  letterSpacing: 1.0,
+                ),
+              ),
+              if (_activePeerDeviceName != null &&
+                  _activePeerDeviceName!.isNotEmpty) ...[
+                Text(
+                  '  •  ',
+                  style: GoogleFonts.plusJakartaSans(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    color: const Color(0xFF475569),
+                  ),
+                ),
+                Flexible(
+                  child: Text(
+                    isSending
+                        ? 'To ${_activePeerDeviceName!}'
+                        : 'From ${_activePeerDeviceName!}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: GoogleFonts.plusJakartaSans(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: const Color(0xFF94A3B8),
+                    ),
+                  ),
+                ),
+              ],
+            ],
           ),
         ),
         Expanded(
