@@ -1,7 +1,7 @@
-class DropLanConfig {
+class OneShareConfig {
   static const int port = 4040;
   static const int protocolVersion = 1;
-  static const String appName = 'DropLAN';
+  static const String appName = 'OneShare';
   static const String infoPath = '/api/v1/info';
   static const String transferRequestPath = '/api/v1/transfer/request';
   static const String transferAcceptPath = '/api/v1/transfer/accept';

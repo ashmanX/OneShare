@@ -4,7 +4,7 @@ import FlutterMacOS
 @main
 class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDelegate {
 
-    private let serviceType = "_droplan._tcp."
+    private let serviceType = "_oneshare._tcp."
 
     private var controlChannel: FlutterMethodChannel?
     private var eventSink: FlutterEventSink?
@@ -18,12 +18,12 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         messenger: FlutterBinaryMessenger
     ) {
         let control = FlutterMethodChannel(
-            name: "com.example.droplan/nsd_control",
+            name: "com.example.oneshare/nsd_control",
             binaryMessenger: messenger
         )
 
         let events = FlutterEventChannel(
-            name: "com.example.droplan/nsd_events",
+            name: "com.example.oneshare/nsd_events",
             binaryMessenger: messenger
         )
 
@@ -31,7 +31,7 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
 
         events.setStreamHandler(self)
 
-        print("DropLAN-NSD macOS: Flutter channels registered")
+        print("OneShare-NSD macOS: Flutter channels registered")
 
         control.setMethodCallHandler { [weak self] call, result in
             guard let self = self else {
@@ -63,7 +63,7 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
                 }
 
                 print(
-                    "DropLAN-NSD macOS: startAdvertising " +
+                    "OneShare-NSD macOS: startAdvertising " +
                     "\(deviceName):\(port)"
                 )
 
@@ -75,17 +75,17 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
                 result(nil)
 
             case "stopAdvertising":
-                print("DropLAN-NSD macOS: stopAdvertising")
+                print("OneShare-NSD macOS: stopAdvertising")
                 self.stopAdvertising()
                 result(nil)
 
             case "startDiscovery":
-                print("DropLAN-NSD macOS: startDiscovery")
+                print("OneShare-NSD macOS: startDiscovery")
                 self.startDiscovery()
                 result(nil)
 
             case "stopDiscovery":
-                print("DropLAN-NSD macOS: stopDiscovery")
+                print("OneShare-NSD macOS: stopDiscovery")
                 self.stopDiscovery()
                 result(nil)
 
@@ -124,7 +124,7 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         publishedService = service
 
         print(
-            "DropLAN-NSD macOS: publishing \(deviceName) on port \(port)"
+            "OneShare-NSD macOS: publishing \(deviceName) on port \(port)"
         )
 
         service.publish(options: [])
@@ -144,7 +144,7 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         serviceBrowser = browser
 
         print(
-            "DropLAN-NSD macOS: starting discovery \(serviceType)"
+            "OneShare-NSD macOS: starting discovery \(serviceType)"
         )
 
         browser.searchForServices(
@@ -168,7 +168,7 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
 
     func netServiceDidPublish(_ sender: NetService) {
         print(
-            "DropLAN-NSD macOS: published \(sender.name):\(sender.port)"
+            "OneShare-NSD macOS: published \(sender.name):\(sender.port)"
         )
     }
 
@@ -177,13 +177,13 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         didNotPublish errorDict: [String: NSNumber]
     ) {
         print(
-            "DropLAN-NSD macOS: publish failed \(errorDict)"
+            "OneShare-NSD macOS: publish failed \(errorDict)"
         )
     }
 
     func netServiceDidStop(_ sender: NetService) {
         print(
-            "DropLAN-NSD macOS: service stopped \(sender.name)"
+            "OneShare-NSD macOS: service stopped \(sender.name)"
         )
     }
 
@@ -192,7 +192,7 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         didNotResolve errorDict: [String: NSNumber]
     ) {
         print(
-            "DropLAN-NSD macOS: resolve failed " +
+            "OneShare-NSD macOS: resolve failed " +
             "\(sender.name) \(errorDict)"
         )
 
@@ -241,7 +241,7 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
 
             if let host = host {
                 print(
-                    "DropLAN-NSD macOS: resolved " +
+                    "OneShare-NSD macOS: resolved " +
                     "\(sender.name) \(host):\(sender.port)"
                 )
 
@@ -262,7 +262,7 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         _ browser: NetServiceBrowser
     ) {
         print(
-            "DropLAN-NSD macOS: browser started"
+            "OneShare-NSD macOS: browser started"
         )
     }
 
@@ -270,7 +270,7 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         _ browser: NetServiceBrowser
     ) {
         print(
-            "DropLAN-NSD macOS: browser stopped"
+            "OneShare-NSD macOS: browser stopped"
         )
     }
 
@@ -279,7 +279,7 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         didNotSearch errorDict: [String: NSNumber]
     ) {
         print(
-            "DropLAN-NSD macOS: browser failed \(errorDict)"
+            "OneShare-NSD macOS: browser failed \(errorDict)"
         )
     }
 
@@ -289,7 +289,7 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         moreComing: Bool
     ) {
         print(
-            "DropLAN-NSD macOS: found \(service.name)"
+            "OneShare-NSD macOS: found \(service.name)"
         )
 
         service.delegate = self
@@ -303,7 +303,7 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         moreComing: Bool
     ) {
         print(
-            "DropLAN-NSD macOS: lost \(service.name)"
+            "OneShare-NSD macOS: lost \(service.name)"
         )
 
         discoveredServices.removeValue(forKey: service.name)
@@ -335,7 +335,7 @@ extension AppDelegate: FlutterStreamHandler {
         eventSink events: @escaping FlutterEventSink
     ) -> FlutterError? {
         self.eventSink = events
-        print("DropLAN-NSD macOS: event stream connected")
+        print("OneShare-NSD macOS: event stream connected")
         return nil
     }
 
@@ -343,7 +343,7 @@ extension AppDelegate: FlutterStreamHandler {
         withArguments arguments: Any?
     ) -> FlutterError? {
         self.eventSink = nil
-        print("DropLAN-NSD macOS: event stream disconnected")
+        print("OneShare-NSD macOS: event stream disconnected")
         return nil
     }
 }

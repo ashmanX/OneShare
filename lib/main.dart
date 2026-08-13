@@ -9,16 +9,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 
-import 'package:droplan/config/droplan_config.dart';
-import 'package:droplan/models/transfer_models.dart';
-import 'package:droplan/services/device_identity_service.dart';
-import 'package:droplan/services/droplan_discovery_service.dart';
-import 'package:droplan/services/droplan_http_server.dart';
-import 'package:droplan/services/transfer_service.dart';
-import 'package:droplan/widgets/incoming_transfer_dialog.dart';
+import 'package:oneshare/config/oneshare_config.dart';
+import 'package:oneshare/models/transfer_models.dart';
+import 'package:oneshare/services/device_identity_service.dart';
+import 'package:oneshare/services/oneshare_discovery_service.dart';
+import 'package:oneshare/services/oneshare_http_server.dart';
+import 'package:oneshare/services/transfer_service.dart';
+import 'package:oneshare/widgets/incoming_transfer_dialog.dart';
 
 void main() {
-  runApp(const DropLanApp());
+  runApp(const OneShareApp());
 }
 
 class SelectedFile {
@@ -46,8 +46,8 @@ enum TransferDirection { sending, receiving }
 // ============================================================
 // App root — theme only, no business logic
 // ============================================================
-class DropLanApp extends StatelessWidget {
-  const DropLanApp({super.key});
+class OneShareApp extends StatelessWidget {
+  const OneShareApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -105,7 +105,7 @@ class DropLanApp extends StatelessWidget {
     );
 
     return MaterialApp(
-      title: 'AirShare',
+      title: 'OneShare',
       debugShowCheckedModeBanner: false,
       themeMode: ThemeMode.dark,
       darkTheme: ThemeData(
@@ -124,7 +124,7 @@ class DropLanApp extends StatelessWidget {
         useMaterial3: true,
         dialogTheme: sharedDialogTheme,
       ),
-      home: const DropLanHomeScreen(),
+      home: const OneShareHomeScreen(),
     );
   }
 }
@@ -132,22 +132,22 @@ class DropLanApp extends StatelessWidget {
 // ============================================================
 // Root widget
 // ============================================================
-class DropLanHomeScreen extends StatefulWidget {
-  const DropLanHomeScreen({super.key});
+class OneShareHomeScreen extends StatefulWidget {
+  const OneShareHomeScreen({super.key});
 
   @override
-  State<DropLanHomeScreen> createState() => _DropLanHomeScreenState();
+  State<OneShareHomeScreen> createState() => _OneShareHomeScreenState();
 }
 
 // ============================================================
 // State — all app logic lives here
 // ============================================================
-class _DropLanHomeScreenState extends State<DropLanHomeScreen>
+class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   // ── Services ─────────────────────────────────────────────
   late final String _deviceName;
-  late final DropLanHttpServer _httpServer;
-  late final DropLanDiscoveryService _discoveryService;
+  late final OneShareHttpServer _httpServer;
+  late final OneShareDiscoveryService _discoveryService;
 
   // ── Animation ────────────────────────────────────────────
   late final AnimationController _radarAnimationController;
@@ -193,8 +193,8 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     super.initState();
 
     _deviceName = DeviceIdentityService.identity.deviceName;
-    _httpServer = DropLanHttpServer();
-    _discoveryService = DropLanDiscoveryService();
+    _httpServer = OneShareHttpServer();
+    _discoveryService = OneShareDiscoveryService();
 
     _radarAnimationController = AnimationController(
       vsync: this,
@@ -288,14 +288,14 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
 
     if (kDebugMode) {
       debugPrint(
-          '[AirShare] INCOMING transferId=${request.transferId} time=${DateTime.now().toIso8601String()}');
+          '[OneShare] INCOMING transferId=${request.transferId} time=${DateTime.now().toIso8601String()}');
     }
 
     if (_isIncomingDialogOpen) return;
     _isIncomingDialogOpen = true;
 
     if (Platform.isMacOS) {
-      const MethodChannel('com.example.droplan/nsd_control')
+      const MethodChannel('com.example.oneshare/nsd_control')
           .invokeMethod('activateApp')
           .catchError((_) {});
     }
@@ -379,7 +379,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (kDebugMode) {
-      debugPrint('[AirShare] lifecycle: ${state.name}');
+      debugPrint('[OneShare] lifecycle: ${state.name}');
     }
     if (state == AppLifecycleState.resumed) {
       _startServicesIfForeground(isResume: true);
@@ -401,7 +401,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
     if (_httpServer.isRunning) {
       await _discoveryService.startAdvertising(
         _deviceName,
-        DropLanConfig.port,
+        OneShareConfig.port,
         isResume: isResume,
       );
       await _discoveryService.startDiscovery();
@@ -580,7 +580,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       final newFiles = <SelectedFile>[];
 
       if (Platform.isAndroid) {
-        const channel = MethodChannel('com.example.droplan/instant_picker');
+        const channel = MethodChannel('com.example.oneshare/instant_picker');
         final List<dynamic>? res =
             await channel.invokeListMethod<dynamic>('pickFiles');
 
@@ -633,7 +633,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
       });
     } catch (error) {
       if (kDebugMode) {
-        debugPrint('AirShare: file picker error: $error');
+        debugPrint('OneShare: file picker error: $error');
       }
     } finally {
       // BUG-16 FIX: Always release the guard.
@@ -1118,7 +1118,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'AirShare',
+                  'OneShare',
                   style: GoogleFonts.plusJakartaSans(
                     fontSize: 24,
                     fontWeight: FontWeight.w800,
@@ -1329,31 +1329,31 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                   children: [
                     _buildSettingsRow(
                       label: 'Service Port',
-                      value: '${DropLanConfig.port}',
+                      value: '${OneShareConfig.port}',
                       icon: Icons.numbers_rounded,
                     ),
                     const Divider(height: 1, color: Color(0xFF1F2232)),
                     _buildSettingsRow(
                       label: 'Protocol Version',
-                      value: 'v${DropLanConfig.protocolVersion}',
+                      value: 'v${OneShareConfig.protocolVersion}',
                       icon: Icons.code_rounded,
                     ),
                     const Divider(height: 1, color: Color(0xFF1F2232)),
                     _buildSettingsRow(
                       label: 'NSD Service Type',
-                      value: '_droplan._tcp.',
+                      value: '_oneshare._tcp.',
                       icon: Icons.dns_rounded,
                     ),
                   ],
                 ),
                 const SizedBox(height: 14),
                 _buildSettingsCard(
-                  title: 'About AirShare',
+                  title: 'About OneShare',
                   icon: Icons.info_outline_rounded,
                   children: [
                     _buildSettingsRow(
                       label: 'Application',
-                      value: DropLanConfig.appName,
+                      value: OneShareConfig.appName,
                       icon: Icons.share_rounded,
                     ),
                     const Divider(height: 1, color: Color(0xFF1F2232)),
@@ -1366,7 +1366,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                     Padding(
                       padding: const EdgeInsets.all(16),
                       child: Text(
-                        'AirShare enables seamless, fast, secure peer-to-peer file transfers between nearby Android and macOS devices over your local Wi-Fi network.',
+                        'OneShare enables seamless, fast, secure peer-to-peer file transfers between nearby Android and macOS devices over your local Wi-Fi network.',
                         style: GoogleFonts.plusJakartaSans(
                           fontSize: 12,
                           fontWeight: FontWeight.w400,
@@ -2671,7 +2671,7 @@ class _DropLanHomeScreenState extends State<DropLanHomeScreen>
                   ),
                   const SizedBox(height: 3),
                   Text(
-                    'Make sure AirShare is open on nearby devices.',
+                    'Make sure OneShare is open on nearby devices.',
                     style: GoogleFonts.plusJakartaSans(
                       fontSize: 12,
                       fontWeight: FontWeight.w400,

@@ -32,8 +32,8 @@ class NsdHelper(context: Context) {
     var eventSink: EventChannel.EventSink? = null
 
     companion object {
-        private const val SERVICE_TYPE = "_droplan._tcp"
-        private const val TAG = "DropLAN-NSD"
+        private const val SERVICE_TYPE = "_oneshare._tcp"
+        private const val TAG = "OneShare-NSD"
     }
 
     private fun postToMain(action: () -> Unit) {
@@ -344,7 +344,7 @@ class NsdHelper(context: Context) {
 
                 multicastLock =
                     wifiManager.createMulticastLock(
-                        "DropLanMulticastLock"
+                        "OneShareMulticastLock"
                     ).apply {
                         setReferenceCounted(false)
                         acquire()

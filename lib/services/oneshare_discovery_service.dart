@@ -5,8 +5,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-import 'package:droplan/config/droplan_config.dart';
-import 'package:droplan/services/device_identity_service.dart';
+import 'package:oneshare/config/oneshare_config.dart';
+import 'package:oneshare/services/device_identity_service.dart';
 
 class DiscoveredDevice {
   const DiscoveredDevice({
@@ -39,12 +39,12 @@ class DiscoveredDevice {
   }
 }
 
-class DropLanDiscoveryService {
+class OneShareDiscoveryService {
   static const MethodChannel _controlChannel =
-      MethodChannel('com.example.droplan/nsd_control');
+      MethodChannel('com.example.oneshare/nsd_control');
 
   static const EventChannel _eventChannel =
-      EventChannel('com.example.droplan/nsd_events');
+      EventChannel('com.example.oneshare/nsd_events');
 
   StreamSubscription? _eventSubscription;
 
@@ -56,9 +56,6 @@ class DropLanDiscoveryService {
 
   final Map<String, DiscoveredDevice> _discoveredDevices = {};
 
-  // BUG-09 FIX: Secondary map from NSD service-name → deviceId so that the
-  // "lost" event (which only provides the service name) can look up the
-  // correct deviceId key rather than doing an error-prone name-based search.
   final Map<String, String> _serviceNameToDeviceId = {};
 
   bool _isAdvertising = false;
@@ -94,15 +91,15 @@ class DropLanDiscoveryService {
       if (kDebugMode) {
         if (isResume) {
           debugPrint(
-              '[DropLAN Timestamp] ANDROID advertising: restarted after resume (name=$deviceName, port=$port)');
+              '[OneShare Timestamp] ANDROID advertising: restarted after resume (name=$deviceName, port=$port)');
         } else {
           debugPrint(
-              '[DropLAN Timestamp] ANDROID advertising: started (name=$deviceName, port=$port)');
+              '[OneShare Timestamp] ANDROID advertising: started (name=$deviceName, port=$port)');
         }
       }
     } catch (error) {
       if (kDebugMode) {
-        debugPrint('DropLAN discovery: startAdvertising failed: $error');
+        debugPrint('OneShare discovery: startAdvertising failed: $error');
       }
     }
   }
@@ -119,11 +116,11 @@ class DropLanDiscoveryService {
           _lastAdvertisedName != null &&
           _lastAdvertisedPort != null) {
         debugPrint(
-            '[DropLAN Timestamp] ANDROID advertising: stopped (name=$_lastAdvertisedName, port=$_lastAdvertisedPort)');
+            '[OneShare Timestamp] ANDROID advertising: stopped (name=$_lastAdvertisedName, port=$_lastAdvertisedPort)');
       }
     } catch (error) {
       if (kDebugMode) {
-        debugPrint('DropLAN discovery: stopAdvertising failed: $error');
+        debugPrint('OneShare discovery: stopAdvertising failed: $error');
       }
     }
   }
@@ -144,11 +141,11 @@ class DropLanDiscoveryService {
       await _controlChannel.invokeMethod('startDiscovery');
       _isDiscovering = true;
       if (kDebugMode) {
-        debugPrint('[DropLAN Timestamp] ANDROID discovery: started');
+        debugPrint('[OneShare Timestamp] ANDROID discovery: started');
       }
     } catch (error) {
       if (kDebugMode) {
-        debugPrint('DropLAN discovery: startDiscovery failed: $error');
+        debugPrint('OneShare discovery: startDiscovery failed: $error');
       }
     }
   }
@@ -165,11 +162,11 @@ class DropLanDiscoveryService {
       await _controlChannel.invokeMethod('stopDiscovery');
       _isDiscovering = false;
       if (kDebugMode) {
-        debugPrint('[DropLAN Timestamp] ANDROID discovery: stopped');
+        debugPrint('[OneShare Timestamp] ANDROID discovery: stopped');
       }
     } catch (error) {
       if (kDebugMode) {
-        debugPrint('DropLAN discovery: stopDiscovery failed: $error');
+        debugPrint('OneShare discovery: stopDiscovery failed: $error');
       }
     }
   }
@@ -181,13 +178,13 @@ class DropLanDiscoveryService {
 
   Future<void> _handleEvent(dynamic event) async {
     if (event is! Map) {
-      if (kDebugMode) debugPrint('DropLAN discovery: invalid event: $event');
+      if (kDebugMode) debugPrint('OneShare discovery: invalid event: $event');
       return;
     }
 
     final eventType = event['event'] as String?;
 
-    if (kDebugMode) debugPrint('DropLAN discovery: received event $event');
+    if (kDebugMode) debugPrint('OneShare discovery: received event $event');
 
     if (eventType == 'resolved') {
       final host = event['host'] as String?;
@@ -196,7 +193,7 @@ class DropLanDiscoveryService {
       if (host == null || port == null) {
         if (kDebugMode) {
           debugPrint(
-            'DropLAN discovery: invalid resolved event: $event',
+            'OneShare discovery: invalid resolved event: $event',
           );
         }
         return;
@@ -204,7 +201,7 @@ class DropLanDiscoveryService {
 
       if (kDebugMode) {
         debugPrint(
-          'DropLAN discovery: resolved $host:$port',
+          'OneShare discovery: resolved $host:$port',
         );
       }
 
@@ -214,7 +211,7 @@ class DropLanDiscoveryService {
       if (verifiedDevice == null) {
         if (kDebugMode) {
           debugPrint(
-            'DropLAN discovery: verification FAILED '
+            'OneShare discovery: verification FAILED '
             'for $host:$port',
           );
         }
@@ -223,7 +220,7 @@ class DropLanDiscoveryService {
 
       if (kDebugMode) {
         debugPrint(
-          'DropLAN discovery: verified '
+          'OneShare discovery: verified '
           '${verifiedDevice.deviceName} '
           '${verifiedDevice.deviceId}',
         );
@@ -234,7 +231,7 @@ class DropLanDiscoveryService {
       if (verifiedDevice.deviceId == selfId) {
         if (kDebugMode) {
           debugPrint(
-            'DropLAN discovery: ignoring self '
+            'OneShare discovery: ignoring self '
             '${verifiedDevice.deviceId}',
           );
         }
@@ -242,15 +239,11 @@ class DropLanDiscoveryService {
       }
 
       _discoveredDevices[verifiedDevice.deviceId] = verifiedDevice;
-
-      // BUG-09 FIX: Record the mapping from NSD service-name to deviceId.
-      // We use deviceName as the NSD service name since that is what Android
-      // NSD advertises and returns in the "lost" event's serviceName field.
       _serviceNameToDeviceId[verifiedDevice.deviceName] = verifiedDevice.deviceId;
 
       if (kDebugMode) {
         debugPrint(
-          'DropLAN discovery: adding '
+          'OneShare discovery: adding '
           '${verifiedDevice.deviceName}',
         );
       }
@@ -260,7 +253,7 @@ class DropLanDiscoveryService {
 
       if (kDebugMode) {
         debugPrint(
-          'DropLAN discovery: total devices = '
+          'OneShare discovery: total devices = '
           '${discoveredDevicesNotifier.value.length}',
         );
       }
@@ -270,18 +263,14 @@ class DropLanDiscoveryService {
       if (serviceName != null) {
         if (kDebugMode) {
           debugPrint(
-            'DropLAN discovery: service lost $serviceName',
+            'OneShare discovery: service lost $serviceName',
           );
         }
 
-        // BUG-09 FIX: Look up the unique deviceId by service name first.
-        // This prevents two devices with the same display name from both
-        // being removed when only one of them goes offline.
         final lostDeviceId = _serviceNameToDeviceId.remove(serviceName);
         if (lostDeviceId != null) {
           _discoveredDevices.remove(lostDeviceId);
         } else {
-          // Fallback: if the mapping is missing for any reason, remove by name.
           _discoveredDevices.removeWhere(
             (_, device) => device.deviceName == serviceName,
           );
@@ -292,7 +281,7 @@ class DropLanDiscoveryService {
 
         if (kDebugMode) {
           debugPrint(
-            'DropLAN discovery: total devices = '
+            'OneShare discovery: total devices = '
             '${discoveredDevicesNotifier.value.length}',
           );
         }
@@ -307,12 +296,12 @@ class DropLanDiscoveryService {
     try {
       final uri = Uri.http(
         '$host:$port',
-        DropLanConfig.infoPath,
+        OneShareConfig.infoPath,
       );
 
       if (kDebugMode) {
         debugPrint(
-          'DropLAN discovery: requesting $uri',
+          'OneShare discovery: requesting $uri',
         );
       }
 
@@ -325,7 +314,7 @@ class DropLanDiscoveryService {
 
       if (kDebugMode) {
         debugPrint(
-          'DropLAN discovery: /info status '
+          'OneShare discovery: /info status '
           '${response.statusCode}',
         );
       }
@@ -339,7 +328,7 @@ class DropLanDiscoveryService {
 
       if (kDebugMode) {
         debugPrint(
-          'DropLAN discovery: /info response '
+          'OneShare discovery: /info response '
           '$responseBody',
         );
       }
@@ -347,12 +336,12 @@ class DropLanDiscoveryService {
       final json =
           jsonDecode(responseBody) as Map<String, dynamic>;
 
-      if (json['appName'] != DropLanConfig.appName ||
+      if (json['appName'] != OneShareConfig.appName ||
           json['protocolVersion'] !=
-              DropLanConfig.protocolVersion) {
+              OneShareConfig.protocolVersion) {
         if (kDebugMode) {
           debugPrint(
-            'DropLAN discovery: metadata mismatch '
+            'OneShare discovery: metadata mismatch '
             'appName=${json['appName']} '
             'protocolVersion=${json['protocolVersion']}',
           );
@@ -369,7 +358,7 @@ class DropLanDiscoveryService {
           deviceName.isEmpty) {
         if (kDebugMode) {
           debugPrint(
-            'DropLAN discovery: missing deviceId/deviceName',
+            'OneShare discovery: missing deviceId/deviceName',
           );
         }
         return null;
@@ -385,7 +374,7 @@ class DropLanDiscoveryService {
     } catch (error) {
       if (kDebugMode) {
         debugPrint(
-          'DropLAN discovery: verification exception '
+          'OneShare discovery: verification exception '
           '$host:$port -> $error',
         );
       }

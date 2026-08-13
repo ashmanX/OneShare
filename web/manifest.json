@@ -1,6 +1,6 @@
 {
-    "name": "droplan",
-    "short_name": "droplan",
+    "name": "OneShare",
+    "short_name": "OneShare",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",

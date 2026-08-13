@@ -8,9 +8,9 @@ import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
-import 'package:droplan/config/droplan_config.dart';
-import 'package:droplan/models/transfer_models.dart';
-import 'package:droplan/services/device_identity_service.dart';
+import 'package:oneshare/config/oneshare_config.dart';
+import 'package:oneshare/models/transfer_models.dart';
+import 'package:oneshare/services/device_identity_service.dart';
 
 class TransferCancelledException implements Exception {
   const TransferCancelledException([this.message = 'Transfer was cancelled']);
@@ -109,7 +109,7 @@ class TransferService {
   Future<void> cancelSingleFile(String transferId, String fileId) async {
     if (kDebugMode) {
       debugPrint(
-          '[DropLAN TransferService] cancelSingleFile called for: transferId=$transferId, fileId=$fileId');
+          '[OneShare TransferService] cancelSingleFile called for: transferId=$transferId, fileId=$fileId');
     }
     final set = _cancelledFileIdsPerTransfer.putIfAbsent(transferId, () => {});
     set.add(fileId);
@@ -119,7 +119,7 @@ class TransferService {
     final port = _activeTargetPort;
     if (host != null && port != null) {
       try {
-        final uri = Uri.http('$host:$port', DropLanConfig.transferCancelFilePath);
+        final uri = Uri.http('$host:$port', OneShareConfig.transferCancelFilePath);
         final req = await _client.postUrl(uri);
         req.headers.contentType = ContentType.json;
         req.write(jsonEncode({
@@ -132,7 +132,7 @@ class TransferService {
       } catch (e) {
         if (kDebugMode) {
           debugPrint(
-              '[DropLAN TransferService] Peer file cancel notify error: $e');
+              '[OneShare TransferService] Peer file cancel notify error: $e');
         }
       }
     }
@@ -145,7 +145,7 @@ class TransferService {
       String transferId, String fileId) async {
     if (kDebugMode) {
       debugPrint(
-          '[DropLAN TransferService] Peer notification cancelled file: transferId=$transferId, fileId=$fileId');
+          '[OneShare TransferService] Peer notification cancelled file: transferId=$transferId, fileId=$fileId');
     }
     final set = _cancelledFileIdsPerTransfer.putIfAbsent(transferId, () => {});
     set.add(fileId);
@@ -340,7 +340,7 @@ class TransferService {
   Future<void> _sendCancelNotificationToPeer(
       String host, int port, String transferId) async {
     try {
-      final uri = Uri.http('$host:$port', DropLanConfig.transferCancelPath);
+      final uri = Uri.http('$host:$port', OneShareConfig.transferCancelPath);
       final req = await _client.postUrl(uri);
       req.headers.contentType = ContentType.json;
       req.write(jsonEncode({
@@ -351,7 +351,7 @@ class TransferService {
       await resp.drain();
     } catch (e) {
       if (kDebugMode) {
-        debugPrint('[DropLAN TransferService] Peer cancel notify error: $e');
+        debugPrint('[OneShare TransferService] Peer cancel notify error: $e');
       }
     }
   }
@@ -362,7 +362,7 @@ class TransferService {
 
   Future<void> cancelTransfer(String transferId) async {
     if (kDebugMode) {
-      debugPrint('[DropLAN TransferService] cancelTransfer called for: $transferId');
+      debugPrint('[OneShare TransferService] cancelTransfer called for: $transferId');
       debugPrint('[DIAGNOSTIC] cancelTransfer called. transferId: $transferId');
       debugPrint('[DIAGNOSTIC] _activeTargetHost: $_activeTargetHost, _activeTargetPort: $_activeTargetPort');
       debugPrint('[DIAGNOSTIC] _acceptedRequests[transferId]: ${_acceptedRequests[transferId]}');
@@ -481,7 +481,7 @@ class TransferService {
     // state before the connection drop triggers a "failed" state.
     if (host != null && port != null) {
       try {
-        final uri = Uri.http('$host:$port', DropLanConfig.transferCancelPath);
+        final uri = Uri.http('$host:$port', OneShareConfig.transferCancelPath);
         final req = await _client.postUrl(uri);
         req.headers.contentType = ContentType.json;
         req.write(jsonEncode({
@@ -491,7 +491,7 @@ class TransferService {
         final resp = await req.close();
         await resp.drain();
       } catch (e) {
-        if (kDebugMode) debugPrint('[DropLAN TransferService] Peer cancel notify error: $e');
+        if (kDebugMode) debugPrint('[OneShare TransferService] Peer cancel notify error: $e');
       }
     }
 
@@ -500,7 +500,7 @@ class TransferService {
       try {
         _activeOutgoingRequest?.abort();
       } catch (e) {
-        if (kDebugMode) debugPrint('[DropLAN TransferService] Error aborting outgoing request: $e');
+        if (kDebugMode) debugPrint('[OneShare TransferService] Error aborting outgoing request: $e');
       }
       _activeOutgoingRequest = null;
     }
@@ -517,12 +517,12 @@ class TransferService {
       try {
         if (await _activeIncomingTempFile?.exists() == true) {
           if (kDebugMode) {
-            debugPrint('[DropLAN TransferService] Deleting incomplete temp file on cancel: ${_activeIncomingTempFile?.path}');
+            debugPrint('[OneShare TransferService] Deleting incomplete temp file on cancel: ${_activeIncomingTempFile?.path}');
           }
           await _activeIncomingTempFile?.delete();
         }
       } catch (e) {
-        if (kDebugMode) debugPrint('[DropLAN TransferService] Error deleting temp file: $e');
+        if (kDebugMode) debugPrint('[OneShare TransferService] Error deleting temp file: $e');
       }
       _activeIncomingTempFile = null;
     }
@@ -554,7 +554,7 @@ class TransferService {
 
   Future<void> handleCancelNotification(String transferId) async {
     if (kDebugMode) {
-      debugPrint('[DropLAN TransferService] Peer notification cancelled transfer: $transferId');
+      debugPrint('[OneShare TransferService] Peer notification cancelled transfer: $transferId');
       debugPrint('[DIAGNOSTIC] handleCancelNotification called. transferId: $transferId');
       debugPrint('[DIAGNOSTIC] _activeSenderCurrentFileBytes: $_activeSenderCurrentFileBytes');
       debugPrint('[DIAGNOSTIC] sendProgressNotifier.value: ${sendProgressNotifier.value}');
@@ -714,7 +714,7 @@ class TransferService {
 
     if (kDebugMode) {
       debugPrint(
-          '[DropLAN Timestamp] MAC TRANSFER START transferId=$transferId time=${DateTime.now().toIso8601String()}');
+          '[OneShare Timestamp] MAC TRANSFER START transferId=$transferId time=${DateTime.now().toIso8601String()}');
     }
 
     final fileItems = selectedFileDetails.map((f) {
@@ -732,7 +732,7 @@ class TransferService {
       'senderDeviceId': ownIdentity.deviceId,
       'senderDeviceName': ownIdentity.deviceName,
       'senderHost': localHost ?? '127.0.0.1',
-      'senderPort': senderPort ?? DropLanConfig.port,
+      'senderPort': senderPort ?? OneShareConfig.port,
       'files': fileItems.map((f) => f.toJson()).toList(),
     };
 
@@ -749,7 +749,7 @@ class TransferService {
       if (_outgoingRequests.containsKey(transferId)) {
         if (kDebugMode) {
           debugPrint(
-              '[DropLAN Timestamp] MAC REQUEST RESPONSE/TIMEOUT transferId=$transferId status=TIMEOUT time=${DateTime.now().toIso8601String()}');
+              '[OneShare Timestamp] MAC REQUEST RESPONSE/TIMEOUT transferId=$transferId status=TIMEOUT time=${DateTime.now().toIso8601String()}');
         }
         _outgoingFileItems.remove(transferId);
         _outgoingRequests.remove(transferId)?.complete(
@@ -763,10 +763,10 @@ class TransferService {
 
     try {
       final uri =
-          Uri.http('$targetHost:$targetPort', DropLanConfig.transferRequestPath);
+          Uri.http('$targetHost:$targetPort', OneShareConfig.transferRequestPath);
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Timestamp] MAC REQUEST CONNECT transferId=$transferId uri=$uri time=${DateTime.now().toIso8601String()}');
+            '[OneShare Timestamp] MAC REQUEST CONNECT transferId=$transferId uri=$uri time=${DateTime.now().toIso8601String()}');
       }
       final request = await _client.postUrl(uri);
       request.headers.contentType = ContentType.json;
@@ -775,13 +775,13 @@ class TransferService {
       final response = await request.close();
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Timestamp] MAC REQUEST BODY SENT transferId=$transferId time=${DateTime.now().toIso8601String()}');
+            '[OneShare Timestamp] MAC REQUEST BODY SENT transferId=$transferId time=${DateTime.now().toIso8601String()}');
       }
       final responseBody = await utf8.decoder.bind(response).join();
 
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Timestamp] MAC REQUEST RESPONSE/TIMEOUT transferId=$transferId status=${response.statusCode} time=${DateTime.now().toIso8601String()}');
+            '[OneShare Timestamp] MAC REQUEST RESPONSE/TIMEOUT transferId=$transferId status=${response.statusCode} time=${DateTime.now().toIso8601String()}');
       }
 
       if (response.statusCode != HttpStatus.ok) {
@@ -807,7 +807,7 @@ class TransferService {
     } catch (e) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Timestamp] MAC REQUEST RESPONSE/TIMEOUT transferId=$transferId status=EXCEPTION error=$e time=${DateTime.now().toIso8601String()}');
+            '[OneShare Timestamp] MAC REQUEST RESPONSE/TIMEOUT transferId=$transferId status=EXCEPTION error=$e time=${DateTime.now().toIso8601String()}');
       }
       timer.cancel();
       _outgoingCancelCompleter = null;
@@ -880,7 +880,7 @@ class TransferService {
     if (isTransferCancelled(transferId)) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Sender] sendTransferFiles called for cancelled transfer $transferId');
+            '[OneShare Stream Sender] sendTransferFiles called for cancelled transfer $transferId');
       }
       return false;
     }
@@ -922,7 +922,7 @@ class TransferService {
         if (isTransferCancelled(transferId)) {
           if (kDebugMode) {
             debugPrint(
-                '[DropLAN Stream Sender] Transfer $transferId was cancelled before file ${i + 1}');
+                '[OneShare Stream Sender] Transfer $transferId was cancelled before file ${i + 1}');
           }
           _activeOutgoingRequest = null;
           return false;
@@ -934,7 +934,7 @@ class TransferService {
         if (isFileCancelled(transferId, fileItem.fileId)) {
           if (kDebugMode) {
             debugPrint(
-                '[DropLAN Stream Sender] File ${fileItem.fileName} was cancelled, skipping.');
+                '[OneShare Stream Sender] File ${fileItem.fileName} was cancelled, skipping.');
           }
           continue;
         }
@@ -946,7 +946,7 @@ class TransferService {
           if (!await file.exists()) {
             if (kDebugMode) {
               debugPrint(
-                  '[DropLAN Stream Sender] File not found on sender: ${fileToSend.localPath}');
+                  '[OneShare Stream Sender] File not found on sender: ${fileToSend.localPath}');
             }
             if (!isTransferCancelled(transferId)) {
               sendProgressNotifier.value = TransferProgressState(
@@ -986,11 +986,11 @@ class TransferService {
 
         try {
           final uri =
-              Uri.http('$targetHost:$targetPort', DropLanConfig.transferFilePath);
+              Uri.http('$targetHost:$targetPort', OneShareConfig.transferFilePath);
           if (kDebugMode) {
-            debugPrint('[DropLAN Stream Sender] Opening connection to $uri');
+            debugPrint('[OneShare Stream Sender] Opening connection to $uri');
             debugPrint(
-                '[DropLAN Stream Sender] transferId: $transferId, fileId: ${fileItem.fileId}, fileName: ${fileItem.fileName}, expectedSize: ${fileItem.fileSize}');
+                '[OneShare Stream Sender] transferId: $transferId, fileId: ${fileItem.fileId}, fileName: ${fileItem.fileName}, expectedSize: ${fileItem.fileSize}');
           }
           final request = await _client.postUrl(uri);
           _activeOutgoingRequest = request;
@@ -1007,7 +1007,7 @@ class TransferService {
 
           if (kDebugMode) {
             debugPrint(
-                '[DropLAN Stream Sender] Connection opened. Streaming file data...');
+                '[OneShare Stream Sender] Connection opened. Streaming file data...');
           }
 
           int lastProgressUpdateMs = 0;
@@ -1094,7 +1094,7 @@ class TransferService {
 
           if (kDebugMode) {
             debugPrint(
-                '[DropLAN Stream Sender] Finished writing stream to socket. Bytes sent: $currentFileSent / ${fileItem.fileSize}');
+                '[OneShare Stream Sender] Finished writing stream to socket. Bytes sent: $currentFileSent / ${fileItem.fileSize}');
           }
 
           final response = await request.close();
@@ -1110,14 +1110,14 @@ class TransferService {
 
           if (kDebugMode) {
             debugPrint(
-                '[DropLAN Stream Sender] Response HTTP Status: ${response.statusCode}');
+                '[OneShare Stream Sender] Response HTTP Status: ${response.statusCode}');
           }
 
           if (response.statusCode != HttpStatus.ok) {
             final responseBody = await utf8.decoder.bind(response).join();
             if (kDebugMode) {
               debugPrint(
-                  '[DropLAN Stream Sender] Upload failed status ${response.statusCode}, body: $responseBody');
+                  '[OneShare Stream Sender] Upload failed status ${response.statusCode}, body: $responseBody');
             }
 
             // Allow in-flight peer cancel HTTP notification to process if socket/HTTP 499 arrived first
@@ -1148,7 +1148,7 @@ class TransferService {
           await response.drain();
           if (kDebugMode) {
             debugPrint(
-                '[DropLAN Stream Sender] Connection closed cleanly for ${fileItem.fileName}');
+                '[OneShare Stream Sender] Connection closed cleanly for ${fileItem.fileName}');
           }
 
           completedFilesBytes += fileItem.fileSize;
@@ -1164,7 +1164,7 @@ class TransferService {
           if (isTransferCancelled(transferId) || e is TransferCancelledException) {
             if (kDebugMode) {
               debugPrint(
-                  '[DropLAN Stream Sender] Outgoing transfer cancelled for $transferId');
+                  '[OneShare Stream Sender] Outgoing transfer cancelled for $transferId');
             }
             return false;
           }
@@ -1174,7 +1174,7 @@ class TransferService {
           if (isTransferCancelled(transferId)) {
             if (kDebugMode) {
               debugPrint(
-                  '[DropLAN Stream Sender] Outgoing transfer marked cancelled after socket drop for $transferId');
+                  '[OneShare Stream Sender] Outgoing transfer marked cancelled after socket drop for $transferId');
             }
             return false;
           }
@@ -1182,14 +1182,14 @@ class TransferService {
           if (isFileCancelled(transferId, fileItem.fileId)) {
             if (kDebugMode) {
               debugPrint(
-                  '[DropLAN Stream Sender] File ${fileItem.fileName} was cancelled, continuing to next.');
+                  '[OneShare Stream Sender] File ${fileItem.fileName} was cancelled, continuing to next.');
             }
             continue;
           }
 
           if (kDebugMode) {
             debugPrint(
-                '[DropLAN Stream Sender] Exception during file upload: $e\n$st');
+                '[OneShare Stream Sender] Exception during file upload: $e\n$st');
           }
           final finalSent = currentFileSent > 0 ? currentFileSent : _activeSenderCurrentFileBytes;
           sendProgressNotifier.value = TransferProgressState(
@@ -1293,13 +1293,13 @@ class TransferService {
 
     if (kDebugMode) {
       debugPrint(
-          '[DropLAN Timestamp] ANDROID handleIncomingRequest START transferId=${pendingRequest.transferId} time=${DateTime.now().toIso8601String()}');
+          '[OneShare Timestamp] ANDROID handleIncomingRequest START transferId=${pendingRequest.transferId} time=${DateTime.now().toIso8601String()}');
     }
 
     if (pendingRequest.transferId.isEmpty) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] REJECTED: transferId is empty');
+            '[OneShare Stream Receiver] REJECTED: transferId is empty');
       }
       return {
         'status': 'rejected',
@@ -1311,7 +1311,7 @@ class TransferService {
     if (_processedTransferIds.contains(pendingRequest.transferId)) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] REJECTED: Duplicate transfer ID ${pendingRequest.transferId}');
+            '[OneShare Stream Receiver] REJECTED: Duplicate transfer ID ${pendingRequest.transferId}');
       }
       return {
         'status': 'rejected',
@@ -1323,7 +1323,7 @@ class TransferService {
     if (incomingRequestNotifier.value != null) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] REJECTED: Receiver busy with pending request ${incomingRequestNotifier.value?.transferId}');
+            '[OneShare Stream Receiver] REJECTED: Receiver busy with pending request ${incomingRequestNotifier.value?.transferId}');
       }
       return {
         'status': 'rejected',
@@ -1355,7 +1355,7 @@ class TransferService {
 
     if (kDebugMode) {
       debugPrint(
-          '[DropLAN Timestamp] ANDROID incomingRequestNotifier UPDATED transferId=${requestWithHost.transferId} time=${DateTime.now().toIso8601String()}');
+          '[OneShare Timestamp] ANDROID incomingRequestNotifier UPDATED transferId=${requestWithHost.transferId} time=${DateTime.now().toIso8601String()}');
     }
 
     return {
@@ -1421,11 +1421,11 @@ class TransferService {
     try {
       final uri = Uri.http(
         '${request.senderHost}:${request.senderPort}',
-        DropLanConfig.transferAcceptPath,
+        OneShareConfig.transferAcceptPath,
       );
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN] Sending accept to $uri for transferId: $transferId');
+            '[OneShare] Sending accept to $uri for transferId: $transferId');
       }
       final req = await _client.postUrl(uri);
       req.headers.contentType = ContentType.json;
@@ -1434,14 +1434,14 @@ class TransferService {
       await res.drain();
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN] Accept request completed with status: ${res.statusCode}');
+            '[OneShare] Accept request completed with status: ${res.statusCode}');
       }
 
       // BUG-05/06 FIX: If the sender returns 410 Gone, the request was
       // accepted too late. Clean up receiver state and notify the user.
       if (res.statusCode == HttpStatus.gone) {
         if (kDebugMode) {
-          debugPrint('[DropLAN] Sender returned 410 — request expired. Cleaning up receiver state.');
+          debugPrint('[OneShare] Sender returned 410 — request expired. Cleaning up receiver state.');
         }
         _cleanupTransferState(transferId);
         receiveProgressNotifier.value = TransferProgressState(
@@ -1459,7 +1459,7 @@ class TransferService {
       }
     } catch (e, st) {
       if (kDebugMode) {
-        debugPrint('[DropLAN] Error sending accept request: $e\n$st');
+        debugPrint('[OneShare] Error sending accept request: $e\n$st');
       }
     }
   }
@@ -1481,11 +1481,11 @@ class TransferService {
     try {
       final uri = Uri.http(
         '${request.senderHost}:${request.senderPort}',
-        DropLanConfig.transferRejectPath,
+        OneShareConfig.transferRejectPath,
       );
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN] Sending reject to $uri for transferId: $transferId');
+            '[OneShare] Sending reject to $uri for transferId: $transferId');
       }
       final req = await _client.postUrl(uri);
       req.headers.contentType = ContentType.json;
@@ -1494,11 +1494,11 @@ class TransferService {
       await res.drain();
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN] Reject request completed with status: ${res.statusCode}');
+            '[OneShare] Reject request completed with status: ${res.statusCode}');
       }
     } catch (e, st) {
       if (kDebugMode) {
-        debugPrint('[DropLAN] Error sending reject request: $e\n$st');
+        debugPrint('[OneShare] Error sending reject request: $e\n$st');
       }
     }
   }
@@ -1551,17 +1551,17 @@ class TransferService {
 
     if (kDebugMode) {
       debugPrint(
-          '[DropLAN Stream Receiver] Connection opened from $clientIp for endpoint ${request.uri.path}');
+          '[OneShare Stream Receiver] Connection opened from $clientIp for endpoint ${request.uri.path}');
       request.headers.forEach((name, values) {
         debugPrint(
-            '[DropLAN Stream Receiver] Request Header: $name = ${values.join(", ")}');
+            '[OneShare Stream Receiver] Request Header: $name = ${values.join(", ")}');
       });
     }
 
     if (authHeader == null || !authHeader.startsWith('Bearer ')) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] Missing or invalid Authorization header');
+            '[OneShare Stream Receiver] Missing or invalid Authorization header');
       }
       await _sendErrorResponse(
         request,
@@ -1584,7 +1584,7 @@ class TransferService {
 
     if (kDebugMode) {
       debugPrint(
-          '[DropLAN Stream Receiver] transferId: $transferId, fileId: $fileId, fileName: $rawFileName, declaredSize: $declaredSize');
+          '[OneShare Stream Receiver] transferId: $transferId, fileId: $fileId, fileName: $rawFileName, declaredSize: $declaredSize');
     }
 
     // 1. Check pending accepted request
@@ -1592,7 +1592,7 @@ class TransferService {
     if (pendingReq == null) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] Transfer ID $transferId not active or accepted');
+            '[OneShare Stream Receiver] Transfer ID $transferId not active or accepted');
       }
       await _sendErrorResponse(
         request,
@@ -1608,7 +1608,7 @@ class TransferService {
     if (token == null) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] Invalid or expired token for fileId $fileId');
+            '[OneShare Stream Receiver] Invalid or expired token for fileId $fileId');
       }
       await _sendErrorResponse(
         request,
@@ -1623,7 +1623,7 @@ class TransferService {
     if (token.senderDeviceId != pendingReq.senderDeviceId) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] Sender device ID mismatch');
+            '[OneShare Stream Receiver] Sender device ID mismatch');
       }
       await _sendErrorResponse(
         request,
@@ -1638,7 +1638,7 @@ class TransferService {
     if (token.transferId != transferId) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] Token transfer ID mismatch');
+            '[OneShare Stream Receiver] Token transfer ID mismatch');
       }
       await _sendErrorResponse(
         request,
@@ -1661,7 +1661,7 @@ class TransferService {
     if (expectedFileItem == null) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] File ID $fileId not found in transfer metadata');
+            '[OneShare Stream Receiver] File ID $fileId not found in transfer metadata');
       }
       await _sendErrorResponse(
         request,
@@ -1676,7 +1676,7 @@ class TransferService {
     if (rawFileName.isNotEmpty && rawFileName != expectedFileItem.fileName) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] Filename mismatch: got $rawFileName, expected ${expectedFileItem.fileName}');
+            '[OneShare Stream Receiver] Filename mismatch: got $rawFileName, expected ${expectedFileItem.fileName}');
       }
       await _sendErrorResponse(
         request,
@@ -1696,7 +1696,7 @@ class TransferService {
         declaredSize != expectedFileItem.fileSize) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] Size mismatch: got $declaredSize, expected ${expectedFileItem.fileSize}');
+            '[OneShare Stream Receiver] Size mismatch: got $declaredSize, expected ${expectedFileItem.fileSize}');
       }
       await _sendErrorResponse(
         request,
@@ -1727,19 +1727,19 @@ class TransferService {
       // Keeping tempFile and targetFile in the exact same directory guarantees that
       // tempFile.rename() is an instant, atomic OS inode operation (0ms, 0 extra disk I/O, 0 memory allocated).
       tempFile =
-          File(p.join(targetFile.parent.path, '.droplan_${transferId}_$fileId.tmp'));
+          File(p.join(targetFile.parent.path, '.oneshare_${transferId}_$fileId.tmp'));
 
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] Temp file path: ${tempFile.path}');
+            '[OneShare Stream Receiver] Temp file path: ${tempFile.path}');
         debugPrint(
-            '[DropLAN Stream Receiver] Target destination path: ${targetFile.path}');
+            '[OneShare Stream Receiver] Target destination path: ${targetFile.path}');
       }
 
       if (await tempFile.exists()) {
         if (kDebugMode) {
           debugPrint(
-              '[DropLAN Stream Receiver] Deleting existing stale temp file at ${tempFile.path}');
+              '[OneShare Stream Receiver] Deleting existing stale temp file at ${tempFile.path}');
         }
         await tempFile.delete();
       }
@@ -1748,7 +1748,7 @@ class TransferService {
     } catch (e, st) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] Error setting up destination file/temp file: $e\n$st');
+            '[OneShare Stream Receiver] Error setting up destination file/temp file: $e\n$st');
       }
       _setReceiverProgressFailed(
           transferId, 'Could not create destination file: $e');
@@ -1767,7 +1767,7 @@ class TransferService {
 
     if (kDebugMode) {
       debugPrint(
-          '[DropLAN Stream Receiver] Opened write sink for ${tempFile.path}');
+          '[OneShare Stream Receiver] Opened write sink for ${tempFile.path}');
     }
 
     int actualBytesReceived = 0;
@@ -1777,7 +1777,7 @@ class TransferService {
 
     if (kDebugMode) {
       debugPrint(
-          '[DropLAN Stream Receiver] Start reading request stream for $rawFileName. Expected size: $expectedSize bytes');
+          '[OneShare Stream Receiver] Start reading request stream for $rawFileName. Expected size: $expectedSize bytes');
     }
 
     try {
@@ -1785,7 +1785,7 @@ class TransferService {
         if (isTransferCancelled(transferId) || isFileCancelled(transferId, fileId)) {
           if (kDebugMode) {
             debugPrint(
-                '[DropLAN Stream Receiver] Stream reading aborted for $rawFileName due to cancellation');
+                '[OneShare Stream Receiver] Stream reading aborted for $rawFileName due to cancellation');
           }
           await sink.close();
           _activeIncomingSink = null;
@@ -1834,7 +1834,7 @@ class TransferService {
 
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] Stream read complete. Expected: $expectedSize, Actual bytes received: $actualBytesReceived');
+            '[OneShare Stream Receiver] Stream read complete. Expected: $expectedSize, Actual bytes received: $actualBytesReceived');
       }
     } catch (e, st) {
       _activeIncomingSink = null;
@@ -1857,7 +1857,7 @@ class TransferService {
 
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] Exception receiving stream for $rawFileName: $e\n$st');
+            '[OneShare Stream Receiver] Exception receiving stream for $rawFileName: $e\n$st');
       }
 
       if (await tempFile.exists()) {
@@ -1894,7 +1894,7 @@ class TransferService {
     if (sizeExceeded || (expectedSize > 0 && actualBytesReceived != expectedSize)) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] Byte count mismatch: expected $expectedSize, got $actualBytesReceived (sizeExceeded: $sizeExceeded)');
+            '[OneShare Stream Receiver] Byte count mismatch: expected $expectedSize, got $actualBytesReceived (sizeExceeded: $sizeExceeded)');
       }
       if (await tempFile.exists()) {
         try {
@@ -1917,7 +1917,7 @@ class TransferService {
     final tempSize = tempExists ? await tempFile.length() : -1;
 
     if (kDebugMode) {
-      debugPrint('[DropLAN Stream Receiver] ANDROID RECEIVE:');
+      debugPrint('[OneShare Stream Receiver] ANDROID RECEIVE:');
       debugPrint('  transferId=$transferId');
       debugPrint('  file=$rawFileName');
       debugPrint('  expectedBytes=$expectedSize');
@@ -1937,7 +1937,7 @@ class TransferService {
     if (!prefinalizationOk) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] ANDROID RECEIVE: Pre-finalization verification failed or cancelled');
+            '[OneShare Stream Receiver] ANDROID RECEIVE: Pre-finalization verification failed or cancelled');
       }
       if (tempExists) {
         try {
@@ -1962,13 +1962,13 @@ class TransferService {
     Object? finalizationException;
 
     if (kDebugMode) {
-      debugPrint('[DropLAN Stream Receiver] ANDROID RECEIVE: finalization started');
+      debugPrint('[OneShare Stream Receiver] ANDROID RECEIVE: finalization started');
     }
 
     try {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] ANDROID RECEIVE: finalization operation=tempFile.rename');
+            '[OneShare Stream Receiver] ANDROID RECEIVE: finalization operation=tempFile.rename');
       }
       await tempFile.rename(targetFile.path);
     } catch (e) {
@@ -1976,7 +1976,7 @@ class TransferService {
       finalizationException = e;
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] ANDROID RECEIVE: finalization operation=copy_fallback (rename failed: $e)');
+            '[OneShare Stream Receiver] ANDROID RECEIVE: finalization operation=copy_fallback (rename failed: $e)');
       }
       try {
         await _copyFileChunked(tempFile, targetFile);
@@ -1987,7 +1987,7 @@ class TransferService {
         finalizationException = copyError;
         if (kDebugMode) {
           debugPrint(
-              '[DropLAN Stream Receiver] ANDROID RECEIVE: finalization exception=$copyError\n$copySt');
+              '[OneShare Stream Receiver] ANDROID RECEIVE: finalization exception=$copyError\n$copySt');
         }
       }
     }
@@ -2013,7 +2013,7 @@ class TransferService {
     final finalSize = finalExists ? await targetFile.length() : -1;
 
     if (kDebugMode) {
-      debugPrint('[DropLAN Stream Receiver] ANDROID RECEIVE:');
+      debugPrint('[OneShare Stream Receiver] ANDROID RECEIVE:');
       debugPrint('  finalization operation=$finalizationOp');
       if (finalizationException != null) {
         debugPrint('  finalization exception=$finalizationException');
@@ -2032,7 +2032,7 @@ class TransferService {
     if (!finalVerificationOk) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Stream Receiver] ANDROID RECEIVE: Final file verification failed: exists=$finalExists, expectedSize=$expectedSize, finalSize=$finalSize');
+            '[OneShare Stream Receiver] ANDROID RECEIVE: Final file verification failed: exists=$finalExists, expectedSize=$expectedSize, finalSize=$finalSize');
       }
       if (finalExists) {
         try {
@@ -2063,7 +2063,7 @@ class TransferService {
 
     if (kDebugMode) {
       debugPrint(
-          '[DropLAN Stream Receiver] Connection closed cleanly for fileId $fileId');
+          '[OneShare Stream Receiver] Connection closed cleanly for fileId $fileId');
     }
   }
 
@@ -2331,7 +2331,7 @@ class TransferService {
 
     Directory downloadsDir;
     if (Platform.isAndroid) {
-      downloadsDir = Directory('/storage/emulated/0/Download/DropLAN');
+      downloadsDir = Directory('/storage/emulated/0/Download/OneShare');
     } else {
       String baseDownloadsPath = '';
       try {
@@ -2350,7 +2350,7 @@ class TransferService {
         baseDownloadsPath = Directory.systemTemp.path;
       }
 
-      downloadsDir = Directory(p.join(baseDownloadsPath, 'DropLAN'));
+      downloadsDir = Directory(p.join(baseDownloadsPath, 'OneShare'));
     }
 
     if (!await downloadsDir.exists()) {
@@ -2440,7 +2440,7 @@ class TransferService {
     void Function(int chunkLength) onChunk,
   ) async* {
     if (path.startsWith('content://') && Platform.isAndroid) {
-      const channel = MethodChannel('com.example.droplan/uri_stream');
+      const channel = MethodChannel('com.example.oneshare/uri_stream');
       final String? streamId =
           await channel.invokeMethod<String>('openStream', {'uri': path});
 

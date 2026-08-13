@@ -7,10 +7,10 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:path/path.dart' as p;
 
-import 'package:droplan/config/droplan_config.dart';
+import 'package:oneshare/config/oneshare_config.dart';
 
-import 'package:droplan/models/transfer_models.dart';
-import 'package:droplan/services/transfer_service.dart';
+import 'package:oneshare/models/transfer_models.dart';
+import 'package:oneshare/services/transfer_service.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -21,7 +21,7 @@ void main() {
     const MethodChannel('plugins.flutter.io/path_provider'),
     (MethodCall methodCall) async {
       final nonExistentCacheDir =
-          '${Directory.systemTemp.path}/droplan_test_cache_${DateTime.now().microsecondsSinceEpoch}';
+          '${Directory.systemTemp.path}/oneshare_test_cache_${DateTime.now().microsecondsSinceEpoch}';
       return nonExistentCacheDir;
     },
   );
@@ -46,7 +46,7 @@ void main() {
       final request = PendingTransferRequest(
         transferId: 'trans-001',
         senderDeviceId: 'dev-001',
-        senderDeviceName: 'DropLAN-Sender',
+        senderDeviceName: 'OneShare-Sender',
         senderHost: '192.168.1.10',
         senderPort: 4040,
         files: const [
@@ -97,7 +97,7 @@ void main() {
       service.incomingRequestNotifier.value = null;
 
       // 1. Create a dummy file to send
-      final tempDir = await Directory.systemTemp.createTemp('droplan_test_sender');
+      final tempDir = await Directory.systemTemp.createTemp('oneshare_test_sender');
       final dummyFile1 = File('${tempDir.path}/test_image.jpg');
       final dummyData = List<int>.generate(1024 * 50, (i) => i % 256); // 50 KB
       await dummyFile1.writeAsBytes(dummyData);
@@ -107,7 +107,7 @@ void main() {
       final port = server.port;
 
       server.listen((HttpRequest req) async {
-        if (req.method == 'POST' && req.uri.path == DropLanConfig.transferRequestPath) {
+        if (req.method == 'POST' && req.uri.path == OneShareConfig.transferRequestPath) {
           final content = await utf8.decoder.bind(req).join();
           final json = jsonDecode(content) as Map<String, dynamic>;
           final res = await service.handleIncomingRequest(json, '127.0.0.1');
@@ -116,7 +116,7 @@ void main() {
             ..headers.contentType = ContentType.json
             ..write(jsonEncode(res));
           await req.response.close();
-        } else if (req.method == 'POST' && req.uri.path == DropLanConfig.transferFilePath) {
+        } else if (req.method == 'POST' && req.uri.path == OneShareConfig.transferFilePath) {
           await service.handleIncomingFileUpload(req);
         } else {
           req.response
@@ -145,7 +145,7 @@ void main() {
       // Simulate accept: call acceptIncomingRequest with a local server for sender
       final senderServer = await HttpServer.bind(InternetAddress.anyIPv4, 0);
       senderServer.listen((HttpRequest req) async {
-        if (req.uri.path == DropLanConfig.transferAcceptPath) {
+        if (req.uri.path == OneShareConfig.transferAcceptPath) {
           final content = await utf8.decoder.bind(req).join();
           service.handleAcceptResponse(jsonDecode(content) as Map<String, dynamic>);
           req.response
@@ -206,7 +206,7 @@ void main() {
       final service = TransferService.instance;
       service.incomingRequestNotifier.value = null;
 
-      final tempDir = await Directory.systemTemp.createTemp('droplan_test_batch');
+      final tempDir = await Directory.systemTemp.createTemp('oneshare_test_batch');
       final dummyFile1 = File('${tempDir.path}/batch_file1.png');
       final dummyFile2 = File('${tempDir.path}/batch_file2.pdf');
       final data1 = List<int>.generate(1024 * 20, (i) => i % 256); // 20 KB
@@ -218,7 +218,7 @@ void main() {
       final port = server.port;
 
       server.listen((HttpRequest req) async {
-        if (req.method == 'POST' && req.uri.path == DropLanConfig.transferRequestPath) {
+        if (req.method == 'POST' && req.uri.path == OneShareConfig.transferRequestPath) {
           final content = await utf8.decoder.bind(req).join();
           final json = jsonDecode(content) as Map<String, dynamic>;
           final res = await service.handleIncomingRequest(json, '127.0.0.1');
@@ -227,7 +227,7 @@ void main() {
             ..headers.contentType = ContentType.json
             ..write(jsonEncode(res));
           await req.response.close();
-        } else if (req.method == 'POST' && req.uri.path == DropLanConfig.transferFilePath) {
+        } else if (req.method == 'POST' && req.uri.path == OneShareConfig.transferFilePath) {
           await service.handleIncomingFileUpload(req);
         } else {
           req.response
@@ -254,7 +254,7 @@ void main() {
 
       final senderServer = await HttpServer.bind(InternetAddress.anyIPv4, 0);
       senderServer.listen((HttpRequest req) async {
-        if (req.uri.path == DropLanConfig.transferAcceptPath) {
+        if (req.uri.path == OneShareConfig.transferAcceptPath) {
           final content = await utf8.decoder.bind(req).join();
           service.handleAcceptResponse(jsonDecode(content) as Map<String, dynamic>);
           req.response
@@ -315,7 +315,7 @@ void main() {
       final port = server.port;
 
       server.listen((HttpRequest req) async {
-        if (req.uri.path == DropLanConfig.transferRequestPath) {
+        if (req.uri.path == OneShareConfig.transferRequestPath) {
           final content = await utf8.decoder.bind(req).join();
           final json = jsonDecode(content) as Map<String, dynamic>;
           final res = await service.handleIncomingRequest(json, '127.0.0.1');
@@ -347,7 +347,7 @@ void main() {
 
       final senderServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       senderServer.listen((HttpRequest req) async {
-        if (req.uri.path == DropLanConfig.transferRejectPath) {
+        if (req.uri.path == OneShareConfig.transferRejectPath) {
           final content = await utf8.decoder.bind(req).join();
           service.handleRejectResponse(jsonDecode(content) as Map<String, dynamic>);
           req.response
@@ -395,7 +395,7 @@ void main() {
     final port = server.port;
 
     server.listen((HttpRequest req) async {
-      if (req.method == 'POST' && req.uri.path == DropLanConfig.transferRequestPath) {
+      if (req.method == 'POST' && req.uri.path == OneShareConfig.transferRequestPath) {
         final content = await utf8.decoder.bind(req).join();
         final json = jsonDecode(content) as Map<String, dynamic>;
         final res = await service.handleIncomingRequest(json, '127.0.0.1');
@@ -404,7 +404,7 @@ void main() {
           ..headers.contentType = ContentType.json
           ..write(jsonEncode(res));
         await req.response.close();
-      } else if (req.method == 'POST' && req.uri.path == DropLanConfig.transferFilePath) {
+      } else if (req.method == 'POST' && req.uri.path == OneShareConfig.transferFilePath) {
         await service.handleIncomingFileUpload(req);
       } else {
         req.response
@@ -430,7 +430,7 @@ void main() {
 
     final senderServer = await HttpServer.bind(InternetAddress.anyIPv4, 0);
     senderServer.listen((HttpRequest req) async {
-      if (req.uri.path == DropLanConfig.transferAcceptPath) {
+      if (req.uri.path == OneShareConfig.transferAcceptPath) {
         final content = await utf8.decoder.bind(req).join();
         service.handleAcceptResponse(jsonDecode(content) as Map<String, dynamic>);
         req.response
@@ -463,7 +463,7 @@ void main() {
 
     // Stream declaredFileSize directly over HTTP request to test receiver finalization & int64
     final fileItem = outcome.fileItems!.first;
-    final uploadUri = Uri.http('127.0.0.1:$port', DropLanConfig.transferFilePath);
+    final uploadUri = Uri.http('127.0.0.1:$port', OneShareConfig.transferFilePath);
     final client = HttpClient();
     final req = await client.postUrl(uploadUri);
     req.headers.set('authorization', 'Bearer ${outcome.transferToken!}');
@@ -500,7 +500,7 @@ void main() {
     expect(destFile.lengthSync(), equals(declaredFileSize));
 
     // Verify temp file is cleaned up
-    final tempFile = File(p.join(destFile.parent.path, '.droplan_${transferId}_${fileItem.fileId}.tmp'));
+    final tempFile = File(p.join(destFile.parent.path, '.oneshare_${transferId}_${fileItem.fileId}.tmp'));
     expect(tempFile.existsSync(), isFalse);
 
     // Cleanup destination file
@@ -553,7 +553,7 @@ void main() {
       final port = server.port;
 
       server.listen((HttpRequest req) async {
-        if (req.method == 'POST' && req.uri.path == DropLanConfig.transferRequestPath) {
+        if (req.method == 'POST' && req.uri.path == OneShareConfig.transferRequestPath) {
           final content = await utf8.decoder.bind(req).join();
           final json = jsonDecode(content) as Map<String, dynamic>;
           final res = await service.handleIncomingRequest(json, '127.0.0.1');
@@ -562,9 +562,9 @@ void main() {
             ..headers.contentType = ContentType.json
             ..write(jsonEncode(res));
           await req.response.close();
-        } else if (req.method == 'POST' && req.uri.path == DropLanConfig.transferFilePath) {
+        } else if (req.method == 'POST' && req.uri.path == OneShareConfig.transferFilePath) {
           await service.handleIncomingFileUpload(req);
-        } else if (req.method == 'POST' && req.uri.path == DropLanConfig.transferCancelPath) {
+        } else if (req.method == 'POST' && req.uri.path == OneShareConfig.transferCancelPath) {
           final content = await utf8.decoder.bind(req).join();
           final json = jsonDecode(content) as Map<String, dynamic>;
           await service.handleCancelNotification(json['transferId'] as String);
@@ -592,7 +592,7 @@ void main() {
 
       final senderServer = await HttpServer.bind(InternetAddress.anyIPv4, 0);
       senderServer.listen((HttpRequest req) async {
-        if (req.uri.path == DropLanConfig.transferAcceptPath) {
+        if (req.uri.path == OneShareConfig.transferAcceptPath) {
           final content = await utf8.decoder.bind(req).join();
           service.handleAcceptResponse(jsonDecode(content) as Map<String, dynamic>);
           req.response
@@ -623,7 +623,7 @@ void main() {
       expect(outcome.status, TransferResultStatus.accepted);
 
       final fileItem = outcome.fileItems!.first;
-      final uploadUri = Uri.http('127.0.0.1:$port', DropLanConfig.transferFilePath);
+      final uploadUri = Uri.http('127.0.0.1:$port', OneShareConfig.transferFilePath);
       final client = HttpClient();
       final req = await client.postUrl(uploadUri);
       req.headers.set('authorization', 'Bearer ${outcome.transferToken!}');
@@ -659,7 +659,7 @@ void main() {
       service.incomingRequestNotifier.value = null;
       service.sendProgressNotifier.value = null; service.receiveProgressNotifier.value = null;
 
-      final tempDir = Directory.systemTemp.createTempSync('droplan_multi_test_');
+      final tempDir = Directory.systemTemp.createTempSync('oneshare_multi_test_');
       final f1 = File(p.join(tempDir.path, 'file1.txt'))..writeAsBytesSync(List.generate(1000, (i) => i % 256));
       final f2 = File(p.join(tempDir.path, 'file2.txt'))..writeAsBytesSync(List.generate(10000, (i) => i % 256));
       final f3 = File(p.join(tempDir.path, 'file3.txt'))..writeAsBytesSync(List.generate(10000, (i) => i % 256));
@@ -1055,7 +1055,7 @@ void main() {
       service.sendProgressNotifier.value = null;
       service.receiveProgressNotifier.value = null;
 
-      final tempDir = Directory.systemTemp.createTempSync('droplan_abort_test_');
+      final tempDir = Directory.systemTemp.createTempSync('oneshare_abort_test_');
       final fileData = List<int>.generate(100 * 1024, (i) => i % 256); // 100 KB
       final dummyFile = File(p.join(tempDir.path, 'large_file.bin'))..writeAsBytesSync(fileData);
 
@@ -1064,7 +1064,7 @@ void main() {
 
       int bytesReadByServer = 0;
       server.listen((HttpRequest req) async {
-        if (req.method == 'POST' && req.uri.path == DropLanConfig.transferFilePath) {
+        if (req.method == 'POST' && req.uri.path == OneShareConfig.transferFilePath) {
           try {
             await for (final chunk in req) {
               bytesReadByServer += chunk.length;
@@ -1113,7 +1113,7 @@ void main() {
       service.sendProgressNotifier.value = null;
       service.receiveProgressNotifier.value = null;
 
-      final tempDir = Directory.systemTemp.createTempSync('droplan_cancel_mid_test_');
+      final tempDir = Directory.systemTemp.createTempSync('oneshare_cancel_mid_test_');
       final fileData = List<int>.generate(200 * 1024, (i) => i % 256); // 200 KB
       final dummyFile = File(p.join(tempDir.path, 'cancel_file.bin'))..writeAsBytesSync(fileData);
 
@@ -1124,7 +1124,7 @@ void main() {
       int bytesReceived = 0;
 
       server.listen((HttpRequest req) async {
-        if (req.method == 'POST' && req.uri.path == DropLanConfig.transferFilePath) {
+        if (req.method == 'POST' && req.uri.path == OneShareConfig.transferFilePath) {
           try {
             await for (final chunk in req) {
               bytesReceived += chunk.length;
@@ -1173,7 +1173,7 @@ void main() {
       service.sendProgressNotifier.value = null;
       service.receiveProgressNotifier.value = null;
 
-      final tempDir = Directory.systemTemp.createTempSync('droplan_diag_cancel_');
+      final tempDir = Directory.systemTemp.createTempSync('oneshare_diag_cancel_');
       final dummyFile = File(p.join(tempDir.path, 'diag_file.bin'));
       final sink = dummyFile.openWrite();
       final chunkData = List<int>.generate(100 * 1024, (i) => i % 256);
@@ -1190,7 +1190,7 @@ void main() {
       int bytesReceived = 0;
 
       server.listen((HttpRequest req) async {
-        if (req.method == 'POST' && req.uri.path == DropLanConfig.transferFilePath) {
+        if (req.method == 'POST' && req.uri.path == OneShareConfig.transferFilePath) {
           try {
             await for (final chunk in req) {
               bytesReceived += chunk.length;

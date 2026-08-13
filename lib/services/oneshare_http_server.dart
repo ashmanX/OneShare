@@ -3,25 +3,25 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
-import 'package:droplan/config/droplan_config.dart';
-import 'package:droplan/services/device_identity_service.dart';
-import 'package:droplan/services/transfer_service.dart';
+import 'package:oneshare/config/oneshare_config.dart';
+import 'package:oneshare/services/device_identity_service.dart';
+import 'package:oneshare/services/transfer_service.dart';
 
-class DropLanHttpServer {
-  DropLanHttpServer({DeviceIdentity? identity})
+class OneShareHttpServer {
+  OneShareHttpServer({DeviceIdentity? identity})
       : _identity = identity ?? DeviceIdentityService.identity;
 
   final DeviceIdentity _identity;
   HttpServer? _server;
 
   bool get isRunning => _server != null;
-  int get port => _server?.port ?? DropLanConfig.port;
+  int get port => _server?.port ?? OneShareConfig.port;
 
   Future<void> start() async {
     if (_server != null) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN HttpServer] Server already running on port ${_server!.port}');
+            '[OneShare HttpServer] Server already running on port ${_server!.port}');
       }
       return;
     }
@@ -29,7 +29,7 @@ class DropLanHttpServer {
     try {
       final server = await HttpServer.bind(
         InternetAddress.anyIPv4,
-        DropLanConfig.port,
+        OneShareConfig.port,
         shared: true,
       );
       server.idleTimeout = null;
@@ -39,11 +39,11 @@ class DropLanHttpServer {
       final localAddress = await _findLocalWifiAddress();
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN HttpServer] Server started listening on 0.0.0.0:${server.port} (local Wi-Fi IP: ${localAddress?.address})');
+            '[OneShare HttpServer] Server started listening on 0.0.0.0:${server.port} (local Wi-Fi IP: ${localAddress?.address})');
       }
     } catch (e, st) {
       if (kDebugMode) {
-        debugPrint('[DropLAN HttpServer] Failed to start server: $e\n$st');
+        debugPrint('[OneShare HttpServer] Failed to start server: $e\n$st');
       }
     }
   }
@@ -53,33 +53,33 @@ class DropLanHttpServer {
     _server = null;
     await server?.close(force: true);
     if (kDebugMode) {
-      debugPrint('[DropLAN HttpServer] Server stopped');
+      debugPrint('[OneShare HttpServer] Server stopped');
     }
   }
 
   Future<void> _handleRequest(HttpRequest request) async {
     if (kDebugMode) {
       debugPrint(
-          '[DropLAN Timestamp] ANDROID REQUEST SOCKET/HTTP RECEIVED path=${request.uri.path} time=${DateTime.now().toIso8601String()}');
+          '[OneShare Timestamp] ANDROID REQUEST SOCKET/HTTP RECEIVED path=${request.uri.path} time=${DateTime.now().toIso8601String()}');
     }
 
     try {
       if (request.method == 'GET' &&
-          request.uri.path == DropLanConfig.infoPath) {
+          request.uri.path == OneShareConfig.infoPath) {
         await _handleInfo(request);
         return;
       }
 
       if (request.method == 'POST' &&
-          request.uri.path == DropLanConfig.transferRequestPath) {
+          request.uri.path == OneShareConfig.transferRequestPath) {
         if (kDebugMode) {
           debugPrint(
-              '[DropLAN Timestamp] ANDROID REQUEST BODY READ START path=${request.uri.path} time=${DateTime.now().toIso8601String()}');
+              '[OneShare Timestamp] ANDROID REQUEST BODY READ START path=${request.uri.path} time=${DateTime.now().toIso8601String()}');
         }
         final jsonBody = await _readJsonBody(request);
         if (kDebugMode) {
           debugPrint(
-              '[DropLAN Timestamp] ANDROID REQUEST PARSED transferId=${jsonBody['transferId']} time=${DateTime.now().toIso8601String()}');
+              '[OneShare Timestamp] ANDROID REQUEST PARSED transferId=${jsonBody['transferId']} time=${DateTime.now().toIso8601String()}');
         }
         final clientIp =
             request.connectionInfo?.remoteAddress.address ?? '127.0.0.1';
@@ -93,7 +93,7 @@ class DropLanHttpServer {
         final responseJson = jsonEncode(responseMap);
         if (kDebugMode) {
           debugPrint(
-              '[DropLAN HttpServer] Handshake response (status: $statusCode): $responseJson');
+              '[OneShare HttpServer] Handshake response (status: $statusCode): $responseJson');
         }
 
         request.response
@@ -105,16 +105,12 @@ class DropLanHttpServer {
       }
 
       if (request.method == 'POST' &&
-          request.uri.path == DropLanConfig.transferAcceptPath) {
+          request.uri.path == OneShareConfig.transferAcceptPath) {
         final jsonBody = await _readJsonBody(request);
         if (kDebugMode) {
           debugPrint(
-              '[DropLAN HttpServer] Parsed transfer accept JSON body: $jsonBody');
+              '[OneShare HttpServer] Parsed transfer accept JSON body: $jsonBody');
         }
-        // BUG-05/06 FIX: handleAcceptResponse returns false when the sender's
-        // transfer request has already timed out. In that case, respond with
-        // HTTP 410 Gone so the receiver knows the request is stale and can
-        // display a proper error rather than being silently stuck.
         final wasLive = TransferService.instance.handleAcceptResponse(jsonBody);
         if (wasLive) {
           request.response
@@ -124,7 +120,7 @@ class DropLanHttpServer {
         } else {
           if (kDebugMode) {
             debugPrint(
-                '[DropLAN HttpServer] Transfer accept arrived after sender timeout — responding 410 Gone');
+                '[OneShare HttpServer] Transfer accept arrived after sender timeout — responding 410 Gone');
           }
           request.response
             ..statusCode = HttpStatus.gone
@@ -140,11 +136,11 @@ class DropLanHttpServer {
       }
 
       if (request.method == 'POST' &&
-          request.uri.path == DropLanConfig.transferRejectPath) {
+          request.uri.path == OneShareConfig.transferRejectPath) {
         final jsonBody = await _readJsonBody(request);
         if (kDebugMode) {
           debugPrint(
-              '[DropLAN HttpServer] Parsed transfer reject JSON body: $jsonBody');
+              '[OneShare HttpServer] Parsed transfer reject JSON body: $jsonBody');
         }
         request.response
           ..statusCode = HttpStatus.ok
@@ -157,11 +153,11 @@ class DropLanHttpServer {
       }
 
       if (request.method == 'POST' &&
-          request.uri.path == DropLanConfig.transferCancelPath) {
+          request.uri.path == OneShareConfig.transferCancelPath) {
         final jsonBody = await _readJsonBody(request);
         if (kDebugMode) {
           debugPrint(
-              '[DropLAN HttpServer] Parsed transfer cancel JSON body: $jsonBody');
+              '[OneShare HttpServer] Parsed transfer cancel JSON body: $jsonBody');
         }
         request.response
           ..statusCode = HttpStatus.ok
@@ -177,11 +173,11 @@ class DropLanHttpServer {
       }
 
       if (request.method == 'POST' &&
-          request.uri.path == DropLanConfig.transferCancelFilePath) {
+          request.uri.path == OneShareConfig.transferCancelFilePath) {
         final jsonBody = await _readJsonBody(request);
         if (kDebugMode) {
           debugPrint(
-              '[DropLAN HttpServer] Parsed transfer file cancel JSON body: $jsonBody');
+              '[OneShare HttpServer] Parsed transfer file cancel JSON body: $jsonBody');
         }
         request.response
           ..statusCode = HttpStatus.ok
@@ -199,14 +195,14 @@ class DropLanHttpServer {
       }
 
       if (request.method == 'POST' &&
-          request.uri.path == DropLanConfig.transferFilePath) {
+          request.uri.path == OneShareConfig.transferFilePath) {
         await TransferService.instance.handleIncomingFileUpload(request);
         return;
       }
 
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN HttpServer] Unrecognized endpoint ${request.method} ${request.uri.path}');
+            '[OneShare HttpServer] Unrecognized endpoint ${request.method} ${request.uri.path}');
       }
       request.response
         ..statusCode = HttpStatus.notFound
@@ -216,7 +212,7 @@ class DropLanHttpServer {
     } catch (e, st) {
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN HttpServer] Error handling request ${request.uri.path}: $e\n$st');
+            '[OneShare HttpServer] Error handling request ${request.uri.path}: $e\n$st');
       }
       if (!request.response.headers.chunkedTransferEncoding) {
         request.response.statusCode = HttpStatus.internalServerError;
@@ -230,7 +226,7 @@ class DropLanHttpServer {
       final content = await utf8.decoder.bind(request).join();
       if (kDebugMode) {
         debugPrint(
-            '[DropLAN Timestamp] ANDROID REQUEST BODY READ COMPLETE bytes=${content.length} time=${DateTime.now().toIso8601String()}');
+            '[OneShare Timestamp] ANDROID REQUEST BODY READ COMPLETE bytes=${content.length} time=${DateTime.now().toIso8601String()}');
       }
       if (content.isEmpty) return {};
       return jsonDecode(content) as Map<String, dynamic>;
@@ -241,11 +237,11 @@ class DropLanHttpServer {
 
   Future<void> _handleInfo(HttpRequest request) async {
     final body = jsonEncode({
-      'protocolVersion': DropLanConfig.protocolVersion,
+      'protocolVersion': OneShareConfig.protocolVersion,
       'deviceId': _identity.deviceId,
       'deviceName': _identity.deviceName,
-      'appName': DropLanConfig.appName,
-      'port': DropLanConfig.port,
+      'appName': OneShareConfig.appName,
+      'port': OneShareConfig.port,
     });
 
     request.response

@@ -7,10 +7,10 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
-    private val controlChannel = "com.example.droplan/nsd_control"
-    private val eventChannel = "com.example.droplan/nsd_events"
-    private val pickerChannel = "com.example.droplan/instant_picker"
-    private val streamChannel = "com.example.droplan/uri_stream"
+    private val controlChannel = "com.example.oneshare/nsd_control"
+    private val eventChannel = "com.example.oneshare/nsd_events"
+    private val pickerChannel = "com.example.oneshare/instant_picker"
+    private val streamChannel = "com.example.oneshare/uri_stream"
 
     private lateinit var nsdHelper: NsdHelper
     private lateinit var instantPicker: InstantFilePicker
@@ -48,7 +48,7 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "startAdvertising" -> {
-                        val name = call.argument<String>("deviceName") ?: "DropLAN"
+                        val name = call.argument<String>("deviceName") ?: "OneShare"
                         val port = call.argument<Int>("port") ?: 4040
                         nsdHelper.startAdvertising(name, port)
                         result.success(null)

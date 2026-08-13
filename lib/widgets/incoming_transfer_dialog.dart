@@ -4,8 +4,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
-import 'package:droplan/models/transfer_models.dart';
-import 'package:droplan/services/transfer_service.dart';
+import 'package:oneshare/models/transfer_models.dart';
+import 'package:oneshare/services/transfer_service.dart';
 
 class IncomingTransferDialog extends StatefulWidget {
   const IncomingTransferDialog({
@@ -31,7 +31,7 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
 
     if (kDebugMode) {
       debugPrint(
-          '[DropLAN Timestamp] ANDROID IncomingTransferDialog BUILD/SHOW transferId=${widget.request.transferId} time=${DateTime.now().toIso8601String()}');
+          '[OneShare Timestamp] ANDROID IncomingTransferDialog BUILD/SHOW transferId=${widget.request.transferId} time=${DateTime.now().toIso8601String()}');
     }
 
     TransferService.instance.incomingRequestNotifier

@@ -36,11 +36,11 @@
     <string>$(PRODUCT_COPYRIGHT)</string>
 
     <key>NSLocalNetworkUsageDescription</key>
-    <string>DropLAN uses your local network to discover nearby devices and transfer files.</string>
+    <string>OneShare uses your local network to discover nearby devices and transfer files.</string>
 
     <key>NSBonjourServices</key>
     <array>
-        <string>_droplan._tcp</string>
+        <string>_oneshare._tcp</string>
     </array>
 
     <key>NSMainNibFile</key>

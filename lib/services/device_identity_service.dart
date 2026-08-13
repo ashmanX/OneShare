@@ -28,7 +28,7 @@ class DeviceIdentityService {
 
   static String _generateDeviceName() {
     final suffix = Random().nextInt(9000) + 1000;
-    return 'DropLAN-$suffix';
+    return 'OneShare-$suffix';
   }
 
   static String _generateUuidV4() {
