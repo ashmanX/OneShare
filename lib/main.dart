@@ -1081,13 +1081,17 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
   // SHARED HEADER — identical on HOME / SC2 / SC3 / SETTINGS
   // ──────────────────────────────────────────────────────────
 
-  Widget _buildSharedHeader(BuildContext context) {
+  Widget _buildSharedHeader(BuildContext context, {Widget? leading}) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
+          if (leading != null) ...[
+            leading,
+            const SizedBox(width: 8),
+          ],
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -1161,7 +1165,7 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
                     ),
                     const SizedBox(height: 2),
                     ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 115),
+                      constraints: const BoxConstraints(maxWidth: 160),
                       child: Text(
                         _deviceName,
                         style: GoogleFonts.plusJakartaSans(
@@ -1238,7 +1242,7 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
             child: _buildPrimaryFileActionButton(context),
           ),
         ),
-        const SizedBox(height: 10),
+        const SizedBox(height: 12),
       ],
     );
   }
@@ -1258,6 +1262,7 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
             padding: const EdgeInsets.symmetric(horizontal: 20),
             child: ListView(
               physics: const BouncingScrollPhysics(),
+              padding: const EdgeInsets.only(bottom: 12),
               children: [
                 Padding(
                   padding: const EdgeInsets.only(left: 4, bottom: 10),
@@ -1586,19 +1591,34 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // BUG-02 FIX: Shared header with a Back button in SC2 so the user can
-        // return to Home without deleting all selected files manually.
-        _buildSC2Header(context),
+        _buildSharedHeader(
+          context,
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 18),
+            color: const Color(0xFF94A3B8),
+            tooltip: 'Back',
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+            onPressed: _isSendingRequest
+                ? null
+                : () {
+                    setState(() {
+                      _selectedFiles.clear();
+                      _currentScreen = AppScreen.home;
+                    });
+                  },
+          ),
+        ),
         const SizedBox(height: 14),
         Expanded(
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 18),
+            padding: const EdgeInsets.symmetric(horizontal: 20),
             child: _buildSC2SelectedFilesPanel(context, totalSelectedSize),
           ),
         ),
         const SizedBox(height: 12),
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 18),
+          padding: const EdgeInsets.symmetric(horizontal: 20),
           child: _isSendingRequest
               ? _buildSC2WaitingPanel(context)
               : ValueListenableBuilder<List<DiscoveredDevice>>(
@@ -1617,35 +1637,8 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
                   },
                 ),
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 12),
       ],
-    );
-  }
-
-  // BUG-02 FIX: Custom header for SC2 that includes a visible Back button so
-  // users can return to Home without relying on the system Back gesture.
-  Widget _buildSC2Header(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(8, 16, 20, 0),
-      child: Row(
-        children: [
-          // Back button
-          IconButton(
-            icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 18),
-            color: const Color(0xFF94A3B8),
-            tooltip: 'Back',
-            onPressed: _isSendingRequest
-                ? null // disabled while waiting — use Cancel Request instead
-                : () {
-                    setState(() {
-                      _selectedFiles.clear();
-                      _currentScreen = AppScreen.home;
-                    });
-                  },
-          ),
-          Expanded(child: _buildSharedHeader(context)),
-        ],
-      ),
     );
   }
 
@@ -1812,23 +1805,26 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
   Widget _buildSC2WaitingPanel(BuildContext context) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
       children: [
         Padding(
           padding: const EdgeInsets.only(left: 4, bottom: 8),
           child: Text(
             'Select device',
             style: GoogleFonts.plusJakartaSans(
-              fontSize: 16,
+              fontSize: 15,
               fontWeight: FontWeight.w700,
               color: Colors.white,
             ),
           ),
         ),
-        Expanded(
+        SizedBox(
+          height: 178,
           child: Container(
+            width: double.infinity,
             decoration: BoxDecoration(
               color: const Color(0xFF12141D),
-              borderRadius: BorderRadius.circular(20),
+              borderRadius: BorderRadius.circular(18),
               border: Border.all(color: const Color(0xFF1F2232), width: 1),
             ),
             child: Center(
@@ -1844,7 +1840,7 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
                           AlwaysStoppedAnimation<Color>(Color(0xFF38BDF8)),
                     ),
                   ),
-                  const SizedBox(height: 14),
+                  const SizedBox(height: 12),
                   Text(
                     'Sending request to ${_waitingForDeviceName ?? 'device'}…',
                     style: GoogleFonts.plusJakartaSans(
@@ -1863,16 +1859,14 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
                     ),
                     textAlign: TextAlign.center,
                   ),
-                  // BUG-01 FIX: Cancel Request button so the user is not stuck
-                  // waiting up to 35 seconds for the receiver to respond.
-                  const SizedBox(height: 20),
+                  const SizedBox(height: 12),
                   OutlinedButton.icon(
                     onPressed: _cancelOutgoingRequest,
-                    icon: const Icon(Icons.cancel_outlined, size: 16),
+                    icon: const Icon(Icons.cancel_outlined, size: 15),
                     label: Text(
                       'Cancel Request',
                       style: GoogleFonts.plusJakartaSans(
-                        fontSize: 13,
+                        fontSize: 12,
                         fontWeight: FontWeight.w600,
                       ),
                     ),
@@ -1881,9 +1875,9 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
                       side: const BorderSide(
                           color: Color(0xFFEF4444), width: 1),
                       padding: const EdgeInsets.symmetric(
-                          horizontal: 20, vertical: 10),
+                          horizontal: 16, vertical: 8),
                       shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12)),
+                          borderRadius: BorderRadius.circular(10)),
                     ),
                   ),
                 ],
@@ -1920,7 +1914,7 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
         const SizedBox(height: 14),
         Expanded(
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 18),
+            padding: const EdgeInsets.symmetric(horizontal: 20),
             child: _buildSC3TransferContent(context, progressState, direction),
           ),
         ),
@@ -1928,13 +1922,13 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
         SizedBox(
           height: 54,
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 18),
+            padding: const EdgeInsets.symmetric(horizontal: 20),
             child: isTransferring
                 ? _buildCancelTransferButton(context)
                 : _buildDoneButton(context, progressState),
           ),
         ),
-        const SizedBox(height: 14),
+        const SizedBox(height: 12),
       ],
     );
   }

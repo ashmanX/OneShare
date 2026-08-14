@@ -11,6 +11,10 @@ class MainFlutterWindow: NSWindow {
         self.maxSize = NSSize(width: 800, height: 900)
         self.setFrame(NSRect(x: windowFrame.origin.x, y: windowFrame.origin.y, width: 560, height: 720), display: true)
 
+        // Disable full-screen mode on macOS
+        self.collectionBehavior.remove(.fullScreenPrimary)
+        self.collectionBehavior.insert(.fullScreenNone)
+
         RegisterGeneratedPlugins(registry: flutterViewController)
 
         if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
