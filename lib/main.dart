@@ -12,6 +12,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:oneshare/config/oneshare_config.dart';
 import 'package:oneshare/models/transfer_models.dart';
 import 'package:oneshare/services/device_identity_service.dart';
+import 'package:oneshare/services/network_monitor_service.dart';
 import 'package:oneshare/services/oneshare_discovery_service.dart';
 import 'package:oneshare/services/oneshare_http_server.dart';
 import 'package:oneshare/services/transfer_service.dart';
@@ -159,10 +160,6 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
   AppScreen _currentScreen = AppScreen.home;
   NavTab _currentTab = NavTab.home;
 
-  // ── Network / WiFi status state ─────────────────────────
-  bool _isWifiOn = true;
-  Timer? _wifiCheckTimer;
-
   // ── Transfer request state ────────────────────────────────
   bool _isSendingRequest = false;
   String? _waitingForDeviceName;
@@ -212,17 +209,18 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     TransferService.instance.receiveProgressNotifier
         .addListener(_onReceiveProgressChanged);
 
-    _checkWifiStatus();
-    _wifiCheckTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-      _checkWifiStatus();
-    });
+    NetworkMonitorService.instance.startMonitoring();
+    NetworkMonitorService.instance.isWifiOnNotifier
+        .addListener(_onWifiStatusChanged);
 
     _startServicesIfForeground();
   }
 
   @override
   void dispose() {
-    _wifiCheckTimer?.cancel();
+    NetworkMonitorService.instance.isWifiOnNotifier
+        .removeListener(_onWifiStatusChanged);
+    NetworkMonitorService.instance.stopMonitoring();
     _radarAnimationController.dispose();
     TransferService.instance.incomingRequestNotifier
         .removeListener(_onIncomingTransferRequest);
@@ -236,46 +234,20 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     super.dispose();
   }
 
-  Future<void> _checkWifiStatus() async {
-    try {
-      final interfaces = await NetworkInterface.list(
-        type: InternetAddressType.IPv4,
-        includeLinkLocal: false,
-      );
-      bool activeNetworkFound = false;
-      for (final interface in interfaces) {
-        for (final address in interface.addresses) {
-          if (!address.isLoopback) {
-            activeNetworkFound = true;
-            break;
-          }
-        }
-        if (activeNetworkFound) break;
+  void _onWifiStatusChanged() {
+    if (!mounted) return;
+    final isWifiOn = NetworkMonitorService.instance.isWifiOn;
+    if (isWifiOn) {
+      if (!_radarAnimationController.isAnimating) {
+        _radarAnimationController.repeat();
       }
-
-      if (!mounted) return;
-
-      if (activeNetworkFound != _isWifiOn) {
-        setState(() {
-          _isWifiOn = activeNetworkFound;
-          if (_isWifiOn) {
-            if (!_radarAnimationController.isAnimating) {
-              _radarAnimationController.repeat();
-            }
-          } else {
-            if (_radarAnimationController.isAnimating) {
-              _radarAnimationController.stop();
-            }
-          }
-        });
-        // BUG-17 FIX: When Wi-Fi reconnects (transition false→true), restart
-        // NSD advertising and discovery so nearby devices become visible
-        // again without requiring an app restart.
-        if (activeNetworkFound) {
-          _startServicesIfForeground(isResume: true);
-        }
+      _startServicesIfForeground(isResume: true);
+    } else {
+      if (_radarAnimationController.isAnimating) {
+        _radarAnimationController.stop();
       }
-    } catch (_) {}
+      _stopServices();
+    }
   }
 
   // ──────────────────────────────────────────────────────────
@@ -395,6 +367,9 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     if (lifecycleState != null &&
         lifecycleState != AppLifecycleState.resumed &&
         lifecycleState != AppLifecycleState.inactive) {
+      return;
+    }
+    if (!NetworkMonitorService.instance.isWifiOn) {
       return;
     }
     await _httpServer.start();
@@ -1142,61 +1117,67 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
             ),
           ),
           const SizedBox(width: 10),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-            decoration: BoxDecoration(
-              color: const Color(0xFF131722),
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: const Color(0xFF1E2333), width: 1),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Row(
+          ValueListenableBuilder<bool>(
+            valueListenable: NetworkMonitorService.instance.isWifiOnNotifier,
+            builder: (context, isWifiOn, _) {
+              return Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF131722),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: const Color(0xFF1E2333), width: 1),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Container(
-                      width: 7,
-                      height: 7,
-                      decoration: BoxDecoration(
-                        color: _isWifiOn
-                            ? const Color(0xFF10B981)
-                            : const Color(0xFF94A3B8),
-                        shape: BoxShape.circle,
-                      ),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: 7,
+                          height: 7,
+                          decoration: BoxDecoration(
+                            color: isWifiOn
+                                ? const Color(0xFF10B981)
+                                : const Color(0xFF94A3B8),
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        const SizedBox(width: 5),
+                        Text(
+                          isWifiOn ? 'Online' : 'Offline',
+                          style: GoogleFonts.plusJakartaSans(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            color: isWifiOn
+                                ? const Color(0xFF10B981)
+                                : const Color(0xFF94A3B8),
+                          ),
+                          textAlign: TextAlign.right,
+                        ),
+                      ],
                     ),
-                    const SizedBox(width: 5),
-                    Text(
-                      _isWifiOn ? 'Online' : 'Offline',
-                      style: GoogleFonts.plusJakartaSans(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
-                        color: _isWifiOn
-                            ? const Color(0xFF10B981)
-                            : const Color(0xFF94A3B8),
+                    const SizedBox(height: 2),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 115),
+                      child: Text(
+                        _deviceName,
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                        textAlign: TextAlign.right,
                       ),
-                      textAlign: TextAlign.right,
                     ),
                   ],
                 ),
-                const SizedBox(height: 2),
-                ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 115),
-                  child: Text(
-                    _deviceName,
-                    style: GoogleFonts.plusJakartaSans(
-                      fontSize: 11,
-                      fontWeight: FontWeight.w600,
-                      color: Colors.white,
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                    maxLines: 1,
-                    textAlign: TextAlign.right,
-                  ),
-                ),
-              ],
-            ),
+              );
+            },
           ),
         ],
       ),
@@ -1218,39 +1199,35 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
         _buildSharedHeader(context),
         const SizedBox(height: 14),
         Expanded(
-          flex: 5,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 20),
             child: _buildRadarCard(context),
           ),
         ),
         const SizedBox(height: 12),
-        Expanded(
-          flex: 4,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 20),
-            child: ValueListenableBuilder<List<DiscoveredDevice>>(
-              valueListenable: _discoveryService.discoveredDevicesNotifier,
-              builder: (context, devices, _) {
-                final sorted = List<DiscoveredDevice>.from(devices)
-                  ..sort((a, b) => a.deviceId.compareTo(b.deviceId));
-                return _buildDiscoveredDevicesList(
-                  context: context,
-                  devices: sorted,
-                  heading: 'Nearby Devices',
-                  showArrow: false,
-                  onDeviceTap: (_) {
-                    _showModernToast(
-                      title: 'Select Files First',
-                      message:
-                          'Tap "Select Files to Send" to choose what to share.',
-                      icon: Icons.upload_file_rounded,
-                      accentColor: const Color(0xFF6366F1),
-                    );
-                  },
-                );
-              },
-            ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: ValueListenableBuilder<List<DiscoveredDevice>>(
+            valueListenable: _discoveryService.discoveredDevicesNotifier,
+            builder: (context, devices, _) {
+              final sorted = List<DiscoveredDevice>.from(devices)
+                ..sort((a, b) => a.deviceId.compareTo(b.deviceId));
+              return _buildDiscoveredDevicesList(
+                context: context,
+                devices: sorted,
+                heading: 'Nearby Devices',
+                showArrow: false,
+                onDeviceTap: (_) {
+                  _showModernToast(
+                    title: 'Select Files First',
+                    message:
+                        'Tap "Select Files to Send" to choose what to share.',
+                    icon: Icons.upload_file_rounded,
+                    accentColor: const Color(0xFF6366F1),
+                  );
+                },
+              );
+            },
           ),
         ),
         const SizedBox(height: 12),
@@ -1310,15 +1287,29 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
                       icon: Icons.fingerprint_rounded,
                     ),
                     const Divider(height: 1, color: Color(0xFF1F2232)),
-                    _buildSettingsRow(
-                      label: 'Status',
-                      value: _isWifiOn
-                          ? 'Online & Discoverable'
-                          : 'Offline (WiFi Off)',
-                      icon: Icons.wifi_tethering_rounded,
-                      valueColor: _isWifiOn
-                          ? const Color(0xFF10B981)
-                          : const Color(0xFF94A3B8),
+                    ValueListenableBuilder<bool>(
+                      valueListenable:
+                          NetworkMonitorService.instance.isWifiOnNotifier,
+                      builder: (context, isWifiOn, _) {
+                        return InkWell(
+                          onTap: () {
+                            NetworkMonitorService.instance.toggleWifiState();
+                          },
+                          borderRadius: BorderRadius.circular(12),
+                          child: _buildSettingsRow(
+                            label: 'Status',
+                            value: isWifiOn
+                                ? 'Online & Discoverable'
+                                : 'Offline (WiFi Off)',
+                            icon: isWifiOn
+                                ? Icons.wifi_tethering_rounded
+                                : Icons.wifi_off_rounded,
+                            valueColor: isWifiOn
+                                ? const Color(0xFF10B981)
+                                : const Color(0xFF94A3B8),
+                          ),
+                        );
+                      },
                     ),
                   ],
                 ),
@@ -1599,38 +1590,32 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
         // return to Home without deleting all selected files manually.
         _buildSC2Header(context),
         const SizedBox(height: 14),
-        // S2 — selected files (flex 5)
         Expanded(
-          flex: 5,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 18),
             child: _buildSC2SelectedFilesPanel(context, totalSelectedSize),
           ),
         ),
         const SizedBox(height: 12),
-        // S3 — select device (flex 4)
-        Expanded(
-          flex: 4,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 18),
-            child: _isSendingRequest
-                ? _buildSC2WaitingPanel(context)
-                : ValueListenableBuilder<List<DiscoveredDevice>>(
-                    valueListenable:
-                        _discoveryService.discoveredDevicesNotifier,
-                    builder: (context, devices, _) {
-                      final sorted = List<DiscoveredDevice>.from(devices)
-                        ..sort((a, b) => a.deviceId.compareTo(b.deviceId));
-                      return _buildDiscoveredDevicesList(
-                        context: context,
-                        devices: sorted,
-                        heading: 'Select device',
-                        showArrow: true,
-                        onDeviceTap: _sendTransferToDevice,
-                      );
-                    },
-                  ),
-          ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 18),
+          child: _isSendingRequest
+              ? _buildSC2WaitingPanel(context)
+              : ValueListenableBuilder<List<DiscoveredDevice>>(
+                  valueListenable:
+                      _discoveryService.discoveredDevicesNotifier,
+                  builder: (context, devices, _) {
+                    final sorted = List<DiscoveredDevice>.from(devices)
+                      ..sort((a, b) => a.deviceId.compareTo(b.deviceId));
+                    return _buildDiscoveredDevicesList(
+                      context: context,
+                      devices: sorted,
+                      heading: 'Select device',
+                      showArrow: true,
+                      onDeviceTap: _sendTransferToDevice,
+                    );
+                  },
+                ),
         ),
         const SizedBox(height: 16),
       ],
@@ -2608,19 +2593,24 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
           alignment: Alignment.center,
           fit: StackFit.expand,
           children: [
-            ValueListenableBuilder<List<DiscoveredDevice>>(
-              valueListenable: _discoveryService.discoveredDevicesNotifier,
-              builder: (context, devices, _) {
-                return AnimatedBuilder(
-                  animation: _radarAnimationController,
-                  builder: (context, _) {
-                    return CustomPaint(
-                      painter: RadarBackgroundPainter(
-                        animationValue: _radarAnimationController.value,
-                        accentColor: accentColor,
-                        devices: devices,
-                        isWifiOn: _isWifiOn,
-                      ),
+            ValueListenableBuilder<bool>(
+              valueListenable: NetworkMonitorService.instance.isWifiOnNotifier,
+              builder: (context, isWifiOn, _) {
+                return ValueListenableBuilder<List<DiscoveredDevice>>(
+                  valueListenable: _discoveryService.discoveredDevicesNotifier,
+                  builder: (context, devices, _) {
+                    return AnimatedBuilder(
+                      animation: _radarAnimationController,
+                      builder: (context, _) {
+                        return CustomPaint(
+                          painter: RadarBackgroundPainter(
+                            animationValue: _radarAnimationController.value,
+                            accentColor: accentColor,
+                            devices: devices,
+                            isWifiOn: isWifiOn,
+                          ),
+                        );
+                      },
                     );
                   },
                 );
@@ -2655,31 +2645,39 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
               left: 20,
               right: 20,
               bottom: 20,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    _isWifiOn
-                        ? 'Scanning for devices...'
-                        : 'Turn on WiFi to start scanning.',
-                    style: GoogleFonts.plusJakartaSans(
-                      fontSize: 16,
-                      fontWeight: FontWeight.w700,
-                      color: Colors.white,
-                    ),
-                    textAlign: TextAlign.center,
-                  ),
-                  const SizedBox(height: 3),
-                  Text(
-                    'Make sure OneShare is open on nearby devices.',
-                    style: GoogleFonts.plusJakartaSans(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w400,
-                      color: const Color(0xFF8E95A5),
-                    ),
-                    textAlign: TextAlign.center,
-                  ),
-                ],
+              child: ValueListenableBuilder<bool>(
+                valueListenable:
+                    NetworkMonitorService.instance.isWifiOnNotifier,
+                builder: (context, isWifiOn, _) {
+                  return Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        isWifiOn
+                            ? 'Scanning for nearby devices'
+                            : 'Turn on Wi-Fi to start scanning',
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        isWifiOn
+                            ? 'Make sure OneShare is open on nearby devices.'
+                            : 'Wi-Fi is currently turned off or disconnected.',
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w400,
+                          color: const Color(0xFF8E95A5),
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
+                  );
+                },
               ),
             ),
           ],
@@ -2705,17 +2703,29 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     final totalSlots = realCount + skeletonCount;
     final scrollable = realCount > maxVisible;
 
+    // Viewport height calculation for exactly 3 device cards:
+    // Single device card height = 38.0px (icon/box) + 20.0px (10px top/bottom padding) = 58.0px.
+    // 3 cards = 174.0px. 2 dividers (1.0px each) + 2.0px border = 178.0px.
+    // Container height = 178.0px, giving full unclipped room for exactly 3 cards.
+    const double itemHeight = 58.0;
+    const double separatorHeight = 1.0;
+    const double borderWidth = 2.0;
+    const double target3ItemHeight = (maxVisible * itemHeight) +
+        ((maxVisible - 1) * separatorHeight) +
+        borderWidth;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
       children: [
         Padding(
-          padding: const EdgeInsets.only(left: 4, right: 4, bottom: 10),
+          padding: const EdgeInsets.only(left: 4, right: 4, bottom: 8),
           child: Row(
             children: [
               Text(
                 heading,
                 style: GoogleFonts.plusJakartaSans(
-                  fontSize: 16,
+                  fontSize: 15,
                   fontWeight: FontWeight.w700,
                   color: Colors.white,
                 ),
@@ -2731,54 +2741,116 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
                 child: Text(
                   '$realCount',
                   style: GoogleFonts.plusJakartaSans(
-                    fontSize: 12,
+                    fontSize: 11,
                     fontWeight: FontWeight.bold,
                     color: const Color(0xFF38BDF8),
                   ),
                 ),
               ),
-              if (_isWifiOn) ...[
-                const SizedBox(width: 8),
-                const CupertinoActivityIndicator(
-                  radius: 10,
-                  color: Color(0xFF38BDF8),
-                ),
-              ],
+              ValueListenableBuilder<bool>(
+                valueListenable:
+                    NetworkMonitorService.instance.isWifiOnNotifier,
+                builder: (context, isWifiOn, _) {
+                  if (!isWifiOn) return const SizedBox.shrink();
+                  return const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      SizedBox(width: 8),
+                      CupertinoActivityIndicator(
+                        radius: 9,
+                        color: Color(0xFF38BDF8),
+                      ),
+                    ],
+                  );
+                },
+              ),
             ],
           ),
         ),
-        Expanded(
-          child: Container(
-            decoration: BoxDecoration(
-              color: const Color(0xFF12141D),
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: const Color(0xFF1F2232), width: 1),
-            ),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(20),
-              child: ListView.separated(
-                physics: scrollable
-                    ? const AlwaysScrollableScrollPhysics()
-                    : const NeverScrollableScrollPhysics(),
-                itemCount: totalSlots,
-                separatorBuilder: (_, _) =>
-                    const Divider(height: 1, color: Color(0xFF1F2232)),
-                itemBuilder: (context, index) {
-                  if (index < realCount) {
-                    return _buildDeviceItem(
-                      context,
-                      devices[index],
-                      index,
-                      totalSlots,
-                      onDeviceTap,
-                      showArrow: showArrow,
-                    );
-                  }
-                  return const ShimmerDeviceTile();
-                },
+        ValueListenableBuilder<bool>(
+          valueListenable: NetworkMonitorService.instance.isWifiOnNotifier,
+          builder: (context, isWifiOn, _) {
+            return SizedBox(
+              height: target3ItemHeight,
+              child: Container(
+                decoration: BoxDecoration(
+                  color: const Color(0xFF12141D),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: const Color(0xFF1F2232), width: 1),
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(18),
+                  child: !isWifiOn && realCount == 0
+                      ? Center(
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 20, vertical: 16),
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Container(
+                                  width: 44,
+                                  height: 44,
+                                  decoration: const BoxDecoration(
+                                    color: Color(0xFF1C2030),
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: const Icon(
+                                    Icons.wifi_off_rounded,
+                                    size: 22,
+                                    color: Color(0xFF64748B),
+                                  ),
+                                ),
+                                const SizedBox(height: 10),
+                                Text(
+                                  'Turn on Wi-Fi to start scanning',
+                                  style: GoogleFonts.plusJakartaSans(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w700,
+                                    color: const Color(0xFF94A3B8),
+                                  ),
+                                  textAlign: TextAlign.center,
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  'No nearby devices can be found while offline.',
+                                  style: GoogleFonts.plusJakartaSans(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w400,
+                                    color: const Color(0xFF64748B),
+                                  ),
+                                  textAlign: TextAlign.center,
+                                ),
+                              ],
+                            ),
+                          ),
+                        )
+                      : ListView.separated(
+                          padding: EdgeInsets.zero,
+                          physics: scrollable
+                              ? const AlwaysScrollableScrollPhysics()
+                              : const NeverScrollableScrollPhysics(),
+                          itemCount: totalSlots,
+                          separatorBuilder: (_, _) => const Divider(
+                              height: 1, thickness: 1, color: Color(0xFF1F2232)),
+                          itemBuilder: (context, index) {
+                            if (index < realCount) {
+                              return _buildDeviceItem(
+                                context,
+                                devices[index],
+                                index,
+                                totalSlots,
+                                onDeviceTap,
+                                showArrow: showArrow,
+                              );
+                            }
+                            return const ShimmerDeviceTile();
+                          },
+                        ),
+                ),
               ),
-            ),
-          ),
+            );
+          },
         ),
       ],
     );
@@ -2799,58 +2871,59 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
       child: InkWell(
         onTap: _isSendingRequest ? null : () => onTap(device),
         borderRadius: index == 0 && totalItems == 1
-            ? BorderRadius.circular(20)
+            ? BorderRadius.circular(18)
             : index == 0
-                ? const BorderRadius.vertical(top: Radius.circular(20))
+                ? const BorderRadius.vertical(top: Radius.circular(18))
                 : index == totalItems - 1
-                    ? const BorderRadius.vertical(bottom: Radius.circular(20))
+                    ? const BorderRadius.vertical(bottom: Radius.circular(18))
                     : BorderRadius.zero,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           child: Row(
             children: [
               Container(
-                width: 44,
-                height: 44,
+                width: 38,
+                height: 38,
                 alignment: Alignment.center,
                 decoration: BoxDecoration(
                   color: const Color(0xFF1A233D),
-                  borderRadius: BorderRadius.circular(12),
+                  borderRadius: BorderRadius.circular(10),
                 ),
                 child:
-                    Icon(iconData, size: 20, color: const Color(0xFF38BDF8)),
+                    Icon(iconData, size: 18, color: const Color(0xFF38BDF8)),
               ),
-              const SizedBox(width: 14),
+              const SizedBox(width: 12),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
                   children: [
                     Text(
                       device.deviceName,
                       style: GoogleFonts.plusJakartaSans(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w700,
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w600,
                         color: Colors.white,
                       ),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
-                    const SizedBox(height: 3),
+                    const SizedBox(height: 2),
                     Row(
                       children: [
                         Container(
-                          width: 6,
-                          height: 6,
+                          width: 5.5,
+                          height: 5.5,
                           decoration: const BoxDecoration(
                             color: Color(0xFF10B981),
                             shape: BoxShape.circle,
                           ),
                         ),
-                        const SizedBox(width: 6),
+                        const SizedBox(width: 5),
                         Text(
                           'Nearby · Ready to receive',
                           style: GoogleFonts.plusJakartaSans(
-                            fontSize: 12,
+                            fontSize: 11,
                             fontWeight: FontWeight.w500,
                             color: const Color(0xFF8E95A5),
                           ),
@@ -2862,15 +2935,15 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
               ),
               if (showArrow)
                 Container(
-                  width: 32,
-                  height: 32,
+                  width: 28,
+                  height: 28,
                   decoration: const BoxDecoration(
                     color: Color(0xFF1C2030),
                     shape: BoxShape.circle,
                   ),
                   child: const Icon(
                     Icons.chevron_right_rounded,
-                    size: 18,
+                    size: 16,
                     color: Color(0xFF8E95A5),
                   ),
                 ),
@@ -2886,98 +2959,107 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
   // ──────────────────────────────────────────────────────────
 
   Widget _buildPrimaryFileActionButton(BuildContext context) {
-    return ValueListenableBuilder<List<DiscoveredDevice>>(
-      valueListenable: _discoveryService.discoveredDevicesNotifier,
-      builder: (context, devices, _) {
-        final hasDevices = devices.isNotEmpty;
+    return ValueListenableBuilder<bool>(
+      valueListenable: NetworkMonitorService.instance.isWifiOnNotifier,
+      builder: (context, isWifiOn, _) {
+        return ValueListenableBuilder<List<DiscoveredDevice>>(
+          valueListenable: _discoveryService.discoveredDevicesNotifier,
+          builder: (context, devices, _) {
+            final hasDevices = devices.isNotEmpty && isWifiOn;
 
-        return SizedBox(
-          width: double.infinity,
-          height: double.infinity,
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 250),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(20),
-              gradient: hasDevices
-                  ? const LinearGradient(
-                      colors: [Color(0xFF2563EB), Color(0xFF3B82F6)],
-                      begin: Alignment.centerLeft,
-                      end: Alignment.centerRight,
-                    )
-                  : const LinearGradient(
-                      colors: [Color(0xFF161B29), Color(0xFF1A2133)],
-                      begin: Alignment.centerLeft,
-                      end: Alignment.centerRight,
-                    ),
-              border: hasDevices
-                  ? null
-                  : Border.all(color: const Color(0xFF222B3F), width: 1),
-              boxShadow: hasDevices
-                  ? [
-                      BoxShadow(
-                        color: const Color(0xFF2563EB).withValues(alpha: 0.35),
-                        blurRadius: 16,
-                        offset: const Offset(0, 4),
-                      ),
-                    ]
-                  : [],
-            ),
-            child: ElevatedButton(
-              onPressed: hasDevices ? _pickFiles : null,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.transparent,
-                shadowColor: Colors.transparent,
-                disabledBackgroundColor: Colors.transparent,
-                disabledForegroundColor: const Color(0xFF64748B),
-                foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(
+            return SizedBox(
+              width: double.infinity,
+              height: double.infinity,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 250),
+                decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(20),
+                  gradient: hasDevices
+                      ? const LinearGradient(
+                          colors: [Color(0xFF2563EB), Color(0xFF3B82F6)],
+                          begin: Alignment.centerLeft,
+                          end: Alignment.centerRight,
+                        )
+                      : const LinearGradient(
+                          colors: [Color(0xFF161B29), Color(0xFF1A2133)],
+                          begin: Alignment.centerLeft,
+                          end: Alignment.centerRight,
+                        ),
+                  border: hasDevices
+                      ? null
+                      : Border.all(color: const Color(0xFF222B3F), width: 1),
+                  boxShadow: hasDevices
+                      ? [
+                          BoxShadow(
+                            color:
+                                const Color(0xFF2563EB).withValues(alpha: 0.35),
+                            blurRadius: 16,
+                            offset: const Offset(0, 4),
+                          ),
+                        ]
+                      : [],
                 ),
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-              ),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(
-                    Icons.upload_rounded,
-                    size: 24,
-                    color: hasDevices ? Colors.white : const Color(0xFF64748B),
+                child: ElevatedButton(
+                  onPressed: hasDevices ? _pickFiles : null,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.transparent,
+                    shadowColor: Colors.transparent,
+                    disabledBackgroundColor: Colors.transparent,
+                    disabledForegroundColor: const Color(0xFF64748B),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 20),
                   ),
-                  const SizedBox(width: 12),
-                  Column(
+                  child: Row(
                     mainAxisAlignment: MainAxisAlignment.center,
-                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        'Select Files to Send',
-                        style: GoogleFonts.plusJakartaSans(
-                          fontSize: 15,
-                          fontWeight: FontWeight.w700,
-                          color: hasDevices
-                              ? Colors.white
-                              : const Color(0xFF64748B),
-                          letterSpacing: -0.2,
-                        ),
+                      Icon(
+                        Icons.upload_rounded,
+                        size: 24,
+                        color:
+                            hasDevices ? Colors.white : const Color(0xFF64748B),
                       ),
-                      const SizedBox(height: 1),
-                      Text(
-                        hasDevices
-                            ? 'or drop files here'
-                            : 'waiting for nearby devices…',
-                        style: GoogleFonts.plusJakartaSans(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w400,
-                          color: hasDevices
-                              ? const Color(0xFFDBEAFE)
-                              : const Color(0xFF475569),
-                        ),
+                      const SizedBox(width: 12),
+                      Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Select Files to Send',
+                            style: GoogleFonts.plusJakartaSans(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w700,
+                              color: hasDevices
+                                  ? Colors.white
+                                  : const Color(0xFF64748B),
+                              letterSpacing: -0.2,
+                            ),
+                          ),
+                          const SizedBox(height: 1),
+                          Text(
+                            hasDevices
+                                ? 'or drop files here'
+                                : isWifiOn
+                                    ? 'waiting for nearby devices…'
+                                    : 'Turn on Wi-Fi to start',
+                            style: GoogleFonts.plusJakartaSans(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w400,
+                              color: hasDevices
+                                  ? const Color(0xFFDBEAFE)
+                                  : const Color(0xFF475569),
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
-                ],
+                ),
               ),
-            ),
-          ),
+            );
+          },
         );
       },
     );
@@ -3150,24 +3232,24 @@ class _ShimmerDeviceTileState extends State<ShimmerDeviceTile>
       animation: _controller,
       builder: (context, _) {
         return Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           child: Row(
             children: [
-              _buildShimmerBox(width: 44, height: 44, borderRadius: 12),
-              const SizedBox(width: 14),
+              _buildShimmerBox(width: 38, height: 38, borderRadius: 10),
+              const SizedBox(width: 12),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    _buildShimmerBox(width: 130, height: 14, borderRadius: 4),
-                    const SizedBox(height: 6),
-                    _buildShimmerBox(width: 90, height: 11, borderRadius: 4),
+                    _buildShimmerBox(width: 120, height: 13, borderRadius: 4),
+                    const SizedBox(height: 5),
+                    _buildShimmerBox(width: 80, height: 10, borderRadius: 4),
                   ],
                 ),
               ),
-              const SizedBox(width: 12),
-              _buildShimmerBox(width: 32, height: 32, borderRadius: 16),
+              const SizedBox(width: 10),
+              _buildShimmerBox(width: 28, height: 28, borderRadius: 14),
             ],
           ),
         );

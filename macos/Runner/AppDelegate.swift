@@ -1,13 +1,19 @@
 import Cocoa
 import FlutterMacOS
+import CoreWLAN
 
 @main
-class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDelegate {
+class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDelegate, CWEventDelegate {
 
     private let serviceType = "_oneshare._tcp."
 
     private var controlChannel: FlutterMethodChannel?
     private var eventSink: FlutterEventSink?
+
+    private var wifiControlChannel: FlutterMethodChannel?
+    private var wifiEventChannel: FlutterEventChannel?
+    private var wifiEventSink: FlutterEventSink?
+    private var currentWifiStatus: Bool = true
 
     private var publishedService: NetService?
     private var serviceBrowser: NetServiceBrowser?
@@ -28,8 +34,39 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         )
 
         controlChannel = control
-
         events.setStreamHandler(self)
+
+        // Native Wi-Fi status channels
+        let wifiControl = FlutterMethodChannel(
+            name: "com.example.oneshare/wifi_control",
+            binaryMessenger: messenger
+        )
+        let wifiEvents = FlutterEventChannel(
+            name: "com.example.oneshare/wifi_events",
+            binaryMessenger: messenger
+        )
+
+        wifiControlChannel = wifiControl
+        wifiEventChannel = wifiEvents
+
+        wifiControl.setMethodCallHandler { [weak self] call, result in
+            guard let self = self else {
+                result(FlutterError(code: "UNAVAILABLE", message: "AppDelegate unavailable", details: nil))
+                return
+            }
+            if call.method == "getWifiStatus" {
+                let status = self.queryCoreWLANPowerState()
+                self.currentWifiStatus = status
+                print("OneShare-WiFi macOS: getWifiStatus called -> \(status)")
+                result(status)
+            } else {
+                result(FlutterMethodNotImplemented)
+            }
+        }
+
+        wifiEvents.setStreamHandler(WifiStreamHandler(appDelegate: self))
+
+        setupCoreWLANMonitoring()
 
         print("OneShare-NSD macOS: Flutter channels registered")
 
@@ -95,6 +132,47 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         }
     }
 
+    private func queryCoreWLANPowerState() -> Bool {
+        if let iface = CWWiFiClient.shared().interface() {
+            return iface.powerOn()
+        }
+        return true
+    }
+
+    private func setupCoreWLANMonitoring() {
+        currentWifiStatus = queryCoreWLANPowerState()
+        CWWiFiClient.shared().delegate = self
+        do {
+            try CWWiFiClient.shared().startMonitoringEvent(with: .powerDidChange)
+            print("OneShare-WiFi macOS: CoreWLAN powerDidChange monitoring started. Initial state: \(currentWifiStatus)")
+        } catch {
+            print("OneShare-WiFi macOS: Failed to start CoreWLAN monitoring: \(error)")
+        }
+
+        // Secondary notification listener for Darwin power notifications
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("com.apple.corewlan.powerDidChange"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            let isPowerOn = self.queryCoreWLANPowerState()
+            print("OneShare-WiFi macOS: Notification powerDidChange received -> \(isPowerOn)")
+            self.currentWifiStatus = isPowerOn
+            self.wifiEventSink?(isPowerOn)
+        }
+    }
+
+    func powerStateDidChangeForWiFiInterface(withName interfaceName: String) {
+        let isPowerOn = CWWiFiClient.shared().interface(withName: interfaceName)?.powerOn() ?? queryCoreWLANPowerState()
+        print("OneShare-WiFi macOS: CWEventDelegate powerStateDidChange for \(interfaceName) -> \(isPowerOn)")
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.currentWifiStatus = isPowerOn
+            self.wifiEventSink?(isPowerOn)
+        }
+    }
+
     override func applicationShouldTerminateAfterLastWindowClosed(
         _ sender: NSApplication
     ) -> Bool {
@@ -140,16 +218,17 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
 
         let browser = NetServiceBrowser()
         browser.delegate = self
-
         serviceBrowser = browser
 
+        discoveredServices.removeAll()
+
         print(
-            "OneShare-NSD macOS: starting discovery \(serviceType)"
+            "OneShare-NSD macOS: browsing for \(serviceType)"
         )
 
         browser.searchForServices(
             ofType: serviceType,
-            inDomain: ""
+            inDomain: "local."
         )
     }
 
@@ -157,18 +236,16 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         serviceBrowser?.stop()
         serviceBrowser = nil
 
-        for service in discoveredServices.values {
+        for (_, service) in discoveredServices {
             service.stop()
         }
 
         discoveredServices.removeAll()
     }
 
-    // MARK: NetServiceDelegate
-
     func netServiceDidPublish(_ sender: NetService) {
         print(
-            "OneShare-NSD macOS: published \(sender.name):\(sender.port)"
+            "OneShare-NSD macOS: successfully published \(sender.name)"
         )
     }
 
@@ -187,102 +264,6 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         )
     }
 
-    func netService(
-        _ sender: NetService,
-        didNotResolve errorDict: [String: NSNumber]
-    ) {
-        print(
-            "OneShare-NSD macOS: resolve failed " +
-            "\(sender.name) \(errorDict)"
-        )
-
-        discoveredServices.removeValue(forKey: sender.name)
-    }
-
-    func netServiceDidResolveAddress(_ sender: NetService) {
-        guard let addresses = sender.addresses else {
-            return
-        }
-
-        for addressData in addresses {
-            guard addressData.count >= MemoryLayout<sockaddr_in>.size else {
-                continue
-            }
-
-            let host: String? = addressData.withUnsafeBytes { buffer in
-                guard let baseAddress = buffer.baseAddress else {
-                    return nil
-                }
-
-                let sockaddrPointer =
-                    baseAddress.assumingMemoryBound(to: sockaddr.self)
-
-                var hostBuffer = [CChar](
-                    repeating: 0,
-                    count: Int(NI_MAXHOST)
-                )
-
-                let result = getnameinfo(
-                    sockaddrPointer,
-                    socklen_t(addressData.count),
-                    &hostBuffer,
-                    socklen_t(hostBuffer.count),
-                    nil,
-                    0,
-                    NI_NUMERICHOST
-                )
-
-                guard result == 0 else {
-                    return nil
-                }
-
-                return String(cString: hostBuffer)
-            }
-
-            if let host = host {
-                print(
-                    "OneShare-NSD macOS: resolved " +
-                    "\(sender.name) \(host):\(sender.port)"
-                )
-
-                sendResolved(
-                    serviceName: sender.name,
-                    host: host,
-                    port: sender.port
-                )
-
-                break
-            }
-        }
-    }
-
-    // MARK: NetServiceBrowserDelegate
-
-    func netServiceBrowserWillSearch(
-        _ browser: NetServiceBrowser
-    ) {
-        print(
-            "OneShare-NSD macOS: browser started"
-        )
-    }
-
-    func netServiceBrowserDidStopSearch(
-        _ browser: NetServiceBrowser
-    ) {
-        print(
-            "OneShare-NSD macOS: browser stopped"
-        )
-    }
-
-    func netServiceBrowser(
-        _ browser: NetServiceBrowser,
-        didNotSearch errorDict: [String: NSNumber]
-    ) {
-        print(
-            "OneShare-NSD macOS: browser failed \(errorDict)"
-        )
-    }
-
     func netServiceBrowser(
         _ browser: NetServiceBrowser,
         didFind service: NetService,
@@ -292,9 +273,41 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
             "OneShare-NSD macOS: found \(service.name)"
         )
 
-        service.delegate = self
         discoveredServices[service.name] = service
-        service.resolve(withTimeout: 3.0)
+        service.delegate = self
+        service.resolve(withTimeout: 5.0)
+    }
+
+    func netServiceDidResolveAddress(_ sender: NetService) {
+        guard let hostName = sender.hostName else {
+            print(
+                "OneShare-NSD macOS: resolved without hostName"
+            )
+            return
+        }
+
+        let port = sender.port
+
+        print(
+            "OneShare-NSD macOS: resolved \(sender.name) -> " +
+            "\(hostName):\(port)"
+        )
+
+        sendResolved(
+            serviceName: sender.name,
+            host: hostName,
+            port: port
+        )
+    }
+
+    func netService(
+        _ sender: NetService,
+        didNotResolve errorDict: [String: NSNumber]
+    ) {
+        print(
+            "OneShare-NSD macOS: resolve failed for " +
+            "\(sender.name): \(errorDict)"
+        )
     }
 
     func netServiceBrowser(
@@ -325,6 +338,31 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
             "host": host,
             "port": port
         ])
+    }
+
+    fileprivate func setWifiSink(_ sink: FlutterEventSink?) {
+        self.wifiEventSink = sink
+        let status = queryCoreWLANPowerState()
+        self.currentWifiStatus = status
+        sink?(status)
+    }
+}
+
+private class WifiStreamHandler: NSObject, FlutterStreamHandler {
+    private weak var appDelegate: AppDelegate?
+
+    init(appDelegate: AppDelegate) {
+        self.appDelegate = appDelegate
+    }
+
+    func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+        appDelegate?.setWifiSink(events)
+        return nil
+    }
+
+    func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        appDelegate?.setWifiSink(nil)
+        return nil
     }
 }
 
