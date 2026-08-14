@@ -1,6 +1,7 @@
 package com.example.droplan
 
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
@@ -12,6 +13,7 @@ import android.provider.OpenableColumns
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.PluginRegistry
+import java.util.concurrent.Executors
 
 class InstantFilePicker(private val activity: Activity) : PluginRegistry.ActivityResultListener {
     companion object {
@@ -20,6 +22,7 @@ class InstantFilePicker(private val activity: Activity) : PluginRegistry.Activit
 
     private var pendingResult: MethodChannel.Result? = null
     private val openPfds = HashMap<String, android.os.ParcelFileDescriptor>()
+    private val executor = Executors.newSingleThreadExecutor()
 
     fun closePfds() {
         for (pfd in openPfds.values) {
@@ -40,13 +43,33 @@ class InstantFilePicker(private val activity: Activity) : PluginRegistry.Activit
             closePfds()
             pendingResult = result
 
-            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            // ACTION_GET_CONTENT launches the native file/content manager directly and fast,
+            // avoiding the heavy initialization lag of SAF DocumentsUI.
+            val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
                 type = "*/*"
                 putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                putExtra(Intent.EXTRA_LOCAL_ONLY, false)
             }
 
-            activity.startActivityForResult(intent, REQUEST_CODE_PICK)
+            try {
+                activity.startActivityForResult(intent, REQUEST_CODE_PICK)
+            } catch (e: ActivityNotFoundException) {
+                try {
+                    val fallbackIntent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "*/*"
+                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                    }
+                    activity.startActivityForResult(fallbackIntent, REQUEST_CODE_PICK)
+                } catch (fallbackError: Exception) {
+                    pendingResult = null
+                    result.error("PICKER_ERROR", fallbackError.message, null)
+                }
+            } catch (e: Exception) {
+                pendingResult = null
+                result.error("PICKER_ERROR", e.message, null)
+            }
         } else if (call.method == "clearPfds") {
             closePfds()
             result.success(null)
@@ -72,40 +95,52 @@ class InstantFilePicker(private val activity: Activity) : PluginRegistry.Activit
             return true
         }
 
-        val filesList = mutableListOf<Map<String, Any>>()
-
-        fun processUri(uri: Uri) {
-            val name = getFileName(activity, uri) ?: "file"
-            var size = getFileSize(activity, uri)
-            var path = resolveBestPath(activity, uri, name)
-
-            if (path != null) {
-                if (size == 0L) {
-                    try {
-                        size = java.io.File(path).length()
-                    } catch (_: Exception) {}
-                }
-                val map = HashMap<String, Any>()
-                map["name"] = name
-                map["size"] = size
-                map["path"] = path
-                filesList.add(map)
-            }
-        }
-
+        val urisToProcess = mutableListOf<Uri>()
         if (data.clipData != null) {
             val count = data.clipData!!.itemCount
             for (i in 0 until count) {
                 val item = data.clipData!!.getItemAt(i)
                 if (item.uri != null) {
-                    processUri(item.uri)
+                    urisToProcess.add(item.uri)
                 }
             }
         } else if (data.data != null) {
-            processUri(data.data!!)
+            urisToProcess.add(data.data!!)
         }
 
-        result.success(filesList)
+        if (urisToProcess.isEmpty()) {
+            result.success(emptyList<Map<String, Any>>())
+            return true
+        }
+
+        // Process URI metadata on background thread to prevent UI thread blocking
+        executor.execute {
+            val filesList = mutableListOf<Map<String, Any>>()
+
+            for (uri in urisToProcess) {
+                val name = getFileName(activity, uri) ?: "file"
+                var size = getFileSize(activity, uri)
+                val path = resolveBestPath(activity, uri, name)
+
+                if (path != null) {
+                    if (size == 0L) {
+                        try {
+                            size = java.io.File(path).length()
+                        } catch (_: Exception) {}
+                    }
+                    val map = HashMap<String, Any>()
+                    map["name"] = name
+                    map["size"] = size
+                    map["path"] = path
+                    filesList.add(map)
+                }
+            }
+
+            activity.runOnUiThread {
+                result.success(filesList)
+            }
+        }
+
         return true
     }
 
