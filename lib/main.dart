@@ -169,12 +169,11 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
   // (e.g. rapid double-tap on macOS).
   bool _isPickingFiles = false;
 
-  // BUG-11 FIX: Track which direction the active SC3 transfer is in and
-  // which transfer session is current, to prevent stale progress updates
-  // from switching the screen back to SC3 after the user taps Done.
-  TransferDirection _transferDirection = TransferDirection.sending;
-  String? _activeTransferSessionId;
-  String? _activePeerDeviceName;
+  // SESSION-SCOPED: Dual tracking for concurrent send+receive.
+  String? _activeSendSessionId;
+  String? _activeRecvSessionId;
+  String? _sendPeerDeviceName;
+  String? _recvPeerDeviceName;
 
   // BUG-E FIX: Track transfer IDs that have been dismissed via Done,
   // so late progress events on BOTH sender and receiver notifiers cannot
@@ -279,7 +278,8 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     ).then((result) {
       _isIncomingDialogOpen = false;
       if (result == 'accepted') {
-        _activePeerDeviceName = request.senderDeviceName;
+        _recvPeerDeviceName = request.senderDeviceName;
+        _activeRecvSessionId = request.transferId;
       }
       if (TransferService.instance.incomingRequestNotifier.value?.transferId ==
           request.transferId) {
@@ -298,9 +298,8 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
 
   // ──────────────────────────────────────────────────────────
   // Transfer progress → drives SC3
-  // BUG-11 FIX: Two separate listeners for sender vs receiver progress.
-  // BUG-15/03 FIX: Guard against stale progress updates overriding Home
-  // after the user taps Done (by checking _activeTransferSessionId).
+  // SESSION-SCOPED: Two separate listeners for sender vs receiver progress.
+  // Each only updates its own session tracking; no shared _transferDirection.
   // ──────────────────────────────────────────────────────────
 
   void _onSendProgressChanged() {
@@ -308,20 +307,17 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     final p = TransferService.instance.sendProgressNotifier.value;
     if (kDebugMode) {
       debugPrint('[DIAGNOSTIC] _onSendProgressChanged called. p: $p');
-      debugPrint('[DIAGNOSTIC] _activeTransferSessionId: $_activeTransferSessionId, dismissed contains: ${p != null ? _dismissedTransferIds.contains(p.transferId) : false}');
+      debugPrint('[DIAGNOSTIC] _activeSendSessionId: $_activeSendSessionId, dismissed contains: ${p != null ? _dismissedTransferIds.contains(p.transferId) : false}');
     }
     if (p == null) return;
-    // BUG-15 FIX: Only navigate to SC3 if this update belongs to the current
-    // active session. After _onDone() clears _activeTransferSessionId, late
-    // updates are ignored.
-    if (_activeTransferSessionId != null &&
-        p.transferId != _activeTransferSessionId) {
+    // Only navigate to SC3 if this update belongs to the current send session.
+    if (_activeSendSessionId != null &&
+        p.transferId != _activeSendSessionId) {
       return;
     }
-    // BUG-E FIX: Ignore events from dismissed transfers.
+    // Ignore events from dismissed transfers.
     if (_dismissedTransferIds.contains(p.transferId)) return;
     setState(() {
-      _transferDirection = TransferDirection.sending;
       _currentScreen = AppScreen.sc3;
       _waitingForDeviceName = null;
       _isSendingRequest = false;
@@ -336,10 +332,14 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
       debugPrint('[DIAGNOSTIC] dismissed contains: ${p != null ? _dismissedTransferIds.contains(p.transferId) : false}');
     }
     if (p == null) return;
-    // BUG-E FIX: Ignore events from dismissed transfers.
+    // Ignore events from dismissed transfers.
     if (_dismissedTransferIds.contains(p.transferId)) return;
+    // Guard against stale recv sessions.
+    if (_activeRecvSessionId != null &&
+        p.transferId != _activeRecvSessionId) {
+      return;
+    }
     setState(() {
-      _transferDirection = TransferDirection.receiving;
       _currentScreen = AppScreen.sc3;
     });
   }
@@ -355,10 +355,24 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     }
     if (state == AppLifecycleState.resumed) {
       _startServicesIfForeground(isResume: true);
+      // LIFECYCLE RECONCILIATION: Pop stale incoming dialog on resume.
+      _reconcileStaleDialogOnResume();
       return;
     }
     if (state == AppLifecycleState.detached) {
       _stopServices();
+    }
+  }
+
+  /// Pop the incoming transfer dialog if the request was nulled while
+  /// the app was backgrounded (the listener's pop may not have processed).
+  void _reconcileStaleDialogOnResume() {
+    if (_isIncomingDialogOpen &&
+        TransferService.instance.incomingRequestNotifier.value == null) {
+      if (Navigator.of(context).canPop()) {
+        Navigator.of(context).pop('cancelled_by_sender');
+      }
+      _isIncomingDialogOpen = false;
     }
   }
 
@@ -637,7 +651,7 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     setState(() {
       _isSendingRequest = true;
       _waitingForDeviceName = device.deviceName;
-      _activePeerDeviceName = device.deviceName;
+      _sendPeerDeviceName = device.deviceName;
     });
 
     // Resolve any zero file sizes in _selectedFiles before sending transfer request
@@ -694,7 +708,7 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
           // from a previous transfer cannot flip the screen back to SC3.
           if (mounted) {
             setState(() {
-              _activeTransferSessionId = outcome.transferId;
+              _activeSendSessionId = outcome.transferId;
             });
           }
           // SC3 transition driven by _onSendProgressChanged
@@ -917,18 +931,19 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     );
 
     if (shouldCancel == true && mounted) {
-      // BUG-11 FIX: Retrieve active transferId from the correct notifier
-      // depending on which direction the active transfer is running.
-      final activeTransferId = _transferDirection == TransferDirection.sending
-          ? TransferService.instance.sendProgressNotifier.value?.transferId
-          : TransferService.instance.receiveProgressNotifier.value?.transferId;
+      // SESSION-SCOPED: Cancel both active transfers (send and receive)
+      // independently based on which sessions are active.
+      final sendId = TransferService.instance.sendProgressNotifier.value?.transferId;
+      final recvId = TransferService.instance.receiveProgressNotifier.value?.transferId;
 
-      if (activeTransferId != null) {
-        await TransferService.instance.cancelTransfer(activeTransferId);
-      } else {
-        // BUG-11 FIX: Clear both notifiers to avoid stale state.
-        TransferService.instance.sendProgressNotifier.value = null;
-        TransferService.instance.receiveProgressNotifier.value = null;
+      // Cancel whichever transfers are currently in-progress
+      if (sendId != null &&
+          TransferService.instance.sendProgressNotifier.value?.status == TransferProgressStatus.transferring) {
+        await TransferService.instance.cancelTransfer(sendId);
+      }
+      if (recvId != null &&
+          TransferService.instance.receiveProgressNotifier.value?.status == TransferProgressStatus.transferring) {
+        await TransferService.instance.cancelTransfer(recvId);
       }
 
       if (!mounted) return;
@@ -937,7 +952,6 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
         _selectedFiles.clear();
         _isSendingRequest = false;
         // Keep screen on SC3 so the user sees 'Transfer Cancelled' and the Done button.
-        // Tapping Done will clear notifiers and return to Home.
       });
     }
   }
@@ -946,33 +960,57 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
   // Done — clear transfer state, return home
   // ──────────────────────────────────────────────────────────
 
-  void _onDone() {
-    // BUG-E FIX: Record the transfer ID(s) being dismissed so late events
-    // from either notifier cannot flip the screen back to SC3.
-    final sendId = TransferService.instance.sendProgressNotifier.value?.transferId;
-    final recvId = TransferService.instance.receiveProgressNotifier.value?.transferId;
-    if (sendId != null) _dismissedTransferIds.add(sendId);
-    if (recvId != null) _dismissedTransferIds.add(recvId);
-    // Cap the set size to prevent unbounded growth.
+  /// Session-scoped done handler. Dismisses only the specified direction.
+  /// If the other direction is still active, the screen stays on SC3.
+  /// If both are dismissed, navigates home.
+  void _onDoneForDirection(TransferDirection direction) {
+    if (direction == TransferDirection.sending) {
+      final sendId = TransferService.instance.sendProgressNotifier.value?.transferId;
+      if (sendId != null) _dismissedTransferIds.add(sendId);
+      TransferService.instance.sendProgressNotifier.value = null;
+      _activeSendSessionId = null;
+      _sendPeerDeviceName = null;
+    } else {
+      final recvId = TransferService.instance.receiveProgressNotifier.value?.transferId;
+      if (recvId != null) _dismissedTransferIds.add(recvId);
+      TransferService.instance.receiveProgressNotifier.value = null;
+      _activeRecvSessionId = null;
+      _recvPeerDeviceName = null;
+    }
+
+    // Cap the dismissed set to prevent unbounded growth.
     if (_dismissedTransferIds.length > 50) {
       final toRemove = _dismissedTransferIds.take(10).toList();
       _dismissedTransferIds.removeAll(toRemove);
     }
 
-    // Clear split progress notifiers first
-    TransferService.instance.sendProgressNotifier.value = null;
-    TransferService.instance.receiveProgressNotifier.value = null;
-
     if (!mounted) return;
-    // Perform a single atomic setState call to avoid mid-frame rebuild flashes
-    setState(() {
-      _activeTransferSessionId = null;
-      _activePeerDeviceName = null;
-      _selectedFiles.clear();
-      _isSendingRequest = false;
-      _currentScreen = AppScreen.home;
-    });
+
+    // Check if the other direction still has an active transfer.
+    final otherActive = (direction == TransferDirection.sending)
+        ? TransferService.instance.receiveProgressNotifier.value
+        : TransferService.instance.sendProgressNotifier.value;
+
+    if (otherActive != null && !_dismissedTransferIds.contains(otherActive.transferId)) {
+      // Other transfer still active — stay on SC3, just rebuild.
+      setState(() {
+        _selectedFiles.clear();
+        _isSendingRequest = false;
+      });
+    } else {
+      // Both done — navigate home.
+      setState(() {
+        _activeSendSessionId = null;
+        _activeRecvSessionId = null;
+        _sendPeerDeviceName = null;
+        _recvPeerDeviceName = null;
+        _selectedFiles.clear();
+        _isSendingRequest = false;
+        _currentScreen = AppScreen.home;
+      });
+    }
   }
+
 
   // ──────────────────────────────────────────────────────────
   // BUILD — routes on AppScreen
@@ -981,27 +1019,32 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    // Read from direction-appropriate notifier, with fallback to whichever state is active
+    // SESSION-SCOPED: Read both notifiers independently.
     final sendState = TransferService.instance.sendProgressNotifier.value;
     final receiveState = TransferService.instance.receiveProgressNotifier.value;
-    final progressState = _transferDirection == TransferDirection.sending
-        ? (sendState ?? receiveState)
-        : (receiveState ?? sendState);
+
+    // Filter out dismissed transfers.
+    final activeSendState = (sendState != null && !_dismissedTransferIds.contains(sendState.transferId))
+        ? sendState
+        : null;
+    final activeReceiveState = (receiveState != null && !_dismissedTransferIds.contains(receiveState.transferId))
+        ? receiveState
+        : null;
+
+    final hasAnyActive = activeSendState != null || activeReceiveState != null;
 
     if (kDebugMode) {
-      debugPrint('[DIAGNOSTIC] build called. _transferDirection: $_transferDirection');
-      debugPrint('[DIAGNOSTIC] sendState: $sendState');
-      debugPrint('[DIAGNOSTIC] receiveState: $receiveState');
-      debugPrint('[DIAGNOSTIC] progressState: $progressState');
+      debugPrint('[DIAGNOSTIC] build called. activeSendState: $activeSendState');
+      debugPrint('[DIAGNOSTIC] activeReceiveState: $activeReceiveState');
       debugPrint('[DIAGNOSTIC] _currentScreen: $_currentScreen');
     }
 
     // Compute effective screen immutably without mutating _currentScreen during build
-    final effectiveScreen = (_currentScreen == AppScreen.sc3 && progressState == null)
+    final effectiveScreen = (_currentScreen == AppScreen.sc3 && !hasAnyActive)
         ? AppScreen.home
         : _currentScreen;
 
-    if (_currentScreen == AppScreen.sc3 && progressState == null) {
+    if (_currentScreen == AppScreen.sc3 && !hasAnyActive) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
           setState(() {
@@ -1029,7 +1072,18 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     } else if (effectiveScreen == AppScreen.sc2) {
       activeMainContent = _buildSC2Screen(context);
     } else {
-      activeMainContent = _buildSC3Screen(context, progressState, _transferDirection);
+      // SC3: Build the transfer screen.
+      // If both send and receive are active, show split view.
+      // If only one, show single view.
+      if (activeSendState != null && activeReceiveState != null) {
+        activeMainContent = _buildSC3SplitView(context, activeSendState, activeReceiveState);
+      } else if (activeSendState != null) {
+        activeMainContent = _buildSC3Screen(context, activeSendState, TransferDirection.sending);
+      } else if (activeReceiveState != null) {
+        activeMainContent = _buildSC3Screen(context, activeReceiveState, TransferDirection.receiving);
+      } else {
+        activeMainContent = _buildHomeScreen(context);
+      }
     }
 
     final Widget bodyWidget = isMacOS
@@ -1894,6 +1948,200 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
   // S1: header  S2: transfer info + file list  S3: Cancel / Done
   // ──────────────────────────────────────────────────────────
 
+  /// Returns the peer device name for the given transfer direction.
+  String? _peerDeviceNameForDirection(TransferDirection direction) {
+    return direction == TransferDirection.sending
+        ? _sendPeerDeviceName
+        : _recvPeerDeviceName;
+  }
+
+  /// Split view for concurrent send+receive (Option A: vertical stack).
+  /// Send section on top, receive section below, each with own controls.
+  Widget _buildSC3SplitView(
+      BuildContext context, TransferProgressState sendState, TransferProgressState receiveState) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _buildSharedHeader(context),
+        const SizedBox(height: 10),
+        // ── Top: Sending ──
+        Expanded(
+          child: _buildSC3CompactSection(
+            context, sendState, TransferDirection.sending,
+          ),
+        ),
+        // Divider between sections
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: Container(
+            height: 1,
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [
+                  Colors.transparent,
+                  const Color(0xFF2A2D3E).withValues(alpha: 0.6),
+                  Colors.transparent,
+                ],
+              ),
+            ),
+          ),
+        ),
+        // ── Bottom: Receiving ──
+        Expanded(
+          child: _buildSC3CompactSection(
+            context, receiveState, TransferDirection.receiving,
+          ),
+        ),
+        const SizedBox(height: 8),
+      ],
+    );
+  }
+
+  /// Compact transfer section for use in split view.
+  /// Shows direction label, progress, file list, and cancel/done button inline.
+  Widget _buildSC3CompactSection(
+      BuildContext context, TransferProgressState state, TransferDirection direction) {
+    final isTransferring = state.status == TransferProgressStatus.transferring;
+    final isSending = direction == TransferDirection.sending;
+    final isCompleted = state.status == TransferProgressStatus.completed;
+    final isFailed = state.status == TransferProgressStatus.failed;
+    final isCancelled = state.status == TransferProgressStatus.cancelled;
+
+    final Color statusAccentColor;
+    final String titleText;
+
+    if (isCompleted) {
+      titleText = isSending ? 'Files Sent' : 'Files Received';
+      statusAccentColor = const Color(0xFF22C55E);
+    } else if (isFailed) {
+      titleText = 'Transfer Failed';
+      statusAccentColor = const Color(0xFFFF4D4F);
+    } else if (isCancelled) {
+      titleText = 'Transfer Cancelled';
+      statusAccentColor = const Color(0xFFFF8A00);
+    } else {
+      titleText = isSending ? 'Sending Files' : 'Receiving Files';
+      statusAccentColor = const Color(0xFF5C7CFA);
+    }
+
+    final percentText = '${(state.overallProgress * 100).toStringAsFixed(0)}%';
+    final peerName = _peerDeviceNameForDirection(direction);
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Title row
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Expanded(
+                child: Row(
+                  children: [
+                    Icon(
+                      isSending ? Icons.arrow_upward_rounded : Icons.arrow_downward_rounded,
+                      size: 16,
+                      color: statusAccentColor,
+                    ),
+                    const SizedBox(width: 6),
+                    Flexible(
+                      child: Text(
+                        titleText,
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                          color: statusAccentColor,
+                          letterSpacing: -0.3,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (peerName != null && peerName.isNotEmpty) ...[
+                      Text(
+                        '  •  ',
+                        style: GoogleFonts.plusJakartaSans(
+                          fontSize: 11,
+                          color: const Color(0xFF475569),
+                        ),
+                      ),
+                      Flexible(
+                        child: Text(
+                          isSending ? 'To $peerName' : 'From $peerName',
+                          style: GoogleFonts.plusJakartaSans(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: const Color(0xFF94A3B8),
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              Text(
+                percentText,
+                style: GoogleFonts.plusJakartaSans(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                  color: statusAccentColor,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          // Progress bar
+          ClipRRect(
+            borderRadius: BorderRadius.circular(3),
+            child: LinearProgressIndicator(
+              value: state.overallProgress,
+              minHeight: 4,
+              backgroundColor: const Color(0xFF141926),
+              valueColor: AlwaysStoppedAnimation<Color>(statusAccentColor),
+            ),
+          ),
+          const SizedBox(height: 4),
+          // Byte count
+          Text(
+            '${_formatFileSize(state.overallBytesTransferred)} / ${_formatFileSize(state.overallTotalBytes)}  •  ${state.files.where((f) => f.status == FileTransferStatus.completed).length}/${state.totalFiles} files',
+            style: GoogleFonts.plusJakartaSans(
+              fontSize: 10,
+              fontWeight: FontWeight.w600,
+              color: const Color(0xFFA7AFC2),
+            ),
+          ),
+          const SizedBox(height: 6),
+          // Compact file list
+          Expanded(
+            child: ListView.separated(
+              physics: const AlwaysScrollableScrollPhysics(),
+              itemCount: state.files.length,
+              separatorBuilder: (_, _) => const SizedBox(height: 4),
+              itemBuilder: (context, index) => _buildSC3FileRow(
+                context,
+                state.files[index],
+                statusAccentColor,
+                state.status,
+                state.transferId,
+              ),
+            ),
+          ),
+          const SizedBox(height: 6),
+          // Action button
+          SizedBox(
+            height: 40,
+            child: isTransferring
+                ? _buildCancelTransferButton(context)
+                : _buildDoneButton(context, state, direction),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ──────────────────────────────────────────────────────────
   // SC3: TRANSFER IN PROGRESS / COMPLETION / CANCELLED / FAILED
   // ──────────────────────────────────────────────────────────
@@ -1925,7 +2173,7 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
             padding: const EdgeInsets.symmetric(horizontal: 20),
             child: isTransferring
                 ? _buildCancelTransferButton(context)
-                : _buildDoneButton(context, progressState),
+                : _buildDoneButton(context, progressState, direction),
           ),
         ),
         const SizedBox(height: 12),
@@ -2053,8 +2301,8 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
                   letterSpacing: 1.0,
                 ),
               ),
-              if (_activePeerDeviceName != null &&
-                  _activePeerDeviceName!.isNotEmpty) ...[
+              if (_peerDeviceNameForDirection(direction) != null &&
+                  _peerDeviceNameForDirection(direction)!.isNotEmpty) ...[
                 Text(
                   '  •  ',
                   style: GoogleFonts.plusJakartaSans(
@@ -2066,8 +2314,8 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
                 Flexible(
                   child: Text(
                     isSending
-                        ? 'To ${_activePeerDeviceName!}'
-                        : 'From ${_activePeerDeviceName!}',
+                        ? 'To ${_peerDeviceNameForDirection(direction)!}'
+                        : 'From ${_peerDeviceNameForDirection(direction)!}',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: GoogleFonts.plusJakartaSans(
@@ -2517,7 +2765,7 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     );
   }
 
-  Widget _buildDoneButton(BuildContext context, TransferProgressState state) {
+  Widget _buildDoneButton(BuildContext context, TransferProgressState state, TransferDirection direction) {
     final isCompleted = state.status == TransferProgressStatus.completed;
     final List<Color> gradientColors = isCompleted
         ? const [Color(0xFF22C55E), Color(0xFF16A34A)]
@@ -2546,7 +2794,7 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
           ],
         ),
         child: ElevatedButton.icon(
-          onPressed: _onDone,
+          onPressed: () => _onDoneForDirection(direction),
           icon: const Icon(Icons.check_rounded, size: 20),
           label: const Text('Done'),
           style: ElevatedButton.styleFrom(

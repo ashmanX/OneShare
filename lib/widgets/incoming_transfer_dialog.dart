@@ -20,7 +20,8 @@ class IncomingTransferDialog extends StatefulWidget {
       _IncomingTransferDialogState();
 }
 
-class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
+class _IncomingTransferDialogState extends State<IncomingTransferDialog>
+    with WidgetsBindingObserver {
   Timer? _countdownTimer;
   int _remainingSeconds = 30;
   bool _isClosing = false;
@@ -28,6 +29,7 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
 
     if (kDebugMode) {
       debugPrint(
@@ -71,7 +73,17 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      // LIFECYCLE RECONCILIATION: Re-check if the request still exists.
+      // The listener's pop may not have processed while the app was backgrounded.
+      _onIncomingRequestChanged();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     TransferService.instance.incomingRequestNotifier
         .removeListener(_onIncomingRequestChanged);
     _countdownTimer?.cancel();

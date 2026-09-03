@@ -70,19 +70,20 @@ class TransferService {
     _cancelledTransferIds.add(id);
   }
 
-  HttpClientRequest? _activeOutgoingRequest;
-  IOSink? _activeIncomingSink;
-  File? _activeIncomingTempFile;
-  HttpRequest? _activeIncomingHttpRequest;
-  String? _activeTargetHost;
-  int? _activeTargetPort;
+  // SESSION-SCOPED I/O: All I/O handles are keyed by transferId so
+  // concurrent send+receive operations never collide.
+  final Map<String, HttpClientRequest?> _activeOutgoingRequests = {};
+  final Map<String, IOSink?> _activeIncomingSinks = {};
+  final Map<String, File?> _activeIncomingTempFiles = {};
+  final Map<String, HttpRequest?> _activeIncomingHttpRequests = {};
+  final Map<String, String> _transferTargetHost = {};
+  final Map<String, int> _transferTargetPort = {};
 
-  int _activeSenderCurrentFileBytes = 0;
+  final Map<String, int> _activeSenderCurrentFileBytes = {};
 
-  // BUG-01 FIX: Completer used to cancel a pending outgoing transfer request
-  // before the 35-second timeout fires.
-  Completer<TransferRequestOutcome>? _outgoingCancelCompleter;
-  String? _lastOutgoingTransferId;
+  // SESSION-SCOPED cancel completers: keyed by transferId so cancelling one
+  // outgoing request doesn't affect another.
+  final Map<String, Completer<TransferRequestOutcome>> _outgoingCancelCompleters = {};
 
   final Map<String, TransferToken> _activeTokens = {};
   final Map<String, Completer<TransferRequestOutcome>> _outgoingRequests = {};
@@ -115,8 +116,8 @@ class TransferService {
     set.add(fileId);
 
     // 1. Notify peer about single file cancellation
-    final host = _activeTargetHost;
-    final port = _activeTargetPort;
+    final host = _transferTargetHost[transferId];
+    final port = _transferTargetPort[transferId];
     if (host != null && port != null) {
       try {
         final uri = Uri.http('$host:$port', OneShareConfig.transferCancelFilePath);
@@ -160,21 +161,22 @@ class TransferService {
       for (final f in currentRecv.files) {
         if (f.fileId == fileId && f.status == FileTransferStatus.transferring) {
           try {
-            _activeIncomingSink?.close();
+            _activeIncomingSinks[transferId]?.close();
           } catch (_) {}
-          _activeIncomingSink = null;
+          _activeIncomingSinks.remove(transferId);
 
-          if (_activeIncomingTempFile != null) {
+          final tempFile = _activeIncomingTempFiles[transferId];
+          if (tempFile != null) {
             try {
-              _activeIncomingTempFile?.delete();
+              tempFile.delete();
             } catch (_) {}
-            _activeIncomingTempFile = null;
+            _activeIncomingTempFiles.remove(transferId);
           }
 
           try {
-            _activeIncomingHttpRequest?.response.detachSocket().then((s) => s.destroy());
+            _activeIncomingHttpRequests[transferId]?.response.detachSocket().then((s) => s.destroy());
           } catch (_) {}
-          _activeIncomingHttpRequest = null;
+          _activeIncomingHttpRequests.remove(transferId);
         }
       }
     }
@@ -184,9 +186,9 @@ class TransferService {
       for (final f in currentSend.files) {
         if (f.fileId == fileId && f.status == FileTransferStatus.transferring) {
           try {
-            _activeOutgoingRequest?.abort();
+            _activeOutgoingRequests[transferId]?.abort();
           } catch (_) {}
-          _activeOutgoingRequest = null;
+          _activeOutgoingRequests.remove(transferId);
         }
       }
     }
@@ -308,23 +310,30 @@ class TransferService {
   void cancelOutgoingRequest([String? transferId]) {
     final targetId = (transferId != null && transferId.isNotEmpty)
         ? transferId
-        : (_outgoingRequests.keys.firstOrNull ?? _lastOutgoingTransferId);
+        : _outgoingRequests.keys.firstOrNull;
 
-    final host = _activeTargetHost;
-    final port = _activeTargetPort;
-    if (targetId != null && host != null && port != null) {
-      _sendCancelNotificationToPeer(host, port, targetId);
+    if (targetId != null) {
+      final host = _transferTargetHost[targetId];
+      final port = _transferTargetPort[targetId];
+      if (host != null && port != null) {
+        _sendCancelNotificationToPeer(host, port, targetId);
+      }
     }
 
-    final cancelCompleter = _outgoingCancelCompleter;
-    if (cancelCompleter != null && !cancelCompleter.isCompleted) {
-      cancelCompleter.complete(
-        const TransferRequestOutcome(
-          status: TransferResultStatus.failed,
-          message: 'Transfer request cancelled by user',
-        ),
-      );
+    // Complete the per-transfer cancel completer
+    if (targetId != null) {
+      final cancelCompleter = _outgoingCancelCompleters[targetId];
+      if (cancelCompleter != null && !cancelCompleter.isCompleted) {
+        cancelCompleter.complete(
+          const TransferRequestOutcome(
+            status: TransferResultStatus.failed,
+            message: 'Transfer request cancelled by user',
+          ),
+        );
+      }
+      _outgoingCancelCompleters.remove(targetId);
     }
+
     // Also complete any pending completer waiting on accept/reject
     if (targetId != null && _outgoingRequests.containsKey(targetId)) {
       _outgoingFileItems.remove(targetId);
@@ -363,24 +372,24 @@ class TransferService {
   Future<void> cancelTransfer(String transferId) async {
     if (kDebugMode) {
       debugPrint('[OneShare TransferService] cancelTransfer called for: $transferId');
-      debugPrint('[DIAGNOSTIC] cancelTransfer called. transferId: $transferId');
-      debugPrint('[DIAGNOSTIC] _activeTargetHost: $_activeTargetHost, _activeTargetPort: $_activeTargetPort');
-      debugPrint('[DIAGNOSTIC] _acceptedRequests[transferId]: ${_acceptedRequests[transferId]}');
     }
     _addCancelledId(transferId);
 
     // Resolve peer target host and port before state cleanup so receiver can notify sender on cancel
-    final host = _activeTargetHost ?? _acceptedRequests[transferId]?.senderHost;
-    final port = _activeTargetPort ?? _acceptedRequests[transferId]?.senderPort;
+    final host = _transferTargetHost[transferId] ?? _acceptedRequests[transferId]?.senderHost;
+    final port = _transferTargetPort[transferId] ?? _acceptedRequests[transferId]?.senderPort;
 
     // Clean up _acceptedRequests and _activeTokens on cancel so stale tokens cannot be used
     _cleanupTransferState(transferId);
 
     // 1. Instantly set progress status to cancelled on matching notifiers.
+    // FIX: Only enter branch if sendCurrent actually belongs to this transferId
+    // (was: sendCurrent == null || ... which incorrectly matched when no send was active)
     final sendCurrent = sendProgressNotifier.value;
-    if (sendCurrent == null || sendCurrent.transferId == transferId) {
+    final isOutgoing = _outgoingFileItems.containsKey(transferId);
+    if ((sendCurrent != null && sendCurrent.transferId == transferId) || (isOutgoing && sendCurrent == null)) {
       final activeIndex = (sendCurrent?.currentFileIndex ?? 1) - 1;
-      final currentSent = _activeSenderCurrentFileBytes;
+      final currentSent = _activeSenderCurrentFileBytes[transferId] ?? 0;
       final outgoingItems = _outgoingFileItems[transferId];
 
       final List<PerFileTransferState> cancelledFiles;
@@ -434,11 +443,11 @@ class TransferService {
 
       sendProgressNotifier.value = TransferProgressState(
         transferId: transferId,
-        currentFileName: sendCurrent?.currentFileName ?? outgoingItems?.firstOrNull?.fileName ?? 'Transfer',
+        currentFileName: sendCurrent?.currentFileName ?? (outgoingItems?.isNotEmpty == true ? outgoingItems!.first.fileName : 'file'),
         currentFileIndex: sendCurrent?.currentFileIndex ?? 1,
-        totalFiles: sendCurrent?.totalFiles ?? outgoingItems?.length ?? 1,
+        totalFiles: sendCurrent?.totalFiles ?? (outgoingItems?.length ?? 1),
         currentFileBytesTransferred: currentFileTransferred,
-        currentFileSizeBytes: sendCurrent?.currentFileSizeBytes ?? outgoingItems?.firstOrNull?.fileSize ?? 0,
+        currentFileSizeBytes: sendCurrent?.currentFileSizeBytes ?? (outgoingItems?.isNotEmpty == true ? outgoingItems!.first.fileSize : 0),
         overallBytesTransferred: overallTransferred,
         overallTotalBytes: totalBytes,
         status: TransferProgressStatus.cancelled,
@@ -448,8 +457,9 @@ class TransferService {
     }
 
     final recvCurrent = receiveProgressNotifier.value;
-    if (recvCurrent != null && recvCurrent.transferId == transferId) {
-      final cancelledFiles = recvCurrent.files.map((f) {
+    final isIncoming = _acceptedRequests.containsKey(transferId) || _activeIncomingSinks.containsKey(transferId);
+    if ((recvCurrent != null && recvCurrent.transferId == transferId) || (isIncoming && recvCurrent == null)) {
+      final cancelledFiles = recvCurrent?.files.map((f) {
         if (f.status == FileTransferStatus.completed) return f;
         return PerFileTransferState(
           fileId: f.fileId,
@@ -459,17 +469,17 @@ class TransferService {
           status: FileTransferStatus.cancelled,
           errorMessage: 'Cancelled',
         );
-      }).toList();
+      }).toList() ?? const [];
 
       receiveProgressNotifier.value = TransferProgressState(
         transferId: transferId,
-        currentFileName: recvCurrent.currentFileName,
-        currentFileIndex: recvCurrent.currentFileIndex,
-        totalFiles: recvCurrent.totalFiles,
-        currentFileBytesTransferred: recvCurrent.currentFileBytesTransferred,
-        currentFileSizeBytes: recvCurrent.currentFileSizeBytes,
-        overallBytesTransferred: recvCurrent.overallBytesTransferred,
-        overallTotalBytes: recvCurrent.overallTotalBytes,
+        currentFileName: recvCurrent?.currentFileName ?? 'file',
+        currentFileIndex: recvCurrent?.currentFileIndex ?? 1,
+        totalFiles: recvCurrent?.totalFiles ?? 1,
+        currentFileBytesTransferred: recvCurrent?.currentFileBytesTransferred ?? 0,
+        currentFileSizeBytes: recvCurrent?.currentFileSizeBytes ?? 0,
+        overallBytesTransferred: recvCurrent?.overallBytesTransferred ?? 0,
+        overallTotalBytes: recvCurrent?.overallTotalBytes ?? 0,
         status: TransferProgressStatus.cancelled,
         files: cancelledFiles,
         errorMessage: 'Transfer cancelled by user',
@@ -495,48 +505,52 @@ class TransferService {
       }
     }
 
-    // 2. Abort active outgoing HTTP upload request if present.
-    if (_activeOutgoingRequest != null) {
+    // 2. Abort active outgoing HTTP upload request FOR THIS TRANSFER ONLY.
+    final outgoingReq = _activeOutgoingRequests[transferId];
+    if (outgoingReq != null) {
       try {
-        _activeOutgoingRequest?.abort();
+        outgoingReq.abort();
       } catch (e) {
         if (kDebugMode) debugPrint('[OneShare TransferService] Error aborting outgoing request: $e');
       }
-      _activeOutgoingRequest = null;
+      _activeOutgoingRequests.remove(transferId);
     }
 
-    // 3. Abort active incoming file sink & temp file if present.
-    if (_activeIncomingSink != null) {
+    // 3. Abort active incoming file sink & temp file FOR THIS TRANSFER ONLY.
+    final incomingSink = _activeIncomingSinks[transferId];
+    if (incomingSink != null) {
       try {
-        await _activeIncomingSink?.close();
+        await incomingSink.close();
       } catch (_) {}
-      _activeIncomingSink = null;
+      _activeIncomingSinks.remove(transferId);
     }
 
-    if (_activeIncomingTempFile != null) {
+    final incomingTempFile = _activeIncomingTempFiles[transferId];
+    if (incomingTempFile != null) {
       try {
-        if (await _activeIncomingTempFile?.exists() == true) {
+        if (await incomingTempFile.exists()) {
           if (kDebugMode) {
-            debugPrint('[OneShare TransferService] Deleting incomplete temp file on cancel: ${_activeIncomingTempFile?.path}');
+            debugPrint('[OneShare TransferService] Deleting incomplete temp file on cancel: ${incomingTempFile.path}');
           }
-          await _activeIncomingTempFile?.delete();
+          await incomingTempFile.delete();
         }
       } catch (e) {
         if (kDebugMode) debugPrint('[OneShare TransferService] Error deleting temp file: $e');
       }
-      _activeIncomingTempFile = null;
+      _activeIncomingTempFiles.remove(transferId);
     }
 
-    if (_activeIncomingHttpRequest != null) {
+    final incomingHttpReq = _activeIncomingHttpRequests[transferId];
+    if (incomingHttpReq != null) {
       try {
-        _activeIncomingHttpRequest?.response.statusCode = 499;
-        await _activeIncomingHttpRequest?.response.close();
+        incomingHttpReq.response.statusCode = 499;
+        await incomingHttpReq.response.close();
       } catch (_) {}
-      _activeIncomingHttpRequest = null;
+      _activeIncomingHttpRequests.remove(transferId);
     }
   }
 
-  /// Cleans up per-transfer state (accepted request entry + token).
+  /// Cleans up per-transfer state (accepted request entry + token + I/O maps).
   /// Called on both cancel and normal completion to prevent leaks.
   void _cleanupTransferState(String transferId) {
     // BUG-08 FIX: Remove acceptedRequest entry.
@@ -550,14 +564,17 @@ class TransferService {
     if (tokenKey != null) {
       _activeTokens.remove(tokenKey);
     }
+
+    // Clean up per-transfer I/O tracking maps.
+    _transferTargetHost.remove(transferId);
+    _transferTargetPort.remove(transferId);
+    _activeSenderCurrentFileBytes.remove(transferId);
+    _outgoingCancelCompleters.remove(transferId);
   }
 
   Future<void> handleCancelNotification(String transferId) async {
     if (kDebugMode) {
       debugPrint('[OneShare TransferService] Peer notification cancelled transfer: $transferId');
-      debugPrint('[DIAGNOSTIC] handleCancelNotification called. transferId: $transferId');
-      debugPrint('[DIAGNOSTIC] _activeSenderCurrentFileBytes: $_activeSenderCurrentFileBytes');
-      debugPrint('[DIAGNOSTIC] sendProgressNotifier.value: ${sendProgressNotifier.value}');
     }
     _addCancelledId(transferId);
 
@@ -572,38 +589,43 @@ class TransferService {
     // BUG-08 FIX: Clean up receiver-side state on peer cancel.
     _cleanupTransferState(transferId);
 
-    if (_activeIncomingSink != null) {
+    // SESSION-SCOPED: Only abort I/O handles belonging to THIS transfer.
+    final incomingSink = _activeIncomingSinks[transferId];
+    if (incomingSink != null) {
       try {
-        await _activeIncomingSink?.close();
+        await incomingSink.close();
       } catch (_) {}
-      _activeIncomingSink = null;
+      _activeIncomingSinks.remove(transferId);
     }
 
-    if (_activeIncomingTempFile != null) {
+    final incomingTempFile = _activeIncomingTempFiles[transferId];
+    if (incomingTempFile != null) {
       try {
-        if (await _activeIncomingTempFile?.exists() == true) {
-          await _activeIncomingTempFile?.delete();
+        if (await incomingTempFile.exists()) {
+          await incomingTempFile.delete();
         }
       } catch (_) {}
-      _activeIncomingTempFile = null;
+      _activeIncomingTempFiles.remove(transferId);
     }
 
-    if (_activeOutgoingRequest != null) {
+    final outgoingReq = _activeOutgoingRequests[transferId];
+    if (outgoingReq != null) {
       try {
-        _activeOutgoingRequest?.abort();
+        outgoingReq.abort();
       } catch (_) {}
-      _activeOutgoingRequest = null;
+      _activeOutgoingRequests.remove(transferId);
     }
 
-    // Update BOTH SENDER and RECEIVER progress notifiers on peer cancel notification.
+    // Update SENDER progress notifier if it belongs to this transfer.
     final sendCurrent = sendProgressNotifier.value;
-    if (sendCurrent != null && sendCurrent.transferId == transferId) {
-      final activeIndex = sendCurrent.currentFileIndex - 1;
-      final currentSent = _activeSenderCurrentFileBytes;
+    final isOutgoing = _outgoingFileItems.containsKey(transferId);
+    if ((sendCurrent != null && sendCurrent.transferId == transferId) || (isOutgoing && sendCurrent == null)) {
+      final activeIndex = (sendCurrent?.currentFileIndex ?? 1) - 1;
+      final currentSent = _activeSenderCurrentFileBytes[transferId] ?? 0;
       final outgoingItems = _outgoingFileItems[transferId];
 
       final List<PerFileTransferState> cancelledFiles;
-      if (sendCurrent.files.isNotEmpty) {
+      if (sendCurrent != null && sendCurrent.files.isNotEmpty) {
         cancelledFiles = sendCurrent.files.asMap().entries.map((entry) {
           final idx = entry.key;
           final f = entry.value;
@@ -637,7 +659,7 @@ class TransferService {
         cancelledFiles = const [];
       }
 
-      final totalBytes = sendCurrent.overallTotalBytes > 0
+      final totalBytes = (sendCurrent != null && sendCurrent.overallTotalBytes > 0)
           ? sendCurrent.overallTotalBytes
           : (outgoingItems?.fold<int>(0, (sum, f) => sum + f.fileSize) ?? 0);
 
@@ -653,11 +675,11 @@ class TransferService {
 
       sendProgressNotifier.value = TransferProgressState(
         transferId: transferId,
-        currentFileName: sendCurrent.currentFileName,
-        currentFileIndex: sendCurrent.currentFileIndex,
-        totalFiles: sendCurrent.totalFiles,
+        currentFileName: sendCurrent?.currentFileName ?? (outgoingItems?.isNotEmpty == true ? outgoingItems!.first.fileName : 'file'),
+        currentFileIndex: sendCurrent?.currentFileIndex ?? 1,
+        totalFiles: sendCurrent?.totalFiles ?? (outgoingItems?.length ?? 1),
         currentFileBytesTransferred: currentFileTransferred,
-        currentFileSizeBytes: sendCurrent.currentFileSizeBytes,
+        currentFileSizeBytes: sendCurrent?.currentFileSizeBytes ?? (outgoingItems?.isNotEmpty == true ? outgoingItems!.first.fileSize : 0),
         overallBytesTransferred: overallTransferred,
         overallTotalBytes: totalBytes,
         status: TransferProgressStatus.cancelled,
@@ -666,11 +688,10 @@ class TransferService {
       );
     }
 
+    // Update RECEIVER progress notifier if it belongs to this transfer.
     final recvCurrent = receiveProgressNotifier.value;
-    final isSender = sendCurrent != null && sendCurrent.transferId == transferId;
-    final isReceiver = recvCurrent != null && recvCurrent.transferId == transferId;
-
-    if (isReceiver || (!isSender && recvCurrent == null)) {
+    final isIncoming = _acceptedRequests.containsKey(transferId) || _activeIncomingSinks.containsKey(transferId);
+    if ((recvCurrent != null && recvCurrent.transferId == transferId) || (isIncoming && recvCurrent == null)) {
       final cancelledFiles = recvCurrent?.files.map((f) {
         if (f.status == FileTransferStatus.completed) return f;
         return PerFileTransferState(
@@ -685,7 +706,7 @@ class TransferService {
 
       receiveProgressNotifier.value = TransferProgressState(
         transferId: transferId,
-        currentFileName: recvCurrent?.currentFileName ?? 'Transfer',
+        currentFileName: recvCurrent?.currentFileName ?? 'file',
         currentFileIndex: recvCurrent?.currentFileIndex ?? 1,
         totalFiles: recvCurrent?.totalFiles ?? 1,
         currentFileBytesTransferred: recvCurrent?.currentFileBytesTransferred ?? 0,
@@ -706,10 +727,9 @@ class TransferService {
     String? localHost,
     int? senderPort,
   }) async {
-    _activeTargetHost = targetHost;
-    _activeTargetPort = targetPort;
     final transferId = _generateUuidV4();
-    _lastOutgoingTransferId = transferId;
+    _transferTargetHost[transferId] = targetHost;
+    _transferTargetPort[transferId] = targetPort;
     final ownIdentity = DeviceIdentityService.identity;
 
     if (kDebugMode) {
@@ -742,7 +762,7 @@ class TransferService {
     // BUG-01 FIX: Set up the cancel completer so cancelOutgoingRequest() can
     // resolve this future immediately without waiting for the 35s timeout.
     final cancelCompleter = Completer<TransferRequestOutcome>();
-    _outgoingCancelCompleter = cancelCompleter;
+    _outgoingCancelCompleters[transferId] = cancelCompleter;
 
     // 35 second fallback timeout for sender
     final timer = Timer(const Duration(seconds: 35), () {
@@ -786,7 +806,7 @@ class TransferService {
 
       if (response.statusCode != HttpStatus.ok) {
         timer.cancel();
-        _outgoingCancelCompleter = null;
+        _outgoingCancelCompleters.remove(transferId);
         _outgoingFileItems.remove(transferId);
         _outgoingRequests.remove(transferId);
         return TransferRequestOutcome(
@@ -802,7 +822,7 @@ class TransferService {
         cancelCompleter.future,
       ]);
       timer.cancel();
-      _outgoingCancelCompleter = null;
+      _outgoingCancelCompleters.remove(transferId);
       return result;
     } catch (e) {
       if (kDebugMode) {
@@ -810,7 +830,7 @@ class TransferService {
             '[OneShare Timestamp] MAC REQUEST RESPONSE/TIMEOUT transferId=$transferId status=EXCEPTION error=$e time=${DateTime.now().toIso8601String()}');
       }
       timer.cancel();
-      _outgoingCancelCompleter = null;
+      _outgoingCancelCompleters.remove(transferId);
       _outgoingFileItems.remove(transferId);
       _outgoingRequests.remove(transferId);
       return TransferRequestOutcome(
@@ -884,9 +904,9 @@ class TransferService {
       }
       return false;
     }
-    _activeTargetHost = targetHost;
-    _activeTargetPort = targetPort;
-    _activeSenderCurrentFileBytes = 0;
+    _transferTargetHost[transferId] = targetHost;
+    _transferTargetPort[transferId] = targetPort;
+    _activeSenderCurrentFileBytes[transferId] = 0;
 
     // Pre-resolve any zero file sizes from disk if available
     final resolvedFiles = <FileToSend>[];
@@ -917,14 +937,14 @@ class TransferService {
 
     try {
       for (int i = 0; i < filesToSend.length; i++) {
-        _activeSenderCurrentFileBytes = 0;
+        _activeSenderCurrentFileBytes[transferId] = 0;
 
         if (isTransferCancelled(transferId)) {
           if (kDebugMode) {
             debugPrint(
                 '[OneShare Stream Sender] Transfer $transferId was cancelled before file ${i + 1}');
           }
-          _activeOutgoingRequest = null;
+          _activeOutgoingRequests.remove(transferId);
           return false;
         }
 
@@ -993,7 +1013,7 @@ class TransferService {
                 '[OneShare Stream Sender] transferId: $transferId, fileId: ${fileItem.fileId}, fileName: ${fileItem.fileName}, expectedSize: ${fileItem.fileSize}');
           }
           final request = await _client.postUrl(uri);
-          _activeOutgoingRequest = request;
+          _activeOutgoingRequests[transferId] = request;
 
           request.headers.contentType = ContentType.binary;
           request.headers.set('authorization', 'Bearer $transferToken');
@@ -1016,7 +1036,7 @@ class TransferService {
             transferId,
             (chunkLength) {
               currentFileSent += chunkLength;
-              _activeSenderCurrentFileBytes = currentFileSent;
+              _activeSenderCurrentFileBytes[transferId] = currentFileSent;
               if (kDebugMode && (currentFileSent % (1024 * 1024) == 0 || currentFileSent < 100 * 1024)) {
                 debugPrint('[DIAGNOSTIC] Sender chunk callback: currentFileSent: $currentFileSent');
               }
@@ -1082,13 +1102,13 @@ class TransferService {
 
           if (isTransferCancelled(transferId)) {
             request.abort();
-            _activeOutgoingRequest = null;
+            _activeOutgoingRequests.remove(transferId);
             return false;
           }
 
           if (isFileCancelled(transferId, fileItem.fileId)) {
             request.abort();
-            _activeOutgoingRequest = null;
+            _activeOutgoingRequests.remove(transferId);
             continue;
           }
 
@@ -1098,7 +1118,7 @@ class TransferService {
           }
 
           final response = await request.close();
-          _activeOutgoingRequest = null;
+          _activeOutgoingRequests.remove(transferId);
 
           if (isTransferCancelled(transferId)) {
             return false;
@@ -1153,11 +1173,11 @@ class TransferService {
 
           completedFilesBytes += fileItem.fileSize;
         } catch (e, st) {
-          _activeOutgoingRequest = null;
+          _activeOutgoingRequests.remove(transferId);
           if (kDebugMode) {
             debugPrint('[DIAGNOSTIC] sendTransferFiles catch block. error: $e');
             debugPrint('[DIAGNOSTIC] isTransferCancelled: ${isTransferCancelled(transferId)}');
-            debugPrint('[DIAGNOSTIC] currentFileSent: $currentFileSent, _activeSenderCurrentFileBytes: $_activeSenderCurrentFileBytes');
+            debugPrint('[DIAGNOSTIC] currentFileSent: $currentFileSent, _activeSenderCurrentFileBytes: ${_activeSenderCurrentFileBytes[transferId]}');
             debugPrint('[DIAGNOSTIC] completedFilesBytes: $completedFilesBytes');
           }
 
@@ -1191,7 +1211,7 @@ class TransferService {
             debugPrint(
                 '[OneShare Stream Sender] Exception during file upload: $e\n$st');
           }
-          final finalSent = currentFileSent > 0 ? currentFileSent : _activeSenderCurrentFileBytes;
+          final finalSent = currentFileSent > 0 ? currentFileSent : (_activeSenderCurrentFileBytes[transferId] ?? 0);
           sendProgressNotifier.value = TransferProgressState(
             transferId: transferId,
             currentFileName: fileItem.fileName,
@@ -1279,11 +1299,11 @@ class TransferService {
 
       return true;
     } finally {
-      // BUG-22 FIX: Always clear _activeTargetHost/Port after a transfer ends
+      // BUG-22 FIX: Always clear per-transfer host/port after a transfer ends
       // (success, failure, or cancellation) to prevent stale cancel
       // notifications being sent to the wrong peer on the next transfer.
-      _activeTargetHost = null;
-      _activeTargetPort = null;
+      _transferTargetHost.remove(transferId);
+      _transferTargetPort.remove(transferId);
     }
   }
 
@@ -1382,8 +1402,8 @@ class TransferService {
       expiresAt: DateTime.now().add(const Duration(minutes: 5)),
     );
 
-    _activeTargetHost = request.senderHost;
-    _activeTargetPort = request.senderPort;
+    _transferTargetHost[transferId] = request.senderHost;
+    _transferTargetPort[transferId] = request.senderPort;
 
     _activeTokens[tokenString] = token;
     _acceptedRequests[transferId] = request;
@@ -1761,9 +1781,9 @@ class TransferService {
       return;
     }
 
-    _activeIncomingHttpRequest = request;
-    _activeIncomingSink = sink;
-    _activeIncomingTempFile = tempFile;
+    _activeIncomingHttpRequests[transferId] = request;
+    _activeIncomingSinks[transferId] = sink;
+    _activeIncomingTempFiles[transferId] = tempFile;
 
     if (kDebugMode) {
       debugPrint(
@@ -1788,14 +1808,14 @@ class TransferService {
                 '[OneShare Stream Receiver] Stream reading aborted for $rawFileName due to cancellation');
           }
           await sink.close();
-          _activeIncomingSink = null;
+          _activeIncomingSinks.remove(transferId);
           if (await tempFile.exists()) {
             try {
               await tempFile.delete();
             } catch (_) {}
           }
-          _activeIncomingTempFile = null;
-          _activeIncomingHttpRequest = null;
+          _activeIncomingTempFiles.remove(transferId);
+          _activeIncomingHttpRequests.remove(transferId);
           return;
         }
 
@@ -1830,14 +1850,14 @@ class TransferService {
       }
       await sink.flush();
       await sink.close();
-      _activeIncomingSink = null;
+      _activeIncomingSinks.remove(transferId);
 
       if (kDebugMode) {
         debugPrint(
             '[OneShare Stream Receiver] Stream read complete. Expected: $expectedSize, Actual bytes received: $actualBytesReceived');
       }
     } catch (e, st) {
-      _activeIncomingSink = null;
+      _activeIncomingSinks.remove(transferId);
       if (kDebugMode) {
         debugPrint('[DIAGNOSTIC] handleIncomingFileUpload catch block. error: $e');
         debugPrint('[DIAGNOSTIC] isTransferCancelled: ${isTransferCancelled(transferId)}');
@@ -1850,8 +1870,8 @@ class TransferService {
             await tempFile.delete();
           } catch (_) {}
         }
-        _activeIncomingTempFile = null;
-        _activeIncomingHttpRequest = null;
+        _activeIncomingTempFiles.remove(transferId);
+        _activeIncomingHttpRequests.remove(transferId);
         return;
       }
 
@@ -1883,8 +1903,8 @@ class TransferService {
           await tempFile.delete();
         } catch (_) {}
       }
-      _activeIncomingTempFile = null;
-      _activeIncomingHttpRequest = null;
+      _activeIncomingTempFiles.remove(transferId);
+      _activeIncomingHttpRequests.remove(transferId);
       return;
     }
 
@@ -2058,8 +2078,8 @@ class TransferService {
       ..headers.contentType = ContentType.json
       ..write(jsonEncode({'status': 'file_received', 'fileId': fileId}));
     await request.response.close();
-    _activeIncomingTempFile = null;
-    _activeIncomingHttpRequest = null;
+    _activeIncomingTempFiles.remove(transferId);
+    _activeIncomingHttpRequests.remove(transferId);
 
     if (kDebugMode) {
       debugPrint(

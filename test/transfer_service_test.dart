@@ -672,6 +672,19 @@ void main() {
         FileToSend(fileItem: const TransferFileItem(fileId: 'm3', fileName: 'file3.txt', fileSize: 10000), localPath: f3.path),
       ];
 
+      // Set notifier to matching transfer ID so cancelTransfer updates it
+      service.sendProgressNotifier.value = TransferProgressState(
+        transferId: transferId,
+        currentFileName: 'file1.txt',
+        currentFileIndex: 1,
+        totalFiles: 3,
+        currentFileBytesTransferred: 0,
+        currentFileSizeBytes: 1000,
+        overallBytesTransferred: 0,
+        overallTotalBytes: 21000,
+        status: TransferProgressStatus.transferring,
+      );
+
       // Mark transfer cancelled
       await service.cancelTransfer(transferId);
 
@@ -697,6 +710,19 @@ void main() {
       service.sendProgressNotifier.value = null; service.receiveProgressNotifier.value = null;
 
       const transferId = 'rcv-cancel-999';
+      // Set notifier to matching transfer ID so handleCancelNotification updates it
+      service.receiveProgressNotifier.value = const TransferProgressState(
+        transferId: transferId,
+        currentFileName: 'file.txt',
+        currentFileIndex: 1,
+        totalFiles: 1,
+        currentFileBytesTransferred: 0,
+        currentFileSizeBytes: 1000,
+        overallBytesTransferred: 0,
+        overallTotalBytes: 1000,
+        status: TransferProgressStatus.transferring,
+      );
+      
       await service.handleCancelNotification(transferId);
 
       expect(service.isTransferCancelled(transferId), isTrue);
