@@ -1,4 +1,4 @@
-package com.example.droplan
+package com.oneshare.app
 
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -12,12 +12,12 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
-    private val controlChannel = "com.example.oneshare/nsd_control"
-    private val eventChannel = "com.example.oneshare/nsd_events"
-    private val pickerChannel = "com.example.oneshare/instant_picker"
-    private val streamChannel = "com.example.oneshare/uri_stream"
-    private val wifiControlChannel = "com.example.oneshare/wifi_control"
-    private val wifiEventChannel = "com.example.oneshare/wifi_events"
+    private val controlChannel = "com.oneshare.app/nsd_control"
+    private val eventChannel = "com.oneshare.app/nsd_events"
+    private val pickerChannel = "com.oneshare.app/instant_picker"
+    private val streamChannel = "com.oneshare.app/uri_stream"
+    private val wifiControlChannel = "com.oneshare.app/wifi_control"
+    private val wifiEventChannel = "com.oneshare.app/wifi_events"
 
     private lateinit var nsdHelper: NsdHelper
     private lateinit var instantPicker: InstantFilePicker

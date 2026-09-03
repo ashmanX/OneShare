@@ -17,12 +17,16 @@ import 'package:oneshare/services/network_monitor_service.dart';
 import 'package:oneshare/services/oneshare_discovery_service.dart';
 import 'package:oneshare/services/oneshare_http_server.dart';
 import 'package:oneshare/services/transfer_service.dart';
+import 'package:oneshare/config/app_environment.dart';
 import 'package:oneshare/widgets/incoming_transfer_dialog.dart';
 import 'package:oneshare/widgets/sas_verification_dialog.dart';
 import 'package:oneshare/widgets/trust_indicator.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Ensure 100% offline zero-network privacy compliance: strictly disable runtime CDN font fetches.
+  GoogleFonts.config.allowRuntimeFetching = false;
+  AppEnvironment.resolveFromEnvironment();
   await DeviceIdentityService.initialize();
   runApp(const OneShareApp());
 }
@@ -116,6 +120,7 @@ class OneShareApp extends StatelessWidget {
       themeMode: ThemeMode.dark,
       darkTheme: ThemeData(
         brightness: Brightness.dark,
+        fontFamily: 'PlusJakartaSans',
         colorScheme: darkColorScheme,
         scaffoldBackgroundColor: const Color(0xFF000000),
         textTheme: textTheme,
@@ -124,6 +129,7 @@ class OneShareApp extends StatelessWidget {
       ),
       theme: ThemeData(
         brightness: Brightness.dark,
+        fontFamily: 'PlusJakartaSans',
         colorScheme: darkColorScheme,
         scaffoldBackgroundColor: const Color(0xFF000000),
         textTheme: textTheme,
@@ -271,7 +277,7 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     _isIncomingDialogOpen = true;
 
     if (Platform.isMacOS) {
-      const MethodChannel('com.example.oneshare/nsd_control')
+      const MethodChannel('com.oneshare.app/nsd_control')
           .invokeMethod('activateApp')
           .catchError((_) {});
     }
@@ -574,7 +580,7 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
       final newFiles = <SelectedFile>[];
 
       if (Platform.isAndroid) {
-        const channel = MethodChannel('com.example.oneshare/instant_picker');
+        const channel = MethodChannel('com.oneshare.app/instant_picker');
         final List<dynamic>? res =
             await channel.invokeListMethod<dynamic>('pickFiles');
 
@@ -683,6 +689,8 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
     final outcome = await TransferService.instance.sendTransferRequest(
       targetHost: device.host,
       targetPort: device.port,
+      targetDeviceId: device.deviceId,
+      targetDeviceName: device.deviceName,
       selectedFileDetails: filePayloads,
       senderPort: _httpServer.port,
     );
@@ -2313,13 +2321,9 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
                         context,
                         transferId: state.transferId,
                         peerDeviceName: _peerDeviceNameForDirection(direction) ?? 'Peer Device',
-                        peerDeviceId: session.peerIdentityPubKey != null
-                            ? session.peerIdentityPubKey!.map((b) => b.toRadixString(16).padLeft(2, '0')).join()
-                            : '',
+                        peerDeviceId: session.peerDeviceId ?? '',
                         sasCode: session.sasCode!,
-                        peerFingerprint: session.peerIdentityPubKey != null
-                            ? session.peerIdentityPubKey!.map((b) => b.toRadixString(16).padLeft(2, '0')).join()
-                            : '',
+                        peerFingerprint: session.peerFingerprint ?? '',
                         peerIdentityPublicKeyBytes: session.peerIdentityPubKey ?? const [],
                         initialTrustLevel: trustLevel,
                         onTrustLevelChanged: (newLevel) {
@@ -2345,13 +2349,9 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
                         context,
                         transferId: state.transferId,
                         peerDeviceName: _peerDeviceNameForDirection(direction) ?? 'Peer Device',
-                        peerDeviceId: session.peerIdentityPubKey != null
-                            ? session.peerIdentityPubKey!.map((b) => b.toRadixString(16).padLeft(2, '0')).join()
-                            : '',
+                        peerDeviceId: session.peerDeviceId ?? '',
                         sasCode: session.sasCode!,
-                        peerFingerprint: session.peerIdentityPubKey != null
-                            ? session.peerIdentityPubKey!.map((b) => b.toRadixString(16).padLeft(2, '0')).join()
-                            : '',
+                        peerFingerprint: session.peerFingerprint ?? '',
                         peerIdentityPublicKeyBytes: session.peerIdentityPubKey ?? const [],
                         initialTrustLevel: trustLevel,
                         onTrustLevelChanged: (newLevel) {

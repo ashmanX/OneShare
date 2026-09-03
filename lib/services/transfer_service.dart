@@ -9,10 +9,13 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import 'package:oneshare/config/oneshare_config.dart';
+import 'package:oneshare/models/e2ee_models.dart';
 import 'package:oneshare/models/transfer_models.dart';
+import 'package:oneshare/services/crypto/control_message_channel.dart';
 import 'package:oneshare/services/crypto/e2ee_handshake.dart';
 import 'package:oneshare/services/crypto/e2ee_session.dart';
 import 'package:oneshare/services/crypto/encrypted_stream.dart';
+import 'package:oneshare/services/crypto/log_sanitizer.dart';
 import 'package:oneshare/services/crypto/trust_store.dart';
 import 'package:oneshare/services/device_identity_service.dart';
 
@@ -97,6 +100,141 @@ class TransferService {
 
   final Map<String, E2eeSession> _outgoingE2eeSessions = {};
   final Map<String, E2eeSession> _incomingE2eeSessions = {};
+  final Set<String> _completedHandshakeTransferIds = <String>{};
+  static const int _maxHandshakeIdSetSize = 500;
+  static const int _handshakeIdSetEvictCount = 100;
+  final Map<String, Completer<void>> _transferLocks = {};
+
+  /// Acquires the shared per-transfer lifecycle lock to serialize control processing,
+  /// full cancellation, single-file cancellation, and session cleanup.
+  Future<T> synchronizedTransfer<T>(String transferId, Future<T> Function() block) async {
+    while (_transferLocks.containsKey(transferId)) {
+      await _transferLocks[transferId]!.future;
+    }
+    final completer = Completer<void>();
+    _transferLocks[transferId] = completer;
+    try {
+      return await block();
+    } finally {
+      _transferLocks.remove(transferId);
+      completer.complete();
+    }
+  }
+
+  /// Whether the transfer has ever derived keys or completed its E2EE handshake.
+  bool hasCompletedHandshake(String transferId) {
+    if (_completedHandshakeTransferIds.contains(transferId)) return true;
+    final session = getSession(transferId);
+    return session != null &&
+        (session.state == E2eeSessionState.keysDerived ||
+            session.state == E2eeSessionState.active ||
+            session.state == E2eeSessionState.destroyed);
+  }
+
+  /// Records that a transfer successfully derived keys / completed handshake with bounded retention.
+  void markHandshakeCompleted(String transferId) {
+    if (_completedHandshakeTransferIds.length >= _maxHandshakeIdSetSize) {
+      final toRemove = _completedHandshakeTransferIds.take(_handshakeIdSetEvictCount).toList();
+      _completedHandshakeTransferIds.removeAll(toRemove);
+    }
+    _completedHandshakeTransferIds.add(transferId);
+  }
+
+  /// Atomically processes an incoming authenticated cancellation under the shared transfer lifecycle lock.
+  ///
+  /// The lock covers:
+  /// - HMAC verification
+  /// - Replay-cache lookup
+  /// - Sequence validation
+  /// - Business action execution (_handleCancelNotificationInternal)
+  /// - Replay-cache insertion
+  /// - Sequence advancement
+  /// - Session cleanup and destruction
+  Future<ControlMessageEvaluation> handleAuthenticatedCancelNotification({
+    required String transferId,
+    required Map<String, dynamic> fullBody,
+  }) async {
+    return synchronizedTransfer(transferId, () async {
+      final session = getSession(transferId);
+      if (session == null || session.incomingCtrlChannel == null) {
+        return ControlMessageEvaluation.duplicateOrExpired();
+      }
+
+      try {
+        final eval = await session.incomingCtrlChannel!.processIncomingControlMessage(
+          fullBody: fullBody,
+          action: () async {
+            // Execute cancellation business action WITHOUT destroying the session yet,
+            // so processIncomingControlMessage can complete cache insertion and sequence advancement.
+            await _handleCancelNotificationInternal(transferId, skipSessionCleanup: true);
+            return {'status': 'cancellation_acknowledged'};
+          },
+        );
+        return eval;
+      } finally {
+        // Destroy session and clean up transfer state now that control message handling has committed
+        _cleanupTransferState(transferId);
+      }
+    });
+  }
+
+  /// Atomically processes an incoming authenticated single-file cancellation under the shared transfer lifecycle lock.
+  ///
+  /// The lock covers HMAC verification, replay cache check, sequence validation, file stream abortion,
+  /// replay cache recording, and sequence advancement. Does NOT destroy the session.
+  Future<ControlMessageEvaluation> handleAuthenticatedCancelFileNotification({
+    required String transferId,
+    required String fileId,
+    required Map<String, dynamic> fullBody,
+  }) async {
+    return synchronizedTransfer(transferId, () async {
+      final session = getSession(transferId);
+      if (session == null || session.incomingCtrlChannel == null) {
+        return ControlMessageEvaluation.duplicateOrExpired();
+      }
+
+      return session.incomingCtrlChannel!.processIncomingControlMessage(
+        fullBody: fullBody,
+        action: () async {
+          await _handleCancelFileNotificationInternal(transferId, fileId);
+          return {'status': 'file_cancellation_acknowledged'};
+        },
+      );
+    });
+  }
+
+  /// Whether a transfer is known to this node (active session, pre-handshake, or terminal).
+  bool isKnownTransfer(String transferId) {
+    if (transferId.isEmpty) return false;
+    if (_incomingE2eeSessions.containsKey(transferId) ||
+        _outgoingE2eeSessions.containsKey(transferId)) {
+      return true;
+    }
+    if (_completedHandshakeTransferIds.contains(transferId) ||
+        _cancelledTransferIds.contains(transferId) ||
+        _processedTransferIds.contains(transferId)) {
+      return true;
+    }
+    if (_acceptedRequests.containsKey(transferId) ||
+        _outgoingRequests.containsKey(transferId) ||
+        _activeIncomingSinks.containsKey(transferId) ||
+        _activeOutgoingRequests.containsKey(transferId)) {
+      return true;
+    }
+    if (incomingRequestNotifier.value?.transferId == transferId) {
+      return true;
+    }
+    final sendVal = sendProgressNotifier.value;
+    if (sendVal != null && sendVal.transferId == transferId) {
+      return true;
+    }
+    final recvVal = receiveProgressNotifier.value;
+    if (recvVal != null && recvVal.transferId == transferId) {
+      return true;
+    }
+    return false;
+  }
+
   TrustStore _trustStore = TrustStore();
 
   /// The active trust store instance.
@@ -117,8 +255,24 @@ class TransferService {
       _incomingE2eeSessions[transferId];
 
   @visibleForTesting
+  void injectIncomingSessionForTesting(String transferId, E2eeSession session) {
+    _incomingE2eeSessions[transferId] = session;
+  }
+
+  @visibleForTesting
   E2eeSession? getOutgoingSessionForTesting(String transferId) =>
       _outgoingE2eeSessions[transferId];
+
+  @visibleForTesting
+  void injectOutgoingSessionForTesting(String transferId, E2eeSession session) {
+    _outgoingE2eeSessions[transferId] = session;
+  }
+
+  @visibleForTesting
+  void setTransferTargetForTesting(String transferId, {required String host, required int port}) {
+    _transferTargetHost[transferId] = host;
+    _transferTargetPort[transferId] = port;
+  }
 
   ValueNotifier<String?> lastSenderMessageNotifier = ValueNotifier(null);
 
@@ -137,47 +291,81 @@ class TransferService {
   }
 
   Future<void> cancelSingleFile(String transferId, String fileId) async {
-    if (kDebugMode) {
-      debugPrint(
-          '[OneShare TransferService] cancelSingleFile called for: transferId=$transferId, fileId=$fileId');
-    }
-    final set = _cancelledFileIdsPerTransfer.putIfAbsent(transferId, () => {});
-    set.add(fileId);
-
-    // 1. Notify peer about single file cancellation
-    final host = _transferTargetHost[transferId];
-    final port = _transferTargetPort[transferId];
-    if (host != null && port != null) {
-      try {
-        final uri = Uri.http('$host:$port', OneShareConfig.transferCancelFilePath);
-        final req = await _client.postUrl(uri);
-        req.headers.contentType = ContentType.json;
-        Map<String, dynamic> payload = {
-          'transferId': transferId,
-          'fileId': fileId,
-          'senderDeviceId': DeviceIdentityService.identity.deviceId,
-        };
-        final session = _outgoingE2eeSessions[transferId] ?? _incomingE2eeSessions[transferId];
-        if (session != null && session.outgoingCtrlChannel != null) {
-          payload = await session.outgoingCtrlChannel!.signControlMessage(payload);
-        }
-        req.write(jsonEncode(payload));
-        final resp = await req.close();
-        await resp.drain();
-      } catch (e) {
+    await synchronizedTransfer(transferId, () async {
+      if (isTransferCancelled(transferId)) {
         if (kDebugMode) {
           debugPrint(
-              '[OneShare TransferService] Peer file cancel notify error: $e');
+              '[OneShare TransferService] cancelSingleFile ignored because transfer $transferId is already cancelled');
+        }
+        return;
+      }
+
+      if (kDebugMode) {
+        debugPrint(
+            '[OneShare TransferService] cancelSingleFile called for: transferId=$transferId, fileId=$fileId');
+      }
+      final set = _cancelledFileIdsPerTransfer.putIfAbsent(transferId, () => {});
+      set.add(fileId);
+
+      // 1. Notify peer about single file cancellation
+      final host = _transferTargetHost[transferId];
+      final port = _transferTargetPort[transferId];
+      if (host != null && port != null) {
+        try {
+          Map<String, dynamic>? payload = {
+            'transferId': transferId,
+            'fileId': fileId,
+            'senderDeviceId': DeviceIdentityService.identity.deviceId,
+          };
+          final session = _outgoingE2eeSessions[transferId] ?? _incomingE2eeSessions[transferId];
+          if (session != null && session.outgoingCtrlChannel != null) {
+            try {
+              payload = await session.outgoingCtrlChannel!.signControlMessage(payload);
+            } catch (e) {
+              payload = null;
+              if (kDebugMode) {
+                debugPrint('[OneShare TransferService] Error signing file cancel message (suppressing peer notify): $e');
+              }
+            }
+          }
+          if (payload != null) {
+            final uri = Uri.http('$host:$port', OneShareConfig.transferCancelFilePath);
+            final req = await _client.postUrl(uri);
+            req.headers.contentType = ContentType.json;
+            req.write(jsonEncode(payload));
+            final resp = await req.close();
+            await resp.drain();
+          }
+        } catch (e) {
+          if (kDebugMode) {
+            debugPrint(
+                '[OneShare TransferService] Peer file cancel notify error: $e');
+          }
         }
       }
-    }
 
-    _abortIfActiveFile(transferId, fileId);
-    _updateNotifiersForFileCancel(transferId, fileId);
+      _abortIfActiveFile(transferId, fileId);
+      _updateNotifiersForFileCancel(transferId, fileId);
+    });
   }
 
   Future<void> handleCancelFileNotification(
       String transferId, String fileId) async {
+    await synchronizedTransfer(transferId, () async {
+      await _handleCancelFileNotificationInternal(transferId, fileId);
+    });
+  }
+
+  Future<void> _handleCancelFileNotificationInternal(
+      String transferId, String fileId) async {
+    if (isTransferCancelled(transferId)) {
+      if (kDebugMode) {
+        debugPrint(
+            '[OneShare TransferService] handleCancelFileNotification ignored: transfer $transferId already cancelled');
+      }
+      return;
+    }
+
     if (kDebugMode) {
       debugPrint(
           '[OneShare TransferService] Peer notification cancelled file: transferId=$transferId, fileId=$fileId');
@@ -404,198 +592,219 @@ class TransferService {
   // ──────────────────────────────────────────────────────────
 
   Future<void> cancelTransfer(String transferId) async {
-    if (kDebugMode) {
-      debugPrint('[OneShare TransferService] cancelTransfer called for: $transferId');
-    }
-    _addCancelledId(transferId);
-
-    // Resolve peer target host and port before state cleanup so receiver can notify sender on cancel
-    final host = _transferTargetHost[transferId] ?? _acceptedRequests[transferId]?.senderHost;
-    final port = _transferTargetPort[transferId] ?? _acceptedRequests[transferId]?.senderPort;
-
-    // Clean up _acceptedRequests and _activeTokens on cancel so stale tokens cannot be used
-    _cleanupTransferState(transferId);
-
-    // 1. Instantly set progress status to cancelled on matching notifiers.
-    // FIX: Only enter branch if sendCurrent actually belongs to this transferId
-    // (was: sendCurrent == null || ... which incorrectly matched when no send was active)
-    final sendCurrent = sendProgressNotifier.value;
-    final isOutgoing = _outgoingFileItems.containsKey(transferId);
-    if ((sendCurrent != null && sendCurrent.transferId == transferId) || (isOutgoing && sendCurrent == null)) {
-      final activeIndex = (sendCurrent?.currentFileIndex ?? 1) - 1;
-      final currentSent = _activeSenderCurrentFileBytes[transferId] ?? 0;
-      final outgoingItems = _outgoingFileItems[transferId];
-
-      final List<PerFileTransferState> cancelledFiles;
-      if (sendCurrent != null && sendCurrent.files.isNotEmpty) {
-        cancelledFiles = sendCurrent.files.asMap().entries.map((entry) {
-          final idx = entry.key;
-          final f = entry.value;
-          if (f.status == FileTransferStatus.completed) return f;
-          final activeBytes = currentSent > f.bytesTransferred ? currentSent : f.bytesTransferred;
-          final bytes = (idx == activeIndex) ? activeBytes : f.bytesTransferred;
-          return PerFileTransferState(
-            fileId: f.fileId,
-            fileName: f.fileName,
-            fileSize: f.fileSize,
-            bytesTransferred: bytes,
-            status: FileTransferStatus.cancelled,
-            errorMessage: 'Cancelled',
-          );
-        }).toList();
-      } else if (outgoingItems != null && outgoingItems.isNotEmpty) {
-        cancelledFiles = outgoingItems.asMap().entries.map((entry) {
-          final idx = entry.key;
-          final f = entry.value;
-          final bytes = (idx == activeIndex && currentSent > 0) ? currentSent : 0;
-          return PerFileTransferState(
-            fileId: f.fileId,
-            fileName: f.fileName,
-            fileSize: f.fileSize,
-            bytesTransferred: bytes,
-            status: FileTransferStatus.cancelled,
-            errorMessage: 'Cancelled',
-          );
-        }).toList();
-      } else {
-        cancelledFiles = const [];
+    await synchronizedTransfer(transferId, () async {
+      if (kDebugMode) {
+        debugPrint('[OneShare TransferService] cancelTransfer called for: $transferId');
       }
-
-      final totalBytes = (sendCurrent != null && sendCurrent.overallTotalBytes > 0)
-          ? sendCurrent.overallTotalBytes
-          : (outgoingItems?.fold<int>(0, (sum, f) => sum + f.fileSize) ?? 0);
-
-      final overallTransferred = cancelledFiles.fold<int>(
-        0,
-        (sum, f) => sum + f.bytesTransferred,
-      );
-
-      final clampedIndex = activeIndex.clamp(0, cancelledFiles.isEmpty ? 0 : cancelledFiles.length - 1);
-      final currentFileTransferred = cancelledFiles.isNotEmpty
-          ? cancelledFiles[clampedIndex].bytesTransferred
-          : 0;
-
-      sendProgressNotifier.value = TransferProgressState(
-        transferId: transferId,
-        currentFileName: sendCurrent?.currentFileName ?? (outgoingItems?.isNotEmpty == true ? outgoingItems!.first.fileName : 'file'),
-        currentFileIndex: sendCurrent?.currentFileIndex ?? 1,
-        totalFiles: sendCurrent?.totalFiles ?? (outgoingItems?.length ?? 1),
-        currentFileBytesTransferred: currentFileTransferred,
-        currentFileSizeBytes: sendCurrent?.currentFileSizeBytes ?? (outgoingItems?.isNotEmpty == true ? outgoingItems!.first.fileSize : 0),
-        overallBytesTransferred: overallTransferred,
-        overallTotalBytes: totalBytes,
-        status: TransferProgressStatus.cancelled,
-        files: cancelledFiles,
-        errorMessage: 'Transfer cancelled by user',
-      );
-    }
-
-    final recvCurrent = receiveProgressNotifier.value;
-    final isIncoming = _acceptedRequests.containsKey(transferId) || _activeIncomingSinks.containsKey(transferId);
-    if ((recvCurrent != null && recvCurrent.transferId == transferId) || (isIncoming && recvCurrent == null)) {
-      final cancelledFiles = recvCurrent?.files.map((f) {
-        if (f.status == FileTransferStatus.completed) return f;
-        return PerFileTransferState(
-          fileId: f.fileId,
-          fileName: f.fileName,
-          fileSize: f.fileSize,
-          bytesTransferred: f.bytesTransferred,
-          status: FileTransferStatus.cancelled,
-          errorMessage: 'Cancelled',
-        );
-      }).toList() ?? const [];
-
-      receiveProgressNotifier.value = TransferProgressState(
-        transferId: transferId,
-        currentFileName: recvCurrent?.currentFileName ?? 'file',
-        currentFileIndex: recvCurrent?.currentFileIndex ?? 1,
-        totalFiles: recvCurrent?.totalFiles ?? 1,
-        currentFileBytesTransferred: recvCurrent?.currentFileBytesTransferred ?? 0,
-        currentFileSizeBytes: recvCurrent?.currentFileSizeBytes ?? 0,
-        overallBytesTransferred: recvCurrent?.overallBytesTransferred ?? 0,
-        overallTotalBytes: recvCurrent?.overallTotalBytes ?? 0,
-        status: TransferProgressStatus.cancelled,
-        files: cancelledFiles,
-        errorMessage: 'Transfer cancelled by user',
-      );
-    }
-
-    // BUG-04 FIX: Send cancel notification to peer BEFORE aborting the local
-    // HTTP request. This gives the peer a chance to set the "cancelled"
-    // state before the connection drop triggers a "failed" state.
-    if (host != null && port != null) {
-      try {
-        final uri = Uri.http('$host:$port', OneShareConfig.transferCancelPath);
-        final req = await _client.postUrl(uri);
-        req.headers.contentType = ContentType.json;
-        Map<String, dynamic> payload = {
-          'transferId': transferId,
-          'senderDeviceId': DeviceIdentityService.identity.deviceId,
-        };
-        final session = _outgoingE2eeSessions[transferId] ?? _incomingE2eeSessions[transferId];
-        if (session != null && session.outgoingCtrlChannel != null) {
-          payload = await session.outgoingCtrlChannel!.signControlMessage(payload);
+      if (isTransferCancelled(transferId)) {
+        if (kDebugMode) {
+          debugPrint('[OneShare TransferService] cancelTransfer: already cancelled $transferId');
         }
-        req.write(jsonEncode(payload));
-        final resp = await req.close();
-        await resp.drain();
-      } catch (e) {
-        if (kDebugMode) debugPrint('[OneShare TransferService] Peer cancel notify error: $e');
+        return;
       }
-    }
+      _addCancelledId(transferId);
 
-    // 2. Abort active outgoing HTTP upload request FOR THIS TRANSFER ONLY.
-    final outgoingReq = _activeOutgoingRequests[transferId];
-    if (outgoingReq != null) {
-      try {
-        outgoingReq.abort();
-      } catch (e) {
-        if (kDebugMode) debugPrint('[OneShare TransferService] Error aborting outgoing request: $e');
-      }
-      _activeOutgoingRequests.remove(transferId);
-    }
+      // 1. Capture peer host, port, session, and outgoing control channel before any state mutation
+      final host = _transferTargetHost[transferId] ?? _acceptedRequests[transferId]?.senderHost;
+      final port = _transferTargetPort[transferId] ?? _acceptedRequests[transferId]?.senderPort;
+      final session = _outgoingE2eeSessions[transferId] ?? _incomingE2eeSessions[transferId];
+      final ctrlChannel = session?.outgoingCtrlChannel;
 
-    // 3. Abort active incoming file sink & temp file FOR THIS TRANSFER ONLY.
-    final incomingSink = _activeIncomingSinks[transferId];
-    if (incomingSink != null) {
-      try {
-        await incomingSink.close();
-      } catch (_) {}
-      _activeIncomingSinks.remove(transferId);
-    }
-
-    final incomingTempFile = _activeIncomingTempFiles[transferId];
-    if (incomingTempFile != null) {
-      try {
-        if (await incomingTempFile.exists()) {
+      // 2. Sign outgoing cancel notification before cleanup
+      Map<String, dynamic>? payload = {
+        'transferId': transferId,
+        'senderDeviceId': DeviceIdentityService.identity.deviceId,
+      };
+      if (ctrlChannel != null) {
+        try {
+          payload = await ctrlChannel.signControlMessage(payload);
+        } catch (e) {
+          // Failure to sign on a post-handshake session must NEVER result in sending
+          // an unsigned unauthenticated cancellation message.
+          payload = null;
           if (kDebugMode) {
-            debugPrint('[OneShare TransferService] Deleting incomplete temp file on cancel: ${incomingTempFile.path}');
+            debugPrint('[OneShare TransferService] Error signing cancel message (suppressing peer notify): $e');
           }
-          await incomingTempFile.delete();
         }
-      } catch (e) {
-        if (kDebugMode) debugPrint('[OneShare TransferService] Error deleting temp file: $e');
       }
-      _activeIncomingTempFiles.remove(transferId);
-    }
 
-    final incomingHttpReq = _activeIncomingHttpRequests[transferId];
-    if (incomingHttpReq != null) {
+      // 3. Send cancel notification to peer BEFORE aborting local HTTP connections
+      if (host != null && port != null && payload != null) {
+        try {
+          final uri = Uri.http('$host:$port', OneShareConfig.transferCancelPath);
+          final req = await _client.postUrl(uri);
+          req.headers.contentType = ContentType.json;
+          req.write(jsonEncode(payload));
+          final resp = await req.close();
+          await resp.drain();
+        } catch (e) {
+          if (kDebugMode) debugPrint('[OneShare TransferService] Peer cancel notify error: $e');
+        }
+      }
+
       try {
-        incomingHttpReq.response.statusCode = 499;
-        await incomingHttpReq.response.close();
-      } catch (_) {}
-      _activeIncomingHttpRequests.remove(transferId);
-    }
+        // 4. Update progress notifiers to cancelled
+        final sendCurrent = sendProgressNotifier.value;
+        final isOutgoing = _outgoingFileItems.containsKey(transferId);
+        if ((sendCurrent != null && sendCurrent.transferId == transferId) || (isOutgoing && sendCurrent == null)) {
+          final activeIndex = (sendCurrent?.currentFileIndex ?? 1) - 1;
+          final currentSent = _activeSenderCurrentFileBytes[transferId] ?? 0;
+          final outgoingItems = _outgoingFileItems[transferId];
+
+          final List<PerFileTransferState> cancelledFiles;
+          if (sendCurrent != null && sendCurrent.files.isNotEmpty) {
+            cancelledFiles = sendCurrent.files.asMap().entries.map((entry) {
+              final idx = entry.key;
+              final f = entry.value;
+              if (f.status == FileTransferStatus.completed) return f;
+              final activeBytes = currentSent > f.bytesTransferred ? currentSent : f.bytesTransferred;
+              final bytes = (idx == activeIndex) ? activeBytes : f.bytesTransferred;
+              return PerFileTransferState(
+                fileId: f.fileId,
+                fileName: f.fileName,
+                fileSize: f.fileSize,
+                bytesTransferred: bytes,
+                status: FileTransferStatus.cancelled,
+                errorMessage: 'Cancelled',
+              );
+            }).toList();
+          } else if (outgoingItems != null && outgoingItems.isNotEmpty) {
+            cancelledFiles = outgoingItems.asMap().entries.map((entry) {
+              final idx = entry.key;
+              final f = entry.value;
+              final bytes = (idx == activeIndex && currentSent > 0) ? currentSent : 0;
+              return PerFileTransferState(
+                fileId: f.fileId,
+                fileName: f.fileName,
+                fileSize: f.fileSize,
+                bytesTransferred: bytes,
+                status: FileTransferStatus.cancelled,
+                errorMessage: 'Cancelled',
+              );
+            }).toList();
+          } else {
+            cancelledFiles = const [];
+          }
+
+          final totalBytes = (sendCurrent != null && sendCurrent.overallTotalBytes > 0)
+              ? sendCurrent.overallTotalBytes
+              : (outgoingItems?.fold<int>(0, (sum, f) => sum + f.fileSize) ?? 0);
+
+          final overallTransferred = cancelledFiles.fold<int>(
+            0,
+            (sum, f) => sum + f.bytesTransferred,
+          );
+
+          final clampedIndex = activeIndex.clamp(0, cancelledFiles.isEmpty ? 0 : cancelledFiles.length - 1);
+          final currentFileTransferred = cancelledFiles.isNotEmpty
+              ? cancelledFiles[clampedIndex].bytesTransferred
+              : 0;
+
+          sendProgressNotifier.value = TransferProgressState(
+            transferId: transferId,
+            currentFileName: sendCurrent?.currentFileName ?? (outgoingItems?.isNotEmpty == true ? outgoingItems!.first.fileName : 'file'),
+            currentFileIndex: sendCurrent?.currentFileIndex ?? 1,
+            totalFiles: sendCurrent?.totalFiles ?? (outgoingItems?.length ?? 1),
+            currentFileBytesTransferred: currentFileTransferred,
+            currentFileSizeBytes: sendCurrent?.currentFileSizeBytes ?? (outgoingItems?.isNotEmpty == true ? outgoingItems!.first.fileSize : 0),
+            overallBytesTransferred: overallTransferred,
+            overallTotalBytes: totalBytes,
+            status: TransferProgressStatus.cancelled,
+            files: cancelledFiles,
+            errorMessage: 'Transfer cancelled by user',
+          );
+        }
+
+        final recvCurrent = receiveProgressNotifier.value;
+        final isIncoming = _acceptedRequests.containsKey(transferId) || _activeIncomingSinks.containsKey(transferId);
+        if ((recvCurrent != null && recvCurrent.transferId == transferId) || (isIncoming && recvCurrent == null)) {
+          final cancelledFiles = recvCurrent?.files.map((f) {
+            if (f.status == FileTransferStatus.completed) return f;
+            return PerFileTransferState(
+              fileId: f.fileId,
+              fileName: f.fileName,
+              fileSize: f.fileSize,
+              bytesTransferred: f.bytesTransferred,
+              status: FileTransferStatus.cancelled,
+              errorMessage: 'Cancelled',
+            );
+          }).toList() ?? const [];
+
+          receiveProgressNotifier.value = TransferProgressState(
+            transferId: transferId,
+            currentFileName: recvCurrent?.currentFileName ?? 'file',
+            currentFileIndex: recvCurrent?.currentFileIndex ?? 1,
+            totalFiles: recvCurrent?.totalFiles ?? 1,
+            currentFileBytesTransferred: recvCurrent?.currentFileBytesTransferred ?? 0,
+            currentFileSizeBytes: recvCurrent?.currentFileSizeBytes ?? 0,
+            overallBytesTransferred: recvCurrent?.overallBytesTransferred ?? 0,
+            overallTotalBytes: recvCurrent?.overallTotalBytes ?? 0,
+            status: TransferProgressStatus.cancelled,
+            files: cancelledFiles,
+            errorMessage: 'Transfer cancelled by user',
+          );
+        }
+
+        // 5. Abort active outgoing HTTP upload request FOR THIS TRANSFER ONLY.
+        final outgoingReq = _activeOutgoingRequests[transferId];
+        if (outgoingReq != null) {
+          try {
+            outgoingReq.abort();
+          } catch (e) {
+            if (kDebugMode) debugPrint('[OneShare TransferService] Error aborting outgoing request: $e');
+          }
+          _activeOutgoingRequests.remove(transferId);
+        }
+
+        // 6. Abort active incoming file sink & temp file FOR THIS TRANSFER ONLY.
+        final incomingSink = _activeIncomingSinks[transferId];
+        if (incomingSink != null) {
+          try {
+            await incomingSink.close();
+          } catch (_) {}
+          _activeIncomingSinks.remove(transferId);
+        }
+
+        final incomingTempFile = _activeIncomingTempFiles[transferId];
+        if (incomingTempFile != null) {
+          try {
+            if (await incomingTempFile.exists()) {
+              if (kDebugMode) {
+                debugPrint('[OneShare TransferService] Deleting incomplete temp file on cancel: ${LogSanitizer.sanitizePath(incomingTempFile.path)}');
+              }
+              await incomingTempFile.delete();
+            }
+          } catch (e) {
+            if (kDebugMode) {
+              debugPrint('[OneShare TransferService] Error deleting temp file: ${LogSanitizer.redact(e.toString())}');
+            }
+          }
+          _activeIncomingTempFiles.remove(transferId);
+        }
+
+        final incomingHttpReq = _activeIncomingHttpRequests[transferId];
+        if (incomingHttpReq != null) {
+          try {
+            incomingHttpReq.response.statusCode = 499;
+            await incomingHttpReq.response.close();
+          } catch (_) {}
+          _activeIncomingHttpRequests.remove(transferId);
+        }
+      } finally {
+        // 7. Guaranteed finalization: clean up state and session keys
+        _cleanupTransferState(transferId);
+      }
+    });
   }
 
   /// Cleans up per-transfer state (accepted request entry + token + I/O maps).
   /// Called on both cancel and normal completion to prevent leaks.
+  /// Safe and idempotent for repeated calls.
   void _cleanupTransferState(String transferId) {
-    // BUG-08 FIX: Remove acceptedRequest entry.
+    // Remove acceptedRequest entry.
     _acceptedRequests.remove(transferId);
 
-    // BUG-08 FIX: Find and invalidate the token for this transfer.
+    // Find and invalidate the token for this transfer.
     final tokenKey = _activeTokens.entries
         .where((e) => e.value.transferId == transferId)
         .map((e) => e.key)
@@ -618,157 +827,183 @@ class TransferService {
   }
 
   Future<void> handleCancelNotification(String transferId) async {
+    await synchronizedTransfer(transferId, () async {
+      await _handleCancelNotificationInternal(transferId);
+    });
+  }
+
+  Future<void> _handleCancelNotificationInternal(String transferId, {bool skipSessionCleanup = false}) async {
     if (kDebugMode) {
       debugPrint('[OneShare TransferService] Peer notification cancelled transfer: $transferId');
     }
+    if (isTransferCancelled(transferId)) {
+      if (kDebugMode) {
+        debugPrint('[OneShare TransferService] handleCancelNotification: already cancelled $transferId');
+      }
+      return;
+    }
     _addCancelledId(transferId);
 
-    // If an incoming request dialog is open on this device,
-    // cancel its timer and clear the notifier so the dialog auto-dismisses.
-    if (incomingRequestNotifier.value != null &&
-        (incomingRequestNotifier.value?.transferId == transferId || transferId.isEmpty)) {
-      incomingRequestNotifier.value?.timer?.cancel();
-      incomingRequestNotifier.value = null;
-    }
-
-    // BUG-08 FIX: Clean up receiver-side state on peer cancel.
-    _cleanupTransferState(transferId);
-
-    // SESSION-SCOPED: Only abort I/O handles belonging to THIS transfer.
-    final incomingSink = _activeIncomingSinks[transferId];
-    if (incomingSink != null) {
-      try {
-        await incomingSink.close();
-      } catch (_) {}
-      _activeIncomingSinks.remove(transferId);
-    }
-
-    final incomingTempFile = _activeIncomingTempFiles[transferId];
-    if (incomingTempFile != null) {
-      try {
-        if (await incomingTempFile.exists()) {
-          await incomingTempFile.delete();
-        }
-      } catch (_) {}
-      _activeIncomingTempFiles.remove(transferId);
-    }
-
-    final outgoingReq = _activeOutgoingRequests[transferId];
-    if (outgoingReq != null) {
-      try {
-        outgoingReq.abort();
-      } catch (_) {}
-      _activeOutgoingRequests.remove(transferId);
-    }
-
-    // Update SENDER progress notifier if it belongs to this transfer.
-    final sendCurrent = sendProgressNotifier.value;
-    final isOutgoing = _outgoingFileItems.containsKey(transferId);
-    if ((sendCurrent != null && sendCurrent.transferId == transferId) || (isOutgoing && sendCurrent == null)) {
-      final activeIndex = (sendCurrent?.currentFileIndex ?? 1) - 1;
-      final currentSent = _activeSenderCurrentFileBytes[transferId] ?? 0;
-      final outgoingItems = _outgoingFileItems[transferId];
-
-      final List<PerFileTransferState> cancelledFiles;
-      if (sendCurrent != null && sendCurrent.files.isNotEmpty) {
-        cancelledFiles = sendCurrent.files.asMap().entries.map((entry) {
-          final idx = entry.key;
-          final f = entry.value;
-          if (f.status == FileTransferStatus.completed) return f;
-          final activeBytes = currentSent > f.bytesTransferred ? currentSent : f.bytesTransferred;
-          final bytes = (idx == activeIndex) ? activeBytes : f.bytesTransferred;
-          return PerFileTransferState(
-            fileId: f.fileId,
-            fileName: f.fileName,
-            fileSize: f.fileSize,
-            bytesTransferred: bytes,
-            status: FileTransferStatus.cancelled,
-            errorMessage: 'Cancelled',
-          );
-        }).toList();
-      } else if (outgoingItems != null && outgoingItems.isNotEmpty) {
-        cancelledFiles = outgoingItems.asMap().entries.map((entry) {
-          final idx = entry.key;
-          final f = entry.value;
-          final bytes = (idx == activeIndex && currentSent > 0) ? currentSent : 0;
-          return PerFileTransferState(
-            fileId: f.fileId,
-            fileName: f.fileName,
-            fileSize: f.fileSize,
-            bytesTransferred: bytes,
-            status: FileTransferStatus.cancelled,
-            errorMessage: 'Cancelled',
-          );
-        }).toList();
-      } else {
-        cancelledFiles = const [];
+      // If an incoming request dialog is open on this device,
+      // cancel its timer and clear the notifier so the dialog auto-dismisses.
+      if (incomingRequestNotifier.value != null &&
+          (incomingRequestNotifier.value?.transferId == transferId || transferId.isEmpty)) {
+        incomingRequestNotifier.value?.timer?.cancel();
+        incomingRequestNotifier.value = null;
       }
 
-      final totalBytes = (sendCurrent != null && sendCurrent.overallTotalBytes > 0)
-          ? sendCurrent.overallTotalBytes
-          : (outgoingItems?.fold<int>(0, (sum, f) => sum + f.fileSize) ?? 0);
+      try {
+        // Abort I/O handles belonging to THIS transfer.
+        final incomingSink = _activeIncomingSinks[transferId];
+        if (incomingSink != null) {
+          try {
+            await incomingSink.close();
+          } catch (_) {}
+          _activeIncomingSinks.remove(transferId);
+        }
 
-      final overallTransferred = cancelledFiles.fold<int>(
-        0,
-        (sum, f) => sum + f.bytesTransferred,
-      );
+        final incomingTempFile = _activeIncomingTempFiles[transferId];
+        if (incomingTempFile != null) {
+          try {
+            if (await incomingTempFile.exists()) {
+              await incomingTempFile.delete();
+            }
+          } catch (_) {}
+          _activeIncomingTempFiles.remove(transferId);
+        }
 
-      final clampedIndex = activeIndex.clamp(0, cancelledFiles.isEmpty ? 0 : cancelledFiles.length - 1);
-      final currentFileTransferred = cancelledFiles.isNotEmpty
-          ? cancelledFiles[clampedIndex].bytesTransferred
-          : 0;
+        final outgoingReq = _activeOutgoingRequests[transferId];
+        if (outgoingReq != null) {
+          try {
+            outgoingReq.abort();
+          } catch (_) {}
+          _activeOutgoingRequests.remove(transferId);
+        }
 
-      sendProgressNotifier.value = TransferProgressState(
-        transferId: transferId,
-        currentFileName: sendCurrent?.currentFileName ?? (outgoingItems?.isNotEmpty == true ? outgoingItems!.first.fileName : 'file'),
-        currentFileIndex: sendCurrent?.currentFileIndex ?? 1,
-        totalFiles: sendCurrent?.totalFiles ?? (outgoingItems?.length ?? 1),
-        currentFileBytesTransferred: currentFileTransferred,
-        currentFileSizeBytes: sendCurrent?.currentFileSizeBytes ?? (outgoingItems?.isNotEmpty == true ? outgoingItems!.first.fileSize : 0),
-        overallBytesTransferred: overallTransferred,
-        overallTotalBytes: totalBytes,
-        status: TransferProgressStatus.cancelled,
-        files: cancelledFiles,
-        errorMessage: 'Transfer cancelled by peer device',
-      );
-    }
+        final incomingHttpReq = _activeIncomingHttpRequests[transferId];
+        if (incomingHttpReq != null) {
+          try {
+            incomingHttpReq.response.statusCode = 499;
+            await incomingHttpReq.response.close();
+          } catch (_) {}
+          _activeIncomingHttpRequests.remove(transferId);
+        }
 
-    // Update RECEIVER progress notifier if it belongs to this transfer.
-    final recvCurrent = receiveProgressNotifier.value;
-    final isIncoming = _acceptedRequests.containsKey(transferId) || _activeIncomingSinks.containsKey(transferId);
-    if ((recvCurrent != null && recvCurrent.transferId == transferId) || (isIncoming && recvCurrent == null)) {
-      final cancelledFiles = recvCurrent?.files.map((f) {
-        if (f.status == FileTransferStatus.completed) return f;
-        return PerFileTransferState(
-          fileId: f.fileId,
-          fileName: f.fileName,
-          fileSize: f.fileSize,
-          bytesTransferred: f.bytesTransferred,
-          status: FileTransferStatus.cancelled,
-          errorMessage: 'Cancelled',
-        );
-      }).toList() ?? const [];
+        // Update SENDER progress notifier if it belongs to this transfer.
+        final sendCurrent = sendProgressNotifier.value;
+        final isOutgoing = _outgoingFileItems.containsKey(transferId);
+        if ((sendCurrent != null && sendCurrent.transferId == transferId) || (isOutgoing && sendCurrent == null)) {
+          final activeIndex = (sendCurrent?.currentFileIndex ?? 1) - 1;
+          final currentSent = _activeSenderCurrentFileBytes[transferId] ?? 0;
+          final outgoingItems = _outgoingFileItems[transferId];
 
-      receiveProgressNotifier.value = TransferProgressState(
-        transferId: transferId,
-        currentFileName: recvCurrent?.currentFileName ?? 'file',
-        currentFileIndex: recvCurrent?.currentFileIndex ?? 1,
-        totalFiles: recvCurrent?.totalFiles ?? 1,
-        currentFileBytesTransferred: recvCurrent?.currentFileBytesTransferred ?? 0,
-        currentFileSizeBytes: recvCurrent?.currentFileSizeBytes ?? 0,
-        overallBytesTransferred: recvCurrent?.overallBytesTransferred ?? 0,
-        overallTotalBytes: recvCurrent?.overallTotalBytes ?? 0,
-        status: TransferProgressStatus.cancelled,
-        files: cancelledFiles,
-        errorMessage: 'Transfer cancelled by peer device',
-      );
-    }
+          final List<PerFileTransferState> cancelledFiles;
+          if (sendCurrent != null && sendCurrent.files.isNotEmpty) {
+            cancelledFiles = sendCurrent.files.asMap().entries.map((entry) {
+              final idx = entry.key;
+              final f = entry.value;
+              if (f.status == FileTransferStatus.completed) return f;
+              final activeBytes = currentSent > f.bytesTransferred ? currentSent : f.bytesTransferred;
+              final bytes = (idx == activeIndex) ? activeBytes : f.bytesTransferred;
+              return PerFileTransferState(
+                fileId: f.fileId,
+                fileName: f.fileName,
+                fileSize: f.fileSize,
+                bytesTransferred: bytes,
+                status: FileTransferStatus.cancelled,
+                errorMessage: 'Cancelled',
+              );
+            }).toList();
+          } else if (outgoingItems != null && outgoingItems.isNotEmpty) {
+            cancelledFiles = outgoingItems.asMap().entries.map((entry) {
+              final idx = entry.key;
+              final f = entry.value;
+              final bytes = (idx == activeIndex && currentSent > 0) ? currentSent : 0;
+              return PerFileTransferState(
+                fileId: f.fileId,
+                fileName: f.fileName,
+                fileSize: f.fileSize,
+                bytesTransferred: bytes,
+                status: FileTransferStatus.cancelled,
+                errorMessage: 'Cancelled',
+              );
+            }).toList();
+          } else {
+            cancelledFiles = const [];
+          }
+
+          final totalBytes = (sendCurrent != null && sendCurrent.overallTotalBytes > 0)
+              ? sendCurrent.overallTotalBytes
+              : (outgoingItems?.fold<int>(0, (sum, f) => sum + f.fileSize) ?? 0);
+
+          final overallTransferred = cancelledFiles.fold<int>(
+            0,
+            (sum, f) => sum + f.bytesTransferred,
+          );
+
+          final clampedIndex = activeIndex.clamp(0, cancelledFiles.isEmpty ? 0 : cancelledFiles.length - 1);
+          final currentFileTransferred = cancelledFiles.isNotEmpty
+              ? cancelledFiles[clampedIndex].bytesTransferred
+              : 0;
+
+          sendProgressNotifier.value = TransferProgressState(
+            transferId: transferId,
+            currentFileName: sendCurrent?.currentFileName ?? (outgoingItems?.isNotEmpty == true ? outgoingItems!.first.fileName : 'file'),
+            currentFileIndex: sendCurrent?.currentFileIndex ?? 1,
+            totalFiles: sendCurrent?.totalFiles ?? (outgoingItems?.length ?? 1),
+            currentFileBytesTransferred: currentFileTransferred,
+            currentFileSizeBytes: sendCurrent?.currentFileSizeBytes ?? (outgoingItems?.isNotEmpty == true ? outgoingItems!.first.fileSize : 0),
+            overallBytesTransferred: overallTransferred,
+            overallTotalBytes: totalBytes,
+            status: TransferProgressStatus.cancelled,
+            files: cancelledFiles,
+            errorMessage: 'Transfer cancelled by peer device',
+          );
+        }
+
+        // Update RECEIVER progress notifier if it belongs to this transfer.
+        final recvCurrent = receiveProgressNotifier.value;
+        final isIncoming = _acceptedRequests.containsKey(transferId) || _activeIncomingSinks.containsKey(transferId);
+        if ((recvCurrent != null && recvCurrent.transferId == transferId) || (isIncoming && recvCurrent == null)) {
+          final cancelledFiles = recvCurrent?.files.map((f) {
+            if (f.status == FileTransferStatus.completed) return f;
+            return PerFileTransferState(
+              fileId: f.fileId,
+              fileName: f.fileName,
+              fileSize: f.fileSize,
+              bytesTransferred: f.bytesTransferred,
+              status: FileTransferStatus.cancelled,
+              errorMessage: 'Cancelled',
+            );
+          }).toList() ?? const [];
+
+          receiveProgressNotifier.value = TransferProgressState(
+            transferId: transferId,
+            currentFileName: recvCurrent?.currentFileName ?? 'file',
+            currentFileIndex: recvCurrent?.currentFileIndex ?? 1,
+            totalFiles: recvCurrent?.totalFiles ?? 1,
+            currentFileBytesTransferred: recvCurrent?.currentFileBytesTransferred ?? 0,
+            currentFileSizeBytes: recvCurrent?.currentFileSizeBytes ?? 0,
+            overallBytesTransferred: recvCurrent?.overallBytesTransferred ?? 0,
+            overallTotalBytes: recvCurrent?.overallTotalBytes ?? 0,
+            status: TransferProgressStatus.cancelled,
+            files: cancelledFiles,
+            errorMessage: 'Transfer cancelled by peer device',
+          );
+        }
+      } finally {
+        if (!skipSessionCleanup) {
+          _cleanupTransferState(transferId);
+        }
+      }
   }
 
   Future<TransferRequestOutcome> sendTransferRequest({
     required String targetHost,
     required int targetPort,
     required List<Map<String, dynamic>> selectedFileDetails,
+    String? targetDeviceId,
+    String? targetDeviceName,
     String? localHost,
     int? senderPort,
   }) async {
@@ -791,6 +1026,23 @@ class TransferService {
     }).toList();
 
     _outgoingFileItems[transferId] = fileItems;
+
+    // Resolve target peer in TrustStore to pin intendedReceiverIdentityPubKey
+    Uint8List? intendedReceiverPubKey;
+    if (targetDeviceId != null || targetDeviceName != null) {
+      final candidates = await trustStore.findCandidatePeers(
+        deviceId: targetDeviceId,
+        deviceName: targetDeviceName,
+      );
+      // Only pin if there is an unambiguous (exactly 1) match that is manually verified
+      if (candidates.length == 1 && candidates.first.trustLevel == TrustLevel.manuallyVerified) {
+        intendedReceiverPubKey = candidates.first.identityPublicKeyBytes;
+        if (kDebugMode) {
+          debugPrint(
+              '[OneShare Stream Sender] Pinned intendedReceiverIdentityPubKey for verified peer: ${candidates.first.deviceName} (${candidates.first.fingerprint.substring(0, 8)}...)');
+        }
+      }
+    }
 
     // E2EE v2 Handshake Setup (Initiator)
     final manifestItems = fileItems
@@ -816,6 +1068,7 @@ class TransferService {
     session.myEphemeralKeyPair = ephemeralKeyPair;
     session.myEphemeralPubKey = ephemeralPubKey;
     session.manifestHash = manifestHash;
+    session.intendedReceiverIdentityPubKey = intendedReceiverPubKey;
     session.state = E2eeSessionState.msg1Sent;
     _outgoingE2eeSessions[transferId] = session;
 
@@ -824,7 +1077,7 @@ class TransferService {
       transferId: transferId,
       manifestHash: manifestHash,
       senderEphemeralPubKey: ephemeralPubKey,
-      intendedReceiverIdentityPubKey: null,
+      intendedReceiverIdentityPubKey: intendedReceiverPubKey,
     );
 
     final payload = {
@@ -840,7 +1093,9 @@ class TransferService {
         'senderIdentityPubKey': base64Encode(ownIdentity.identityPublicKeyBytes),
         'senderEphemeralPubKey': base64Encode(ephemeralPubKey),
         'senderEphemeralSig': base64Encode(signature),
-        'intendedReceiverIdentityPubKey': null,
+        'intendedReceiverIdentityPubKey': intendedReceiverPubKey != null
+            ? base64Encode(intendedReceiverPubKey)
+            : null,
       },
     };
 
@@ -1454,6 +1709,47 @@ class TransferService {
       };
     }
 
+    if (pendingRequest.files.isEmpty) {
+      return {
+        'status': 'rejected',
+        'error': 'No files specified in transfer request',
+        'code': 'EMPTY_FILE_LIST',
+      };
+    }
+
+    if (pendingRequest.files.length > 100) {
+      return {
+        'status': 'rejected',
+        'error': 'File count exceeds maximum allowed limit of 100 files',
+        'code': 'EXCESSIVE_FILE_COUNT',
+      };
+    }
+
+    const int maxSingleFileSize = 100 * 1024 * 1024 * 1024; // 100 GB
+    for (final f in pendingRequest.files) {
+      if (f.fileName.isEmpty || f.fileName.length > 255) {
+        return {
+          'status': 'rejected',
+          'error': 'Invalid file name length: ${f.fileName}',
+          'code': 'INVALID_FILE_NAME',
+        };
+      }
+      if (f.fileName.contains('\x00') || f.fileName.contains('/') || f.fileName.contains('\\')) {
+        return {
+          'status': 'rejected',
+          'error': 'File name contains disallowed path characters',
+          'code': 'INVALID_FILE_NAME',
+        };
+      }
+      if (f.fileSize < 0 || f.fileSize > maxSingleFileSize) {
+        return {
+          'status': 'rejected',
+          'error': 'File size exceeds allowed limits: ${f.fileSize}',
+          'code': 'EXCESSIVE_FILE_SIZE',
+        };
+      }
+    }
+
     // E2EE Protocol v2 Validation & Handshake Verification
     final e2ee = pendingRequest.e2ee;
     if (e2ee == null) {
@@ -1467,30 +1763,34 @@ class TransferService {
       };
     }
 
-    final version = e2ee['version'] as int?;
-    if (version != 2) {
-      if (kDebugMode) {
-        debugPrint('[OneShare Stream Receiver] REJECTED: Protocol version mismatch ($version)');
-      }
-      return {
-        'status': 'rejected',
-        'error': 'Unsupported protocol version: $version (expected 2)',
-        'code': 'PROTOCOL_VERSION_MISMATCH',
-      };
-    }
-
     try {
-      final manifestHashBase64 = e2ee['manifestHash'] as String?;
-      final senderIdentityPubKeyBase64 = e2ee['senderIdentityPubKey'] as String?;
-      final senderEphemeralPubKeyBase64 = e2ee['senderEphemeralPubKey'] as String?;
-      final senderEphemeralSigBase64 = e2ee['senderEphemeralSig'] as String?;
-      final intendedReceiverIdentityPubKeyBase64 =
-          e2ee['intendedReceiverIdentityPubKey'] as String?;
+      final rawVersion = e2ee['version'];
+      if (rawVersion is! int || rawVersion != 2) {
+        if (kDebugMode) {
+          debugPrint('[OneShare Stream Receiver] REJECTED: Protocol version mismatch ($rawVersion)');
+        }
+        return {
+          'status': 'rejected',
+          'error': 'Unsupported protocol version: $rawVersion (expected integer 2)',
+          'code': 'PROTOCOL_VERSION_MISMATCH',
+        };
+      }
 
-      if (manifestHashBase64 == null ||
-          senderIdentityPubKeyBase64 == null ||
-          senderEphemeralPubKeyBase64 == null ||
-          senderEphemeralSigBase64 == null) {
+      final manifestHashRaw = e2ee['manifestHash'];
+      final senderIdentityPubKeyRaw = e2ee['senderIdentityPubKey'];
+      final senderEphemeralPubKeyRaw = e2ee['senderEphemeralPubKey'];
+      final senderEphemeralSigRaw = e2ee['senderEphemeralSig'];
+      final intendedReceiverIdentityPubKeyRaw =
+          e2ee['intendedReceiverIdentityPubKey'];
+
+      if (manifestHashRaw is! String ||
+          senderIdentityPubKeyRaw is! String ||
+          senderEphemeralPubKeyRaw is! String ||
+          senderEphemeralSigRaw is! String ||
+          manifestHashRaw.isEmpty ||
+          senderIdentityPubKeyRaw.isEmpty ||
+          senderEphemeralPubKeyRaw.isEmpty ||
+          senderEphemeralSigRaw.isEmpty) {
         return {
           'status': 'rejected',
           'error': 'Malformed E2EE handshake parameters',
@@ -1498,20 +1798,52 @@ class TransferService {
         };
       }
 
-      final manifestHash = Uint8List.fromList(base64Decode(manifestHashBase64));
-      final senderIdentityPubKey =
-          Uint8List.fromList(base64Decode(senderIdentityPubKeyBase64));
-      final senderEphemeralPubKey =
-          Uint8List.fromList(base64Decode(senderEphemeralPubKeyBase64));
-      final senderEphemeralSig =
-          Uint8List.fromList(base64Decode(senderEphemeralSigBase64));
-
+      final Uint8List manifestHash;
+      final Uint8List senderIdentityPubKey;
+      final Uint8List senderEphemeralPubKey;
+      final Uint8List senderEphemeralSig;
       Uint8List? intendedReceiverIdentityPubKey;
-      if (intendedReceiverIdentityPubKeyBase64 != null &&
-          intendedReceiverIdentityPubKeyBase64.isNotEmpty) {
-        intendedReceiverIdentityPubKey = Uint8List.fromList(
-          base64Decode(intendedReceiverIdentityPubKeyBase64),
-        );
+
+      try {
+        manifestHash = Uint8List.fromList(base64Decode(manifestHashRaw));
+        senderIdentityPubKey = Uint8List.fromList(base64Decode(senderIdentityPubKeyRaw));
+        senderEphemeralPubKey = Uint8List.fromList(base64Decode(senderEphemeralPubKeyRaw));
+        senderEphemeralSig = Uint8List.fromList(base64Decode(senderEphemeralSigRaw));
+
+        if (intendedReceiverIdentityPubKeyRaw != null) {
+          if (intendedReceiverIdentityPubKeyRaw is! String) {
+            return {
+              'status': 'rejected',
+              'error': 'Malformed intendedReceiverIdentityPubKey parameter',
+              'code': 'INVALID_HANDSHAKE',
+            };
+          }
+          if (intendedReceiverIdentityPubKeyRaw.isNotEmpty) {
+            intendedReceiverIdentityPubKey = Uint8List.fromList(
+              base64Decode(intendedReceiverIdentityPubKeyRaw),
+            );
+          }
+        }
+      } catch (_) {
+        return {
+          'status': 'rejected',
+          'error': 'Invalid Base64 encoding in cryptographic parameters',
+          'code': 'INVALID_HANDSHAKE',
+        };
+      }
+
+      // Exact cryptographic byte-length checks
+      if (manifestHash.length != 32 ||
+          senderIdentityPubKey.length != 32 ||
+          senderEphemeralPubKey.length != 32 ||
+          senderEphemeralSig.length != 64 ||
+          (intendedReceiverIdentityPubKey != null &&
+              intendedReceiverIdentityPubKey.length != 32)) {
+        return {
+          'status': 'rejected',
+          'error': 'Cryptographic parameter byte lengths invalid',
+          'code': 'INVALID_HANDSHAKE',
+        };
       }
 
       // 1. Verify manifest hash against received files list
@@ -1614,14 +1946,44 @@ class TransferService {
         deviceName: pendingRequest.senderDeviceName,
         deviceId: pendingRequest.senderDeviceId,
       );
+      session.peerFingerprint = senderFp;
+      session.peerDeviceId = pendingRequest.senderDeviceId;
       session.trustLevel = evaluation.trustLevel;
+
+      // Reject changed identities for known manually verified peers
+      if (evaluation.hasIdentityMismatchForDeviceName &&
+          evaluation.mismatchedRecord?.trustLevel == TrustLevel.manuallyVerified) {
+        if (kDebugMode) {
+          debugPrint(
+              '[OneShare Stream Receiver] SECURITY REJECTION: Known verified peer "${evaluation.mismatchedRecord!.deviceName}" presented altered identity key.');
+        }
+        // Preserve original verified record in trustStore untouched.
+        // Clean up session and return HTTP 403 / IDENTITY_MISMATCH.
+        _incomingE2eeSessions.remove(pendingRequest.transferId)?.destroy();
+        return {
+          'status': 'rejected',
+          'error': 'Security warning: Known verified device presented an unexpected identity key.',
+          'code': 'IDENTITY_MISMATCH',
+        };
+      }
+
+      if (!evaluation.hasIdentityMismatchForDeviceName) {
+        await trustStore.recordPeerEncounter(
+          fingerprint: senderFp,
+          identityPublicKeyBytes: senderIdentityPubKey,
+          deviceName: pendingRequest.senderDeviceName,
+          deviceId: pendingRequest.senderDeviceId,
+        );
+      }
     } catch (e) {
       if (kDebugMode) {
-        debugPrint('[OneShare Stream Receiver] Error verifying E2EE handshake: $e');
+        debugPrint(
+            '[OneShare Stream Receiver] Error verifying E2EE handshake: ${LogSanitizer.redact(e.toString())}');
       }
+      _incomingE2eeSessions.remove(pendingRequest.transferId)?.destroy();
       return {
         'status': 'rejected',
-        'error': 'Handshake verification error: $e',
+        'error': 'Handshake verification failed',
         'code': 'HANDSHAKE_ERROR',
       };
     }
@@ -1754,6 +2116,7 @@ class TransferService {
         transcriptHash: transcriptHash,
       );
       session.state = E2eeSessionState.msg2Sent;
+      markHandshakeCompleted(transferId);
 
       e2eePayload = {
         'version': OneShareConfig.protocolVersion,
@@ -1777,7 +2140,7 @@ class TransferService {
       );
       if (kDebugMode) {
         debugPrint(
-            '[OneShare] Sending accept to $uri for transferId: $transferId');
+            '[OneShare] Sending accept to $uri for transferId: ${LogSanitizer.truncateId(transferId)}');
       }
       final req = await _client.postUrl(uri);
       req.headers.contentType = ContentType.json;
@@ -1809,9 +2172,9 @@ class TransferService {
           errorMessage: 'The sender is no longer waiting — request expired.',
         );
       }
-    } catch (e, st) {
+    } catch (e) {
       if (kDebugMode) {
-        debugPrint('[OneShare] Error sending accept request: $e\n$st');
+        debugPrint('[OneShare] Error sending accept request: ${LogSanitizer.redact(e.toString())}');
       }
     }
   }
@@ -1837,7 +2200,7 @@ class TransferService {
       );
       if (kDebugMode) {
         debugPrint(
-            '[OneShare] Sending reject to $uri for transferId: $transferId');
+            '[OneShare] Sending reject to $uri for transferId: ${LogSanitizer.truncateId(transferId)}');
       }
       final req = await _client.postUrl(uri);
       req.headers.contentType = ContentType.json;
@@ -1883,32 +2246,72 @@ class TransferService {
         }
 
         try {
-          final receiverIdentityPubKeyBase64 =
-              e2ee['receiverIdentityPubKey'] as String?;
-          final receiverEphemeralPubKeyBase64 =
-              e2ee['receiverEphemeralPubKey'] as String?;
-          final receiverEphemeralSigBase64 =
-              e2ee['receiverEphemeralSig'] as String?;
+          final rawVersion = e2ee['version'];
+          if (rawVersion is! int || rawVersion != 2) {
+            throw const FormatException('Unsupported E2EE protocol version in accept response');
+          }
 
-          if (receiverIdentityPubKeyBase64 == null ||
-              receiverEphemeralPubKeyBase64 == null ||
-              receiverEphemeralSigBase64 == null ||
-              token == null) {
+          final receiverIdentityPubKeyRaw = e2ee['receiverIdentityPubKey'];
+          final receiverEphemeralPubKeyRaw = e2ee['receiverEphemeralPubKey'];
+          final receiverEphemeralSigRaw = e2ee['receiverEphemeralSig'];
+
+          if (receiverIdentityPubKeyRaw is! String ||
+              receiverEphemeralPubKeyRaw is! String ||
+              receiverEphemeralSigRaw is! String ||
+              receiverIdentityPubKeyRaw.isEmpty ||
+              receiverEphemeralPubKeyRaw.isEmpty ||
+              receiverEphemeralSigRaw.isEmpty ||
+              token == null ||
+              token.isEmpty) {
             throw const FormatException('Malformed E2EE accept parameters');
           }
 
-          final receiverIdentityPubKey = Uint8List.fromList(
-              base64Decode(receiverIdentityPubKeyBase64));
-          final receiverEphemeralPubKey = Uint8List.fromList(
-              base64Decode(receiverEphemeralPubKeyBase64));
-          final receiverEphemeralSig = Uint8List.fromList(
-              base64Decode(receiverEphemeralSigBase64));
+          final Uint8List receiverIdentityPubKey;
+          final Uint8List receiverEphemeralPubKey;
+          final Uint8List receiverEphemeralSig;
+
+          try {
+            receiverIdentityPubKey = Uint8List.fromList(
+                base64Decode(receiverIdentityPubKeyRaw));
+            receiverEphemeralPubKey = Uint8List.fromList(
+                base64Decode(receiverEphemeralPubKeyRaw));
+            receiverEphemeralSig = Uint8List.fromList(
+                base64Decode(receiverEphemeralSigRaw));
+          } catch (_) {
+            throw const FormatException('Invalid Base64 in E2EE accept parameters');
+          }
+
+          if (receiverIdentityPubKey.length != 32 ||
+              receiverEphemeralPubKey.length != 32 ||
+              receiverEphemeralSig.length != 64) {
+            throw const FormatException('Invalid cryptographic parameter lengths in accept response');
+          }
 
           session.peerIdentityPubKey = receiverIdentityPubKey;
           session.peerEphemeralPubKey = receiverEphemeralPubKey;
 
           final tokenHash = await E2eeHandshake.computeTokenHash(token);
           session.tokenHash = tokenHash;
+
+          // Verify pinned receiver identity if specified in msg1
+          if (session.intendedReceiverIdentityPubKey != null) {
+            final pinned = session.intendedReceiverIdentityPubKey!;
+            bool pinMatches = pinned.length == receiverIdentityPubKey.length;
+            if (pinMatches) {
+              for (int i = 0; i < pinned.length; i++) {
+                if (pinned[i] != receiverIdentityPubKey[i]) {
+                  pinMatches = false;
+                  break;
+                }
+              }
+            }
+            if (!pinMatches) {
+              if (kDebugMode) {
+                debugPrint('[OneShare Stream Sender] ABORT: Receiver msg2 identity public key does not match pinned key');
+              }
+              throw StateError('Receiver identity mismatch: public key does not match pinned verified identity');
+            }
+          }
 
           // Verify receiver's signature on msg2
           final isSigValid = await E2eeHandshake.verifyMsg2(
@@ -1947,6 +2350,7 @@ class TransferService {
             transcriptHash: transcriptHash,
           );
           session.state = E2eeSessionState.keysDerived;
+          markHandshakeCompleted(transferId);
 
           // Best-effort zeroization of ephemeral private key
           if (session.myEphemeralKeyPair != null) {
@@ -1964,6 +2368,8 @@ class TransferService {
             deviceName: 'Receiver',
             deviceId: body['receiverDeviceId'] as String? ?? '',
           );
+          session.peerFingerprint = receiverFp;
+          session.peerDeviceId = body['receiverDeviceId'] as String? ?? '';
           session.trustLevel = eval.trustLevel;
         } catch (e) {
           if (kDebugMode) {
@@ -2021,10 +2427,6 @@ class TransferService {
     if (kDebugMode) {
       debugPrint(
           '[OneShare Stream Receiver] Connection opened from $clientIp for endpoint ${request.uri.path}');
-      request.headers.forEach((name, values) {
-        debugPrint(
-            '[OneShare Stream Receiver] Request Header: $name = ${values.join(", ")}');
-      });
     }
 
     if (authHeader == null || !authHeader.startsWith('Bearer ')) {
@@ -2181,11 +2583,12 @@ class TransferService {
     }
 
     // BUG-12 FIX: When expectedSize is 0 (unknown at selection time), use the
-    // declared content-length as the authoritative expected size so the
-    // byte-count verification after the stream will pass.
+    // declared content-length if provided (> 0). Otherwise, cap at maxUnknownFileSize (2 GB)
+    // to prevent adversarial streams from filling storage.
+    const int maxUnknownFileSize = 2 * 1024 * 1024 * 1024; // 2 GB
     final expectedSize = (expectedFileItem.fileSize == 0 && declaredSize > 0)
         ? declaredSize
-        : expectedFileItem.fileSize;
+        : (expectedFileItem.fileSize == 0 ? maxUnknownFileSize : expectedFileItem.fileSize);
 
     late final File targetFile;
     late final File tempFile;
@@ -2204,31 +2607,31 @@ class TransferService {
 
       if (kDebugMode) {
         debugPrint(
-            '[OneShare Stream Receiver] Temp file path: ${tempFile.path}');
+            '[OneShare Stream Receiver] Temp file path: ${LogSanitizer.sanitizePath(tempFile.path)}');
         debugPrint(
-            '[OneShare Stream Receiver] Target destination path: ${targetFile.path}');
+            '[OneShare Stream Receiver] Target destination path: ${LogSanitizer.sanitizePath(targetFile.path)}');
       }
 
       if (await tempFile.exists()) {
         if (kDebugMode) {
           debugPrint(
-              '[OneShare Stream Receiver] Deleting existing stale temp file at ${tempFile.path}');
+              '[OneShare Stream Receiver] Deleting existing stale temp file at ${LogSanitizer.sanitizePath(tempFile.path)}');
         }
         await tempFile.delete();
       }
 
       sink = tempFile.openWrite();
-    } catch (e, st) {
+    } catch (e) {
       if (kDebugMode) {
         debugPrint(
-            '[OneShare Stream Receiver] Error setting up destination file/temp file: $e\n$st');
+            '[OneShare Stream Receiver] Error setting up destination file/temp file: ${LogSanitizer.redact(e.toString())}');
       }
       _setReceiverProgressFailed(
-          transferId, 'Could not create destination file: $e');
+          transferId, 'Could not create destination file');
       await _sendErrorResponse(
         request,
         HttpStatus.internalServerError,
-        'Could not create destination file: $e',
+        'Could not create destination file',
         'FILE_CREATION_ERROR',
       );
       return;
@@ -2240,7 +2643,7 @@ class TransferService {
 
     if (kDebugMode) {
       debugPrint(
-          '[OneShare Stream Receiver] Opened write sink for ${tempFile.path}');
+          '[OneShare Stream Receiver] Opened write sink for ${LogSanitizer.sanitizePath(tempFile.path)}');
     }
 
     int actualBytesReceived = 0;
@@ -2364,7 +2767,7 @@ class TransferService {
         debugPrint(
             '[OneShare Stream Receiver] Stream read complete. Expected: $expectedSize, Actual bytes received: $actualBytesReceived');
       }
-    } catch (e, st) {
+    } catch (e) {
       _activeIncomingSinks.remove(transferId);
       if (kDebugMode) {
         debugPrint('[DIAGNOSTIC] handleIncomingFileUpload catch block. error: $e');
@@ -2385,7 +2788,7 @@ class TransferService {
 
       if (kDebugMode) {
         debugPrint(
-            '[OneShare Stream Receiver] Exception receiving stream for $rawFileName: $e\n$st');
+            '[OneShare Stream Receiver] Exception receiving stream for $rawFileName: ${LogSanitizer.redact(e.toString())}');
       }
 
       if (await tempFile.exists()) {
@@ -2394,12 +2797,13 @@ class TransferService {
         } catch (_) {}
       }
 
+      _incomingE2eeSessions.remove(transferId)?.destroy();
       _setReceiverProgressFailed(
-          transferId, 'Error receiving stream for $rawFileName: $e');
+          transferId, 'Error receiving stream for $rawFileName');
       await _sendErrorResponse(
         request,
         HttpStatus.internalServerError,
-        'Error writing stream: $e',
+        'Error receiving data stream',
         'STREAM_ERROR',
       );
       return;
@@ -2417,9 +2821,10 @@ class TransferService {
     }
 
     // BUG-12 FIX: For files with known size, verify byte count. For
-    // expectedSize==0 (unknown at selection time but stream EOF reached), skip
-    // the strict equality check — accept whatever was received.
-    if (sizeExceeded || (expectedSize > 0 && actualBytesReceived != expectedSize)) {
+    // expectedFileItem.fileSize == 0 (unknown at selection time), verify it didn't exceed
+    // the 2 GB cap (sizeExceeded == false).
+    final isKnownSize = expectedFileItem.fileSize > 0 || declaredSize > 0;
+    if (sizeExceeded || (isKnownSize && actualBytesReceived != expectedSize)) {
       if (kDebugMode) {
         debugPrint(
             '[OneShare Stream Receiver] Byte count mismatch: expected $expectedSize, got $actualBytesReceived (sizeExceeded: $sizeExceeded)');
@@ -2434,7 +2839,7 @@ class TransferService {
       await _sendErrorResponse(
         request,
         HttpStatus.badRequest,
-        'Byte count mismatch: expected $expectedSize, got $actualBytesReceived',
+        'Byte count mismatch',
         'BYTE_COUNT_MISMATCH',
       );
       return;
@@ -2446,20 +2851,20 @@ class TransferService {
 
     if (kDebugMode) {
       debugPrint('[OneShare Stream Receiver] ANDROID RECEIVE:');
-      debugPrint('  transferId=$transferId');
+      debugPrint('  transferId=${LogSanitizer.truncateId(transferId)}');
       debugPrint('  file=$rawFileName');
       debugPrint('  expectedBytes=$expectedSize');
       debugPrint('  receivedBytes=$actualBytesReceived');
-      debugPrint('  tempPath=${tempFile.path}');
+      debugPrint('  tempPath=${LogSanitizer.sanitizePath(tempFile.path)}');
       debugPrint('  tempFileExists=$tempExists');
       debugPrint('  tempFileSize=$tempSize');
-      debugPrint('  finalPath=${targetFile.path}');
+      debugPrint('  finalPath=${LogSanitizer.sanitizePath(targetFile.path)}');
     }
 
     // BUG-12 FIX: For size=0 expected (unknown-size cloud files), skip the
-    // pre-finalization size comparison.
+    // strict pre-finalization size comparison with the cap.
     final prefinalizationOk = tempExists &&
-        (expectedSize == 0 || tempSize == expectedSize) &&
+        (!isKnownSize || tempSize == expectedSize) &&
         !isTransferCancelled(transferId);
 
     if (!prefinalizationOk) {
@@ -2572,7 +2977,7 @@ class TransferService {
       await _sendErrorResponse(
         request,
         HttpStatus.internalServerError,
-        'File finalization failed: ${finalizationException ?? "Size or existence mismatch"}',
+        'File finalization failed',
         'FINALIZATION_ERROR',
       );
       return;
@@ -2968,7 +3373,7 @@ class TransferService {
     void Function(int chunkLength) onChunk,
   ) async* {
     if (path.startsWith('content://') && Platform.isAndroid) {
-      const channel = MethodChannel('com.example.oneshare/uri_stream');
+      const channel = MethodChannel('com.oneshare.app/uri_stream');
       final String? streamId =
           await channel.invokeMethod<String>('openStream', {'uri': path});
 

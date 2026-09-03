@@ -29,6 +29,7 @@ class EncryptedStreamWriter {
 
   static const int maxPlaintextChunkSize = 65536; // 64 KB
   static const int maxCiphertextChunkSize = 65552; // 64 KB + 16-byte Poly1305 tag
+  static const int maxNonceCounter = 0x7FFFFFFFFFFFFFFF; // Max positive 64-bit signed int in Dart VM
 
   int _chunkCounter = 0;
   int _totalPlaintextBytes = 0;
@@ -36,6 +37,9 @@ class EncryptedStreamWriter {
   /// Constructs the 12-byte nonce for a given [chunkCounter]:
   /// `[0, 0, 0, 0, (8 bytes big-endian chunkCounter)]`.
   static Uint8List buildNonce(int chunkCounter) {
+    if (chunkCounter < 0 || chunkCounter > maxNonceCounter) {
+      throw const EncryptedStreamException('Nonce counter overflow: counter exceeds 64-bit bounds');
+    }
     final nonce = Uint8List(12);
     final bd = ByteData.sublistView(nonce, 4, 12);
     bd.setUint64(0, chunkCounter, Endian.big);
@@ -45,6 +49,9 @@ class EncryptedStreamWriter {
   /// Encrypts a plaintext chunk (up to 64KB) and returns framed ciphertext bytes:
   /// `[4-byte big-endian length][ciphertext + 16-byte tag]`.
   Future<Uint8List> encryptChunk(List<int> plaintext) async {
+    if (_chunkCounter >= maxNonceCounter) {
+      throw const EncryptedStreamException('Nonce counter overflow: cannot encrypt further chunks under current file key');
+    }
     if (plaintext.isEmpty) {
       throw ArgumentError('Plaintext chunk must not be empty. Use writeSentinel for EOF.');
     }
@@ -161,6 +168,8 @@ class EncryptedStreamReader {
   static final _algorithm = Chacha20.poly1305Aead();
 
   static const int maxCiphertextChunkSize = 65552; // 64 KB + 16 bytes tag
+  static const int maxParserBufferBytes = 131104; // 128 KB (2x max frame)
+  static const int maxNonceCounter = 0x7FFFFFFFFFFFFFFF; // Max positive 64-bit signed int in Dart VM
 
   int _chunkCounter = 0;
   int _accumulatedPlaintextBytes = 0;
@@ -183,7 +192,17 @@ class EncryptedStreamReader {
         throw const EncryptedStreamException('Trailing bytes received after stream sentinel EOF');
       }
 
+      if (_chunkCounter >= maxNonceCounter) {
+        _state = ReaderState.error;
+        throw const EncryptedStreamException('Nonce counter overflow in reader');
+      }
+
       buffer.addAll(chunk);
+
+      if (buffer.length > maxParserBufferBytes) {
+        _state = ReaderState.error;
+        throw const EncryptedStreamException('Parser buffer overflow: buffer exceeds maximum 128 KB ceiling');
+      }
 
       bool processing = true;
       while (processing) {

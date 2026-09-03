@@ -24,12 +24,12 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
         messenger: FlutterBinaryMessenger
     ) {
         let control = FlutterMethodChannel(
-            name: "com.example.oneshare/nsd_control",
+            name: "com.oneshare.app/nsd_control",
             binaryMessenger: messenger
         )
 
         let events = FlutterEventChannel(
-            name: "com.example.oneshare/nsd_events",
+            name: "com.oneshare.app/nsd_events",
             binaryMessenger: messenger
         )
 
@@ -38,11 +38,11 @@ class AppDelegate: FlutterAppDelegate, NetServiceDelegate, NetServiceBrowserDele
 
         // Native Wi-Fi status channels
         let wifiControl = FlutterMethodChannel(
-            name: "com.example.oneshare/wifi_control",
+            name: "com.oneshare.app/wifi_control",
             binaryMessenger: messenger
         )
         let wifiEvents = FlutterEventChannel(
-            name: "com.example.oneshare/wifi_events",
+            name: "com.oneshare.app/wifi_events",
             binaryMessenger: messenger
         )
 

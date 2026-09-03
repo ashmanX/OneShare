@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -158,6 +159,58 @@ class ControlMessageChannel {
       'mac': base64Encode(macBytes),
     };
     return signed;
+  }
+
+  Completer<void>? _currentLock;
+
+  /// Acquires an asynchronous mutex lock for this control channel.
+  Future<T> synchronized<T>(Future<T> Function() action) async {
+    while (_currentLock != null) {
+      await _currentLock!.future;
+    }
+    final completer = Completer<void>();
+    _currentLock = completer;
+    try {
+      return await action();
+    } finally {
+      _currentLock = null;
+      completer.complete();
+    }
+  }
+
+  /// Atomically evaluates an incoming control message, executes the business action,
+  /// caches the response, and advances the sequence number inside a channel mutex lock.
+  ///
+  /// Failure semantics:
+  /// - If HMAC, direction, sequence, or structure validation fails, [action] is never called.
+  /// - If [action] throws, the response is NOT cached and [_expectedNextSeq] is NOT advanced,
+  ///   leaving the sequence retryable.
+  Future<ControlMessageEvaluation> processIncomingControlMessage({
+    required Map<String, dynamic> fullBody,
+    required Future<Map<String, dynamic>> Function() action,
+  }) async {
+    return synchronized(() async {
+      final eval = await evaluateIncomingControlMessage(fullBody: fullBody);
+      if (eval.status != ControlEvaluationStatus.executeNew) {
+        return eval;
+      }
+
+      final ctrl = fullBody['e2ee_ctrl'] as Map<String, dynamic>;
+      final seq = ctrl['seq'] as int;
+      final macBytes = base64Decode(ctrl['mac'] as String);
+
+      // Execute business action. If this throws, nothing is cached and sequence does not advance.
+      final responsePayload = await action();
+
+      // Commit to cache and advance expected sequence on success
+      recordSuccess(
+        seq: seq,
+        mac: Uint8List.fromList(macBytes),
+        response: responsePayload,
+      );
+
+      return ControlMessageEvaluation.idempotentReplay(responsePayload);
+    });
   }
 
   /// Evaluates an incoming control message against sequencing, HMAC, and the 16-entry idempotent cache.

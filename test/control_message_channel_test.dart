@@ -249,5 +249,102 @@ void main() {
       expect(eval.statusCode, 401);
       expect(eval.errorCode, 'INVALID_CONTROL_MAC');
     });
+
+    test('Two concurrent duplicate controls execute business action exactly once', () async {
+      final msg = await senderChannel.signControlMessage({'transferId': transferId, 'action': 'cancel'});
+
+      int executionCount = 0;
+      final results = await Future.wait([
+        receiverChannel.processIncomingControlMessage(
+          fullBody: msg,
+          action: () async {
+            executionCount++;
+            await Future.delayed(const Duration(milliseconds: 20));
+            return {'status': 'cancellation_acknowledged'};
+          },
+        ),
+        receiverChannel.processIncomingControlMessage(
+          fullBody: msg,
+          action: () async {
+            executionCount++;
+            await Future.delayed(const Duration(milliseconds: 20));
+            return {'status': 'cancellation_acknowledged'};
+          },
+        ),
+      ]);
+
+      expect(executionCount, 1, reason: 'Business callback must be executed exactly once for duplicate requests');
+      expect(results[0].status, ControlEvaluationStatus.idempotentReplay);
+      expect(results[1].status, ControlEvaluationStatus.idempotentReplay);
+      expect(results[0].cachedResponse, {'status': 'cancellation_acknowledged'});
+      expect(results[1].cachedResponse, {'status': 'cancellation_acknowledged'});
+      expect(receiverChannel.expectedNextSeq, 2);
+    });
+
+    test('Business callback failure leaves sequence retryable and does not advance expectedNextSeq', () async {
+      final msg = await senderChannel.signControlMessage({'transferId': transferId, 'action': 'cancel'});
+
+      expect(receiverChannel.expectedNextSeq, 1);
+
+      // Attempt 1: Business action throws an exception
+      bool threw = false;
+      try {
+        await receiverChannel.processIncomingControlMessage(
+          fullBody: msg,
+          action: () async {
+            throw StateError('Simulated DB/IO failure');
+          },
+        );
+      } catch (e) {
+        threw = true;
+      }
+      expect(threw, isTrue);
+
+      // Verify channel state: sequence did NOT advance and nothing was cached
+      expect(receiverChannel.expectedNextSeq, 1);
+
+      // Attempt 2: Retry with the EXACT SAME valid message and sequence
+      int retryExecuted = 0;
+      final retryEval = await receiverChannel.processIncomingControlMessage(
+        fullBody: msg,
+        action: () async {
+          retryExecuted++;
+          return {'status': 'cancellation_acknowledged_retry'};
+        },
+      );
+
+      expect(retryExecuted, 1);
+      expect(retryEval.status, ControlEvaluationStatus.idempotentReplay);
+      expect(retryEval.cachedResponse, {'status': 'cancellation_acknowledged_retry'});
+      expect(receiverChannel.expectedNextSeq, 2);
+    });
+
+    test('Concurrent controls with different sequence numbers cannot bypass ordering', () async {
+      final msgSeq1 = await senderChannel.signControlMessage({'transferId': transferId, 'seqOrder': 1});
+      final msgSeq2 = await senderChannel.signControlMessage({'transferId': transferId, 'seqOrder': 2});
+
+      // Launch seq 2 slightly before or concurrent with seq 1
+      final results = await Future.wait([
+        receiverChannel.processIncomingControlMessage(
+          fullBody: msgSeq2,
+          action: () async => {'ack': 2},
+        ),
+        receiverChannel.processIncomingControlMessage(
+          fullBody: msgSeq1,
+          action: () async => {'ack': 1},
+        ),
+      ]);
+
+      // One must be a sequence gap error (400) because seq 2 ran before seq 1 advanced expectedNextSeq
+      final seq2Result = results[0];
+      expect(seq2Result.status, ControlEvaluationStatus.error);
+      expect(seq2Result.statusCode, 400);
+      expect(seq2Result.errorCode, 'SEQUENCE_GAP');
+
+      final seq1Result = results[1];
+      expect(seq1Result.status, ControlEvaluationStatus.idempotentReplay);
+      expect(seq1Result.cachedResponse, {'ack': 1});
+      expect(receiverChannel.expectedNextSeq, 2);
+    });
   });
 }

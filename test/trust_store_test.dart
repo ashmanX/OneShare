@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'dart:typed_data';
+import 'package:cryptography/cryptography.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:oneshare/models/e2ee_models.dart';
 import 'package:oneshare/services/crypto/crypto_key_storage.dart';
@@ -9,12 +11,18 @@ void main() {
   late TrustStore trustStore;
 
   final samplePubKey1 = Uint8List.fromList(List.generate(32, (i) => i + 1));
-  const sampleFp1 = '0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20';
+  late String sampleFp1;
 
   final samplePubKey2 = Uint8List.fromList(List.generate(32, (i) => i + 33));
-  const sampleFp2 = '2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40';
+  late String sampleFp2;
 
-  setUp(() {
+  setUp(() async {
+    final hash1 = await Sha256().hash(samplePubKey1);
+    sampleFp1 = hash1.bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+    final hash2 = await Sha256().hash(samplePubKey2);
+    sampleFp2 = hash2.bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
     storage = InMemoryKeyStorage();
     trustStore = TrustStore(storage: storage);
   });
@@ -202,6 +210,76 @@ void main() {
 
       await trustStore.clearAll();
       expect((await trustStore.getAllPeers()).isEmpty, isTrue);
+    });
+
+    test('findCandidatePeers correctly resolves unique verified peer and flags ambiguous matches', () async {
+      // 1. Peer 1 is manuallyVerified
+      await trustStore.markManuallyVerified(
+        fingerprint: sampleFp1,
+        identityPublicKeyBytes: samplePubKey1,
+        deviceName: 'Alice Phone',
+        deviceId: 'dev-alice-01',
+      );
+
+      // Query by deviceId finds unique verified peer
+      final candidates1 = await trustStore.findCandidatePeers(deviceId: 'dev-alice-01');
+      expect(candidates1.length, 1);
+      expect(candidates1.first.fingerprint, sampleFp1);
+      expect(candidates1.first.trustLevel, TrustLevel.manuallyVerified);
+
+      // 2. Peer 2 has the same deviceName 'Alice Phone' but different deviceId and fingerprint
+      await trustStore.recordPeerEncounter(
+        fingerprint: sampleFp2,
+        identityPublicKeyBytes: samplePubKey2,
+        deviceName: 'Alice Phone',
+        deviceId: 'dev-alice-02',
+      );
+
+      // Query by deviceName returns multiple candidates (ambiguous match)
+      final candidatesByName = await trustStore.findCandidatePeers(deviceName: 'Alice Phone');
+      expect(candidatesByName.length, 2);
+
+      // Query by non-existent deviceId returns empty list
+      final candidatesEmpty = await trustStore.findCandidatePeers(deviceId: 'unknown-id');
+      expect(candidatesEmpty.isEmpty, isTrue);
+    });
+
+    test('TrustStore.load rejects duplicate fingerprint in trust index', () async {
+      await storage.write(
+        key: TrustStore.kTrustIndexKey,
+        value: jsonEncode([sampleFp1, sampleFp1]),
+      );
+      expect(
+        () => trustStore.load(),
+        throwsA(isA<TrustCorruptedException>()),
+      );
+    });
+
+    test('TrustStore.load rejects peer record where SHA-256 of public key does not match fingerprint', () async {
+      // Index references sampleFp1
+      await storage.write(
+        key: TrustStore.kTrustIndexKey,
+        value: jsonEncode([sampleFp1]),
+      );
+      // But record has samplePubKey2 (which hashes to sampleFp2, mismatching sampleFp1)
+      final recordJson = jsonEncode(PeerRecord(
+        fingerprint: sampleFp1,
+        identityPublicKeyBytes: samplePubKey2,
+        deviceName: 'Mismatch Peer',
+        deviceId: 'dev-mismatch',
+        trustLevel: TrustLevel.unverifiedSeen,
+        firstSeen: DateTime.now(),
+        lastSeen: DateTime.now(),
+      ).toJson());
+      await storage.write(
+        key: '${TrustStore.kTrustStorePrefix}$sampleFp1',
+        value: recordJson,
+      );
+
+      expect(
+        () => trustStore.load(),
+        throwsA(isA<TrustCorruptedException>()),
+      );
     });
   });
 }

@@ -3,7 +3,9 @@ import 'dart:math';
 
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter/foundation.dart';
+import 'package:oneshare/config/app_environment.dart';
 import 'package:oneshare/services/crypto/crypto_key_storage.dart';
+import 'package:oneshare/services/crypto/trust_store.dart';
 
 /// Represents the cryptographic and network identity of this device.
 class DeviceIdentity {
@@ -45,6 +47,24 @@ class DeviceIdentity {
   }
 }
 
+class IdentityStorageException implements Exception {
+  IdentityStorageException(this.message, [this.cause]);
+  final String message;
+  final dynamic cause;
+
+  @override
+  String toString() => 'IdentityStorageException: $message';
+}
+
+class IdentityCorruptedException implements Exception {
+  IdentityCorruptedException(this.message, [this.cause]);
+  final String message;
+  final dynamic cause;
+
+  @override
+  String toString() => 'IdentityCorruptedException: $message';
+}
+
 /// Service managing persistent device identity and Ed25519 signing keypair.
 class DeviceIdentityService {
   DeviceIdentityService._();
@@ -63,6 +83,7 @@ class DeviceIdentityService {
   static const String kDeviceIdKey = 'oneshare_device_id';
   static const String kDeviceNameKey = 'oneshare_device_name';
   static const String kIdentityPrivateKeyKey = 'oneshare_identity_priv_key_b64';
+  static const String kIdentityCommittedKey = 'oneshare_identity_committed';
 
   static DeviceIdentity? _identity;
 
@@ -71,55 +92,126 @@ class DeviceIdentityService {
 
   /// Synchronous access to device identity.
   ///
-  /// Returns the initialized identity, or lazily generates an in-memory
-  /// fallback identity if accessed before [initialize] has been called.
+  /// In staging and production environments, accessing identity before [initialize]
+  /// has successfully completed throws a [StateError] (fail-closed).
+  /// In unit tests and development, lazily generates a fallback identity.
   static DeviceIdentity get identity {
+    if (_identity != null) return _identity!;
+    if (AppEnvironment.current.type == EnvironmentType.staging ||
+        AppEnvironment.current.type == EnvironmentType.production) {
+      throw StateError(
+        '[DeviceIdentityService] Identity accessed before initialize() in secure environment (${AppEnvironment.current.type.name}).',
+      );
+    }
     return _identity ??= _createFallbackIdentity();
   }
 
   /// Initializes the device identity from [storage].
   ///
   /// If an identity already exists in [storage], it is loaded and restored.
-  /// Otherwise, a new UUID, device name, and Ed25519 keypair are generated
-  /// and persisted.
+  /// If storage is clean/empty (fresh install), a new UUID, device name,
+  /// and Ed25519 keypair are generated and persisted.
+  ///
+  /// CRITICAL SECURITY GUARANTEES:
+  /// 1. Storage read errors fail closed with [IdentityStorageException].
+  /// 2. Corrupted or partially-written keys fail closed with [IdentityCorruptedException].
+  /// 3. Existing valid Phase 1 identities (missing commit marker) are backfilled automatically.
+  /// 4. A new identity is NEVER generated automatically on storage failure or corruption.
   static Future<DeviceIdentity> initialize({KeyStorage? storage}) async {
     final store = storage ?? CryptoKeyStorage();
 
-    final storedDeviceId = await store.read(key: kDeviceIdKey);
-    final storedDeviceName = await store.read(key: kDeviceNameKey);
-    final storedPrivKeyB64 = await store.read(key: kIdentityPrivateKeyKey);
+    if (store is CryptoKeyStorage) {
+      await store.migrateLegacyFileIfNeeded();
+    }
 
-    if (storedDeviceId != null &&
-        storedDeviceId.isNotEmpty &&
-        storedDeviceName != null &&
-        storedDeviceName.isNotEmpty &&
-        storedPrivKeyB64 != null &&
-        storedPrivKeyB64.isNotEmpty) {
+    String? storedDeviceId;
+    String? storedDeviceName;
+    String? storedPrivKeyB64;
+    String? storedCommitted;
+
+    try {
+      storedDeviceId = await store.read(key: kDeviceIdKey);
+      storedDeviceName = await store.read(key: kDeviceNameKey);
+      storedPrivKeyB64 = await store.read(key: kIdentityPrivateKeyKey);
+      storedCommitted = await store.read(key: kIdentityCommittedKey);
+    } catch (e) {
+      throw IdentityStorageException(
+        'Failed to read persistent identity from secure storage. Halting startup.',
+        e,
+      );
+    }
+
+    final hasAnyStored = (storedDeviceId != null && storedDeviceId.isNotEmpty) ||
+        (storedDeviceName != null && storedDeviceName.isNotEmpty) ||
+        (storedPrivKeyB64 != null && storedPrivKeyB64.isNotEmpty) ||
+        (storedCommitted != null && storedCommitted.isNotEmpty);
+
+    if (hasAnyStored) {
+      // Must have all three identity fields completely intact
+      if (storedDeviceId == null ||
+          storedDeviceId.isEmpty ||
+          storedDeviceName == null ||
+          storedDeviceName.isEmpty ||
+          storedPrivKeyB64 == null ||
+          storedPrivKeyB64.isEmpty) {
+        throw IdentityCorruptedException(
+          'Persistent identity state in storage is incomplete or corrupted. Refusing silent regeneration.',
+        );
+      }
+
+      final Uint8List privBytes;
       try {
-        final privBytes = base64Decode(storedPrivKeyB64);
-        if (privBytes.length == 32) {
-          final ed25519 = Ed25519();
-          final keyPair = await ed25519.newKeyPairFromSeed(privBytes);
-          final pubKey = await keyPair.extractPublicKey();
-          final pubBytes = Uint8List.fromList(pubKey.bytes);
-          final fingerprint = await computeFingerprint(pubBytes);
-
-          final loaded = DeviceIdentity(
-            deviceId: storedDeviceId,
-            deviceName: storedDeviceName,
-            identityKeyPair: keyPair,
-            identityPublicKeyBytes: pubBytes,
-            fingerprint: fingerprint,
+        privBytes = Uint8List.fromList(base64Decode(storedPrivKeyB64));
+        if (privBytes.length != 32) {
+          throw IdentityCorruptedException(
+            'Stored Ed25519 private seed has invalid length (${privBytes.length} bytes; expected 32).',
           );
-          _identity = loaded;
-          return loaded;
         }
       } catch (e) {
-        debugPrint('[DeviceIdentityService] Failed to load stored identity: $e. Re-generating.');
+        if (e is IdentityCorruptedException) rethrow;
+        throw IdentityCorruptedException(
+          'Failed to decode stored Ed25519 private key: $e',
+          e,
+        );
+      }
+
+      // Backfill commit marker for existing valid Phase 1 identities
+      if (storedCommitted == null || storedCommitted != 'true') {
+        try {
+          await store.write(key: kIdentityCommittedKey, value: 'true');
+        } catch (e) {
+          throw IdentityStorageException(
+            'Failed to backfill identity commit marker to secure storage: $e',
+            e,
+          );
+        }
+      }
+
+      try {
+        final ed25519 = Ed25519();
+        final keyPair = await ed25519.newKeyPairFromSeed(privBytes);
+        final pubKey = await keyPair.extractPublicKey();
+        final pubBytes = Uint8List.fromList(pubKey.bytes);
+        final fingerprint = await computeFingerprint(pubBytes);
+
+        final loaded = DeviceIdentity(
+          deviceId: storedDeviceId,
+          deviceName: storedDeviceName,
+          identityKeyPair: keyPair,
+          identityPublicKeyBytes: pubBytes,
+          fingerprint: fingerprint,
+        );
+        _identity = loaded;
+        return loaded;
+      } catch (e) {
+        throw IdentityCorruptedException(
+          'Failed to restore Ed25519 keypair from validated seed: $e',
+          e,
+        );
       }
     }
 
-    // Generate new identity
+    // Completely empty storage: bootstrap fresh persistent identity transactionally
     final newDeviceId = _generateUuidV4();
     final newDeviceName = _generateDeviceName();
 
@@ -130,9 +222,18 @@ class DeviceIdentityService {
     final pubBytes = Uint8List.fromList(pubKey.bytes);
     final fingerprint = await computeFingerprint(pubBytes);
 
-    await store.write(key: kDeviceIdKey, value: newDeviceId);
-    await store.write(key: kDeviceNameKey, value: newDeviceName);
-    await store.write(key: kIdentityPrivateKeyKey, value: base64Encode(privBytes));
+    try {
+      // Transactional write order: private seed -> device id -> device name -> commit marker
+      await store.write(key: kIdentityPrivateKeyKey, value: base64Encode(privBytes));
+      await store.write(key: kDeviceIdKey, value: newDeviceId);
+      await store.write(key: kDeviceNameKey, value: newDeviceName);
+      await store.write(key: kIdentityCommittedKey, value: 'true');
+    } catch (e) {
+      throw IdentityStorageException(
+        'Failed to persist newly generated device identity to storage: $e',
+        e,
+      );
+    }
 
     final newIdentity = DeviceIdentity(
       deviceId: newDeviceId,
@@ -143,6 +244,34 @@ class DeviceIdentityService {
     );
     _identity = newIdentity;
     return newIdentity;
+  }
+
+  /// Explicit user-initiated identity reset.
+  ///
+  /// Atomically clears stored identity keys AND invalidates the entire trust store.
+  /// A newly generated identity will NEVER inherit old trust records.
+  /// Must only be invoked following explicit user confirmation.
+  static Future<DeviceIdentity> resetIdentity({
+    required KeyStorage storage,
+    TrustStore? trustStore,
+  }) async {
+    // 1. Purge all peer trust records and the trust index
+    if (trustStore != null) {
+      await trustStore.clearAll();
+    } else {
+      final store = TrustStore(storage: storage);
+      await store.clearAll();
+    }
+
+    // 2. Uncommit and clear identity keys
+    await storage.delete(key: kIdentityCommittedKey);
+    await storage.delete(key: kDeviceIdKey);
+    await storage.delete(key: kDeviceNameKey);
+    await storage.delete(key: kIdentityPrivateKeyKey);
+    _identity = null;
+
+    // 3. Cleanly bootstrap fresh identity
+    return initialize(storage: storage);
   }
 
   /// Computes the SHA-256 hex fingerprint of a public key.
@@ -157,6 +286,7 @@ class DeviceIdentityService {
     _identity = identity;
   }
 
+  /// Explicitly resets the local device identity and clears all paired trust records.
   /// Resets the cached identity state (useful in tests).
   @visibleForTesting
   static void resetForTesting() {

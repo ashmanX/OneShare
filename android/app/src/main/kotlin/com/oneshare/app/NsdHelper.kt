@@ -1,4 +1,4 @@
-package com.example.droplan
+package com.oneshare.app
 
 import android.content.Context
 import android.net.nsd.NsdManager

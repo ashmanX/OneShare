@@ -11,9 +11,9 @@ class NetworkMonitorService {
   static final NetworkMonitorService instance = NetworkMonitorService._();
 
   static const MethodChannel _wifiControlChannel =
-      MethodChannel('com.example.oneshare/wifi_control');
+      MethodChannel('com.oneshare.app/wifi_control');
   static const EventChannel _wifiEventChannel =
-      EventChannel('com.example.oneshare/wifi_events');
+      EventChannel('com.oneshare.app/wifi_events');
 
   /// Reactive notifier emitting real-time Wi-Fi status changes (true = Wi-Fi ON/Online, false = Wi-Fi OFF/Offline).
   final ValueNotifier<bool> isWifiOnNotifier = ValueNotifier<bool>(true);

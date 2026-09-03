@@ -1,4 +1,4 @@
-package com.example.droplan
+package com.oneshare.app
 
 import android.app.Activity
 import android.content.ActivityNotFoundException

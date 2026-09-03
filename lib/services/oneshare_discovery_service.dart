@@ -41,10 +41,10 @@ class DiscoveredDevice {
 
 class OneShareDiscoveryService {
   static const MethodChannel _controlChannel =
-      MethodChannel('com.example.oneshare/nsd_control');
+      MethodChannel('com.oneshare.app/nsd_control');
 
   static const EventChannel _eventChannel =
-      EventChannel('com.example.oneshare/nsd_events');
+      EventChannel('com.oneshare.app/nsd_events');
 
   StreamSubscription? _eventSubscription;
 

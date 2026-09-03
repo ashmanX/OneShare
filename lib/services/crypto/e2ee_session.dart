@@ -42,6 +42,9 @@ class E2eeSession {
   Uint8List? myEphemeralPubKey;
   Uint8List? peerEphemeralPubKey;
   Uint8List? peerIdentityPubKey;
+  Uint8List? intendedReceiverIdentityPubKey;
+  String? peerFingerprint;
+  String? peerDeviceId;
   Uint8List? manifestHash;
   Uint8List? tokenHash;
   Uint8List? transcriptHash;
@@ -144,6 +147,21 @@ class E2eeSession {
   }
 
   /// Performs best-effort key zeroization and transitions session to destroyed state.
+  ///
+  /// DART GC ZEROIZATION BOUNDARIES & LIMITATIONS:
+  /// Pure Dart applications running on the Dart VM or Flutter runtime operate under
+  /// automatic garbage collection without pinned raw heap allocation primitives.
+  /// While mutable byte lists ([Uint8List]) can have their underlying bytes explicitly
+  /// overwritten with zeros via [List.fillRange], the following limitations apply:
+  /// 1. Immutable objects (such as [String] instances used for fingerprints, Base64
+  ///    representations, or tokens) cannot be overwritten in-place in Dart heap memory.
+  /// 2. Intermediate copies created by internal cryptographic primitives (e.g. package:cryptography
+  ///    or native BoringSSL wrappers during HKDF/HMAC/ChaCha20 operations) reside in
+  ///    transient heap buffers that remain until swept and reclaimed by the garbage collector.
+  /// 3. To guarantee zero residual key-memory risk, native C/Rust interop with pinned
+  ///    `mlock` / `sodium_memzero` boundaries would be required. In pure Flutter/Dart,
+  ///    best-effort zeroization explicitly zeroes all accessible mutable byte arrays,
+  ///    releases references immediately to permit GC reclamation, and closes active channels.
   Future<void> destroy() async {
     state = E2eeSessionState.destroyed;
 
@@ -154,6 +172,36 @@ class E2eeSession {
         priv.fillRange(0, priv.length, 0);
       } catch (_) {}
       myEphemeralKeyPair = null;
+    }
+
+    if (myEphemeralPubKey != null) {
+      myEphemeralPubKey!.fillRange(0, myEphemeralPubKey!.length, 0);
+      myEphemeralPubKey = null;
+    }
+
+    if (peerEphemeralPubKey != null) {
+      peerEphemeralPubKey!.fillRange(0, peerEphemeralPubKey!.length, 0);
+      peerEphemeralPubKey = null;
+    }
+
+    if (peerIdentityPubKey != null) {
+      peerIdentityPubKey!.fillRange(0, peerIdentityPubKey!.length, 0);
+      peerIdentityPubKey = null;
+    }
+
+    if (manifestHash != null) {
+      manifestHash!.fillRange(0, manifestHash!.length, 0);
+      manifestHash = null;
+    }
+
+    if (tokenHash != null) {
+      tokenHash!.fillRange(0, tokenHash!.length, 0);
+      tokenHash = null;
+    }
+
+    if (transcriptHash != null) {
+      transcriptHash!.fillRange(0, transcriptHash!.length, 0);
+      transcriptHash = null;
     }
 
     if (sasBytes != null) {
