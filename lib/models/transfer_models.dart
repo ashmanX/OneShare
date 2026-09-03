@@ -61,6 +61,7 @@ class PendingTransferRequest {
     required this.files,
     required this.receivedAt,
     this.timer,
+    this.e2ee,
   });
 
   final String transferId;
@@ -71,17 +72,24 @@ class PendingTransferRequest {
   final List<TransferFileItem> files;
   final DateTime receivedAt;
   Timer? timer;
+  final Map<String, dynamic>? e2ee;
 
   int get totalSize => files.fold(0, (sum, item) => sum + item.fileSize);
 
-  Map<String, dynamic> toJson() => {
-        'transferId': transferId,
-        'senderDeviceId': senderDeviceId,
-        'senderDeviceName': senderDeviceName,
-        'senderHost': senderHost,
-        'senderPort': senderPort,
-        'files': files.map((f) => f.toJson()).toList(),
-      };
+  Map<String, dynamic> toJson() {
+    final map = <String, dynamic>{
+      'transferId': transferId,
+      'senderDeviceId': senderDeviceId,
+      'senderDeviceName': senderDeviceName,
+      'senderHost': senderHost,
+      'senderPort': senderPort,
+      'files': files.map((f) => f.toJson()).toList(),
+    };
+    if (e2ee != null) {
+      map['e2ee'] = e2ee;
+    }
+    return map;
+  }
 
   factory PendingTransferRequest.fromJson(Map<String, dynamic> json) {
     final filesList = (json['files'] as List<dynamic>?)
@@ -97,6 +105,7 @@ class PendingTransferRequest {
       senderPort: (json['senderPort'] as num?)?.toInt() ?? 4040,
       files: filesList,
       receivedAt: DateTime.now(),
+      e2ee: json['e2ee'] as Map<String, dynamic>?,
     );
   }
 }

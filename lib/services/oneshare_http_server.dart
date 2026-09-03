@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import 'package:oneshare/config/oneshare_config.dart';
+import 'package:oneshare/services/crypto/control_message_channel.dart';
 import 'package:oneshare/services/device_identity_service.dart';
 import 'package:oneshare/services/transfer_service.dart';
 
@@ -111,7 +112,7 @@ class OneShareHttpServer {
           debugPrint(
               '[OneShare HttpServer] Parsed transfer accept JSON body: $jsonBody');
         }
-        final wasLive = TransferService.instance.handleAcceptResponse(jsonBody);
+        final wasLive = await TransferService.instance.handleAcceptResponse(jsonBody);
         if (wasLive) {
           request.response
             ..statusCode = HttpStatus.ok
@@ -159,16 +160,72 @@ class OneShareHttpServer {
           debugPrint(
               '[OneShare HttpServer] Parsed transfer cancel JSON body: $jsonBody');
         }
+
+        final transferId = jsonBody['transferId'] as String?;
+        if (transferId == null) {
+          request.response
+            ..statusCode = HttpStatus.badRequest
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode({'error': 'Missing transferId'}));
+          await request.response.close();
+          return;
+        }
+
+        final session = TransferService.instance.getSession(transferId);
+        if (session != null && session.incomingCtrlChannel != null) {
+          final eval = await session.incomingCtrlChannel!.evaluateIncomingControlMessage(
+            fullBody: jsonBody,
+          );
+          if (eval.status == ControlEvaluationStatus.error) {
+            request.response
+              ..statusCode = eval.statusCode
+              ..headers.contentType = ContentType.json
+              ..write(jsonEncode({
+                'error': eval.errorMessage,
+                'code': eval.errorCode,
+              }));
+            await request.response.close();
+            return;
+          }
+
+          if (eval.status == ControlEvaluationStatus.idempotentReplay) {
+            request.response
+              ..statusCode = HttpStatus.ok
+              ..headers.contentType = ContentType.json
+              ..write(jsonEncode(eval.cachedResponse!));
+            await request.response.close();
+            return;
+          }
+
+          // Execute new authenticated cancellation
+          final responsePayload = {'status': 'cancellation_acknowledged'};
+          final ctrl = jsonBody['e2ee_ctrl'] as Map<String, dynamic>;
+          final seq = ctrl['seq'] as int;
+          final macBytes = base64Decode(ctrl['mac'] as String);
+          session.incomingCtrlChannel!.recordSuccess(
+            seq: seq,
+            mac: Uint8List.fromList(macBytes),
+            response: responsePayload,
+          );
+
+          request.response
+            ..statusCode = HttpStatus.ok
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode(responsePayload));
+          await request.response.close();
+
+          await TransferService.instance.handleCancelNotification(transferId);
+          return;
+        }
+
+        // Pre-handshake or non-E2EE cancel
         request.response
           ..statusCode = HttpStatus.ok
           ..headers.contentType = ContentType.json
           ..write(jsonEncode({'status': 'cancellation_acknowledged'}));
         await request.response.close();
 
-        final transferId = jsonBody['transferId'] as String?;
-        if (transferId != null) {
-          await TransferService.instance.handleCancelNotification(transferId);
-        }
+        await TransferService.instance.handleCancelNotification(transferId);
         return;
       }
 
@@ -179,18 +236,73 @@ class OneShareHttpServer {
           debugPrint(
               '[OneShare HttpServer] Parsed transfer file cancel JSON body: $jsonBody');
         }
+
+        final transferId = jsonBody['transferId'] as String?;
+        final fileId = jsonBody['fileId'] as String?;
+        if (transferId == null || fileId == null) {
+          request.response
+            ..statusCode = HttpStatus.badRequest
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode({'error': 'Missing transferId or fileId'}));
+          await request.response.close();
+          return;
+        }
+
+        final session = TransferService.instance.getSession(transferId);
+        if (session != null && session.incomingCtrlChannel != null) {
+          final eval = await session.incomingCtrlChannel!.evaluateIncomingControlMessage(
+            fullBody: jsonBody,
+          );
+          if (eval.status == ControlEvaluationStatus.error) {
+            request.response
+              ..statusCode = eval.statusCode
+              ..headers.contentType = ContentType.json
+              ..write(jsonEncode({
+                'error': eval.errorMessage,
+                'code': eval.errorCode,
+              }));
+            await request.response.close();
+            return;
+          }
+
+          if (eval.status == ControlEvaluationStatus.idempotentReplay) {
+            request.response
+              ..statusCode = HttpStatus.ok
+              ..headers.contentType = ContentType.json
+              ..write(jsonEncode(eval.cachedResponse!));
+            await request.response.close();
+            return;
+          }
+
+          // Execute new authenticated file cancellation
+          final responsePayload = {'status': 'file_cancellation_acknowledged'};
+          final ctrl = jsonBody['e2ee_ctrl'] as Map<String, dynamic>;
+          final seq = ctrl['seq'] as int;
+          final macBytes = base64Decode(ctrl['mac'] as String);
+          session.incomingCtrlChannel!.recordSuccess(
+            seq: seq,
+            mac: Uint8List.fromList(macBytes),
+            response: responsePayload,
+          );
+
+          request.response
+            ..statusCode = HttpStatus.ok
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode(responsePayload));
+          await request.response.close();
+
+          await TransferService.instance.handleCancelFileNotification(transferId, fileId);
+          return;
+        }
+
+        // Pre-handshake or non-E2EE file cancel
         request.response
           ..statusCode = HttpStatus.ok
           ..headers.contentType = ContentType.json
           ..write(jsonEncode({'status': 'file_cancellation_acknowledged'}));
         await request.response.close();
 
-        final transferId = jsonBody['transferId'] as String?;
-        final fileId = jsonBody['fileId'] as String?;
-        if (transferId != null && fileId != null) {
-          await TransferService.instance
-              .handleCancelFileNotification(transferId, fileId);
-        }
+        await TransferService.instance.handleCancelFileNotification(transferId, fileId);
         return;
       }
 

@@ -4,8 +4,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import 'package:oneshare/models/e2ee_models.dart';
 import 'package:oneshare/models/transfer_models.dart';
 import 'package:oneshare/services/transfer_service.dart';
+import 'package:oneshare/widgets/trust_indicator.dart';
 
 class IncomingTransferDialog extends StatefulWidget {
   const IncomingTransferDialog({
@@ -215,6 +217,14 @@ class _IncomingTransferDialogState extends State<IncomingTransferDialog>
                               ),
                             ),
                           ],
+                        ),
+                        const SizedBox(height: 6),
+                        Builder(
+                          builder: (context) {
+                            final session = TransferService.instance.getSession(request.transferId);
+                            final trustLevel = session?.trustLevel ?? TrustLevel.untrusted;
+                            return TrustIndicator(trustLevel: trustLevel, compact: true);
+                          },
                         ),
                       ],
                     ),

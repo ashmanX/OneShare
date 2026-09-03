@@ -1,6 +1,6 @@
 class OneShareConfig {
   static const int port = 4040;
-  static const int protocolVersion = 1;
+  static const int protocolVersion = 2;
   static const String appName = 'OneShare';
   static const String infoPath = '/api/v1/info';
   static const String transferRequestPath = '/api/v1/transfer/request';

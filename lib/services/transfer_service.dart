@@ -10,6 +10,10 @@ import 'package:path_provider/path_provider.dart';
 
 import 'package:oneshare/config/oneshare_config.dart';
 import 'package:oneshare/models/transfer_models.dart';
+import 'package:oneshare/services/crypto/e2ee_handshake.dart';
+import 'package:oneshare/services/crypto/e2ee_session.dart';
+import 'package:oneshare/services/crypto/encrypted_stream.dart';
+import 'package:oneshare/services/crypto/trust_store.dart';
 import 'package:oneshare/services/device_identity_service.dart';
 
 class TransferCancelledException implements Exception {
@@ -91,6 +95,31 @@ class TransferService {
   final Map<String, PendingTransferRequest> _acceptedRequests = {};
   final Map<String, Set<String>> _receivedFilesPerTransfer = {};
 
+  final Map<String, E2eeSession> _outgoingE2eeSessions = {};
+  final Map<String, E2eeSession> _incomingE2eeSessions = {};
+  TrustStore _trustStore = TrustStore();
+
+  /// The active trust store instance.
+  TrustStore get trustStore => _trustStore;
+
+  /// Injects a custom TrustStore instance (e.g. backed by InMemoryKeyStorage in tests).
+  @visibleForTesting
+  set trustStore(TrustStore store) {
+    _trustStore = store;
+  }
+
+  /// Gets the active E2eeSession for a given [transferId].
+  E2eeSession? getSession(String transferId) =>
+      _incomingE2eeSessions[transferId] ?? _outgoingE2eeSessions[transferId];
+
+  @visibleForTesting
+  E2eeSession? getIncomingSessionForTesting(String transferId) =>
+      _incomingE2eeSessions[transferId];
+
+  @visibleForTesting
+  E2eeSession? getOutgoingSessionForTesting(String transferId) =>
+      _outgoingE2eeSessions[transferId];
+
   ValueNotifier<String?> lastSenderMessageNotifier = ValueNotifier(null);
 
   final Map<String, Set<String>> _cancelledFileIdsPerTransfer = {};
@@ -123,11 +152,16 @@ class TransferService {
         final uri = Uri.http('$host:$port', OneShareConfig.transferCancelFilePath);
         final req = await _client.postUrl(uri);
         req.headers.contentType = ContentType.json;
-        req.write(jsonEncode({
+        Map<String, dynamic> payload = {
           'transferId': transferId,
           'fileId': fileId,
           'senderDeviceId': DeviceIdentityService.identity.deviceId,
-        }));
+        };
+        final session = _outgoingE2eeSessions[transferId] ?? _incomingE2eeSessions[transferId];
+        if (session != null && session.outgoingCtrlChannel != null) {
+          payload = await session.outgoingCtrlChannel!.signControlMessage(payload);
+        }
+        req.write(jsonEncode(payload));
         final resp = await req.close();
         await resp.drain();
       } catch (e) {
@@ -494,10 +528,15 @@ class TransferService {
         final uri = Uri.http('$host:$port', OneShareConfig.transferCancelPath);
         final req = await _client.postUrl(uri);
         req.headers.contentType = ContentType.json;
-        req.write(jsonEncode({
+        Map<String, dynamic> payload = {
           'transferId': transferId,
           'senderDeviceId': DeviceIdentityService.identity.deviceId,
-        }));
+        };
+        final session = _outgoingE2eeSessions[transferId] ?? _incomingE2eeSessions[transferId];
+        if (session != null && session.outgoingCtrlChannel != null) {
+          payload = await session.outgoingCtrlChannel!.signControlMessage(payload);
+        }
+        req.write(jsonEncode(payload));
         final resp = await req.close();
         await resp.drain();
       } catch (e) {
@@ -570,6 +609,12 @@ class TransferService {
     _transferTargetPort.remove(transferId);
     _activeSenderCurrentFileBytes.remove(transferId);
     _outgoingCancelCompleters.remove(transferId);
+
+    // E2EE session cleanup and best-effort zeroization
+    final outgoingSession = _outgoingE2eeSessions.remove(transferId);
+    outgoingSession?.destroy();
+    final incomingSession = _incomingE2eeSessions.remove(transferId);
+    incomingSession?.destroy();
   }
 
   Future<void> handleCancelNotification(String transferId) async {
@@ -747,6 +792,41 @@ class TransferService {
 
     _outgoingFileItems[transferId] = fileItems;
 
+    // E2EE v2 Handshake Setup (Initiator)
+    final manifestItems = fileItems
+        .map((f) => ManifestFileItem(
+              fileId: f.fileId,
+              fileName: f.fileName,
+              fileSize: f.fileSize,
+            ))
+        .toList();
+    final manifestHash = await E2eeHandshake.computeManifestHash(manifestItems);
+
+    final ephemeralKeyPair = await E2eeHandshake.generateEphemeralKeyPair();
+    final ephemeralPubKey = Uint8List.fromList(
+      (await ephemeralKeyPair.extractPublicKey()).bytes,
+    );
+
+    final session = E2eeSession(
+      transferId: transferId,
+      isInitiator: true,
+      myIdentityKeyPair: ownIdentity.identityKeyPair,
+      myIdentityPubKey: ownIdentity.identityPublicKeyBytes,
+    );
+    session.myEphemeralKeyPair = ephemeralKeyPair;
+    session.myEphemeralPubKey = ephemeralPubKey;
+    session.manifestHash = manifestHash;
+    session.state = E2eeSessionState.msg1Sent;
+    _outgoingE2eeSessions[transferId] = session;
+
+    final signature = await E2eeHandshake.signMsg1(
+      senderIdentityKeyPair: ownIdentity.identityKeyPair,
+      transferId: transferId,
+      manifestHash: manifestHash,
+      senderEphemeralPubKey: ephemeralPubKey,
+      intendedReceiverIdentityPubKey: null,
+    );
+
     final payload = {
       'transferId': transferId,
       'senderDeviceId': ownIdentity.deviceId,
@@ -754,6 +834,14 @@ class TransferService {
       'senderHost': localHost ?? '127.0.0.1',
       'senderPort': senderPort ?? OneShareConfig.port,
       'files': fileItems.map((f) => f.toJson()).toList(),
+      'e2ee': {
+        'version': OneShareConfig.protocolVersion,
+        'manifestHash': base64Encode(manifestHash),
+        'senderIdentityPubKey': base64Encode(ownIdentity.identityPublicKeyBytes),
+        'senderEphemeralPubKey': base64Encode(ephemeralPubKey),
+        'senderEphemeralSig': base64Encode(signature),
+        'intendedReceiverIdentityPubKey': null,
+      },
     };
 
     final completer = Completer<TransferRequestOutcome>();
@@ -1021,7 +1109,10 @@ class TransferService {
           request.headers.set('x-file-id', fileItem.fileId);
           request.headers.set(
               'x-file-name', Uri.encodeComponent(fileItem.fileName));
-          if (fileItem.fileSize > 0) {
+          // For E2EE v2 transfers, HTTP chunked transfer encoding is used so the
+          // plaintext length is not leaked on the wire and ciphertext length is dynamic.
+          final session = _outgoingE2eeSessions[transferId];
+          if (session == null && fileItem.fileSize > 0) {
             request.contentLength = fileItem.fileSize;
           }
 
@@ -1072,7 +1163,18 @@ class TransferService {
             },
           );
 
-          await request.addStream(fileStream);
+          Stream<List<int>> streamToSend = fileStream;
+          if (session != null) {
+            final fileKey = await session.deriveFileKeyForId(fileItem.fileId);
+            final writer = EncryptedStreamWriter(
+              fileKey: fileKey,
+              transferId: transferId,
+              fileId: fileItem.fileId,
+            );
+            streamToSend = writer.encryptStream(fileStream);
+          }
+
+          await request.addStream(streamToSend);
 
           // Post-addStream safeguard: ensure UI reflects final byte count
           // even if the 50ms throttle skipped the last onChunk update.
@@ -1352,6 +1454,178 @@ class TransferService {
       };
     }
 
+    // E2EE Protocol v2 Validation & Handshake Verification
+    final e2ee = pendingRequest.e2ee;
+    if (e2ee == null) {
+      if (kDebugMode) {
+        debugPrint('[OneShare Stream Receiver] REJECTED: Missing E2EE block');
+      }
+      return {
+        'status': 'rejected',
+        'error': 'OneShare v2 requires End-to-End Encryption',
+        'code': 'PROTOCOL_VERSION_MISMATCH',
+      };
+    }
+
+    final version = e2ee['version'] as int?;
+    if (version != 2) {
+      if (kDebugMode) {
+        debugPrint('[OneShare Stream Receiver] REJECTED: Protocol version mismatch ($version)');
+      }
+      return {
+        'status': 'rejected',
+        'error': 'Unsupported protocol version: $version (expected 2)',
+        'code': 'PROTOCOL_VERSION_MISMATCH',
+      };
+    }
+
+    try {
+      final manifestHashBase64 = e2ee['manifestHash'] as String?;
+      final senderIdentityPubKeyBase64 = e2ee['senderIdentityPubKey'] as String?;
+      final senderEphemeralPubKeyBase64 = e2ee['senderEphemeralPubKey'] as String?;
+      final senderEphemeralSigBase64 = e2ee['senderEphemeralSig'] as String?;
+      final intendedReceiverIdentityPubKeyBase64 =
+          e2ee['intendedReceiverIdentityPubKey'] as String?;
+
+      if (manifestHashBase64 == null ||
+          senderIdentityPubKeyBase64 == null ||
+          senderEphemeralPubKeyBase64 == null ||
+          senderEphemeralSigBase64 == null) {
+        return {
+          'status': 'rejected',
+          'error': 'Malformed E2EE handshake parameters',
+          'code': 'INVALID_HANDSHAKE',
+        };
+      }
+
+      final manifestHash = Uint8List.fromList(base64Decode(manifestHashBase64));
+      final senderIdentityPubKey =
+          Uint8List.fromList(base64Decode(senderIdentityPubKeyBase64));
+      final senderEphemeralPubKey =
+          Uint8List.fromList(base64Decode(senderEphemeralPubKeyBase64));
+      final senderEphemeralSig =
+          Uint8List.fromList(base64Decode(senderEphemeralSigBase64));
+
+      Uint8List? intendedReceiverIdentityPubKey;
+      if (intendedReceiverIdentityPubKeyBase64 != null &&
+          intendedReceiverIdentityPubKeyBase64.isNotEmpty) {
+        intendedReceiverIdentityPubKey = Uint8List.fromList(
+          base64Decode(intendedReceiverIdentityPubKeyBase64),
+        );
+      }
+
+      // 1. Verify manifest hash against received files list
+      final manifestItems = pendingRequest.files
+          .map((f) => ManifestFileItem(
+                fileId: f.fileId,
+                fileName: f.fileName,
+                fileSize: f.fileSize,
+              ))
+          .toList();
+      final expectedManifestHash =
+          await E2eeHandshake.computeManifestHash(manifestItems);
+
+      bool manifestMatches = manifestHash.length == expectedManifestHash.length;
+      if (manifestMatches) {
+        for (int i = 0; i < manifestHash.length; i++) {
+          if (manifestHash[i] != expectedManifestHash[i]) {
+            manifestMatches = false;
+            break;
+          }
+        }
+      }
+
+      if (!manifestMatches) {
+        if (kDebugMode) {
+          debugPrint('[OneShare Stream Receiver] REJECTED: Manifest hash mismatch');
+        }
+        return {
+          'status': 'rejected',
+          'error': 'File manifest integrity check failed',
+          'code': 'MANIFEST_HASH_MISMATCH',
+        };
+      }
+
+      // 2. Verify intended receiver identity binding (if specified)
+      final ownIdentity = DeviceIdentityService.identity;
+      if (intendedReceiverIdentityPubKey != null) {
+        bool identityMatches = intendedReceiverIdentityPubKey.length ==
+            ownIdentity.identityPublicKeyBytes.length;
+        if (identityMatches) {
+          for (int i = 0; i < intendedReceiverIdentityPubKey.length; i++) {
+            if (intendedReceiverIdentityPubKey[i] !=
+                ownIdentity.identityPublicKeyBytes[i]) {
+              identityMatches = false;
+              break;
+            }
+          }
+        }
+        if (!identityMatches) {
+          if (kDebugMode) {
+            debugPrint('[OneShare Stream Receiver] REJECTED: Intended receiver identity mismatch');
+          }
+          return {
+            'status': 'rejected',
+            'error': 'This transfer was addressed to a different device identity',
+            'code': 'IDENTITY_MISMATCH',
+          };
+        }
+      }
+
+      // 3. Verify sender's Ed25519 signature on msg1
+      final isSigValid = await E2eeHandshake.verifyMsg1(
+        senderIdentityPubKey: senderIdentityPubKey,
+        signatureBytes: senderEphemeralSig,
+        transferId: pendingRequest.transferId,
+        manifestHash: manifestHash,
+        senderEphemeralPubKey: senderEphemeralPubKey,
+        intendedReceiverIdentityPubKey: intendedReceiverIdentityPubKey,
+      );
+
+      if (!isSigValid) {
+        if (kDebugMode) {
+          debugPrint('[OneShare Stream Receiver] REJECTED: Invalid msg1 signature');
+        }
+        return {
+          'status': 'rejected',
+          'error': 'Cryptographic handshake signature verification failed',
+          'code': 'INVALID_SIGNATURE',
+        };
+      }
+
+      // 4. Initialize receiver E2EE session and hold state
+      final session = E2eeSession(
+        transferId: pendingRequest.transferId,
+        isInitiator: false,
+        myIdentityKeyPair: ownIdentity.identityKeyPair,
+        myIdentityPubKey: ownIdentity.identityPublicKeyBytes,
+      );
+      session.peerEphemeralPubKey = senderEphemeralPubKey;
+      session.peerIdentityPubKey = senderIdentityPubKey;
+      session.manifestHash = manifestHash;
+      session.state = E2eeSessionState.msg1Received;
+      _incomingE2eeSessions[pendingRequest.transferId] = session;
+
+      // Evaluate peer trust level against trust store
+      final senderFp =
+          await DeviceIdentityService.computeFingerprint(senderIdentityPubKey);
+      final evaluation = await trustStore.evaluatePeer(
+        fingerprint: senderFp,
+        deviceName: pendingRequest.senderDeviceName,
+        deviceId: pendingRequest.senderDeviceId,
+      );
+      session.trustLevel = evaluation.trustLevel;
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('[OneShare Stream Receiver] Error verifying E2EE handshake: $e');
+      }
+      return {
+        'status': 'rejected',
+        'error': 'Handshake verification error: $e',
+        'code': 'HANDSHAKE_ERROR',
+      };
+    }
+
     _addProcessedId(pendingRequest.transferId);
 
     final requestWithHost = PendingTransferRequest(
@@ -1365,6 +1639,7 @@ class TransferService {
       senderPort: pendingRequest.senderPort,
       files: pendingRequest.files,
       receivedAt: DateTime.now(),
+      e2ee: pendingRequest.e2ee,
     );
 
     requestWithHost.timer = Timer(const Duration(seconds: 30), () {
@@ -1432,10 +1707,67 @@ class TransferService {
       files: initialFiles,
     );
 
+    final ownIdentity = DeviceIdentityService.identity;
+    final session = _incomingE2eeSessions[transferId];
+    final tokenHash = await E2eeHandshake.computeTokenHash(tokenString);
+
+    Map<String, dynamic>? e2eePayload;
+    if (session != null &&
+        session.peerEphemeralPubKey != null &&
+        session.peerIdentityPubKey != null &&
+        session.manifestHash != null) {
+      final ephemeralKeyPair = await E2eeHandshake.generateEphemeralKeyPair();
+      final ephemeralPubKey = Uint8List.fromList(
+        (await ephemeralKeyPair.extractPublicKey()).bytes,
+      );
+      session.myEphemeralKeyPair = ephemeralKeyPair;
+      session.myEphemeralPubKey = ephemeralPubKey;
+      session.tokenHash = tokenHash;
+
+      final sig2 = await E2eeHandshake.signMsg2(
+        receiverIdentityKeyPair: ownIdentity.identityKeyPair,
+        transferId: transferId,
+        manifestHash: session.manifestHash!,
+        tokenHash: tokenHash,
+        receiverEphemeralPubKey: ephemeralPubKey,
+        senderEphemeralPubKey: session.peerEphemeralPubKey!,
+        senderIdentityPubKey: session.peerIdentityPubKey!,
+      );
+
+      final transcriptHash = await E2eeHandshake.computeTranscriptHash(
+        transferId: transferId,
+        manifestHash: session.manifestHash!,
+        tokenHash: tokenHash,
+        senderIdentityPubKey: session.peerIdentityPubKey!,
+        receiverIdentityPubKey: ownIdentity.identityPublicKeyBytes,
+        senderEphemeralPubKey: session.peerEphemeralPubKey!,
+        receiverEphemeralPubKey: ephemeralPubKey,
+      );
+
+      final sharedSecret = await E2eeHandshake.computeSharedSecret(
+        myEphemeralKeyPair: ephemeralKeyPair,
+        peerEphemeralPubKey: session.peerEphemeralPubKey!,
+      );
+
+      await session.deriveKeys(
+        sharedSecret: sharedSecret,
+        transcriptHash: transcriptHash,
+      );
+      session.state = E2eeSessionState.msg2Sent;
+
+      e2eePayload = {
+        'version': OneShareConfig.protocolVersion,
+        'receiverIdentityPubKey': base64Encode(ownIdentity.identityPublicKeyBytes),
+        'receiverEphemeralPubKey': base64Encode(ephemeralPubKey),
+        'receiverEphemeralSig': base64Encode(sig2),
+      };
+    }
+
     final payload = {
       'transferId': transferId,
       'receiverDeviceId': DeviceIdentityService.identity.deviceId,
       'transferToken': tokenString,
+      ...?e2eePayload == null ? null : {'e2ee': e2eePayload},
     };
 
     try {
@@ -1526,12 +1858,129 @@ class TransferService {
   /// Handles an accept response from the receiver.
   /// Returns [true] if the accept was processed, [false] if the request had
   /// already timed out (BUG-05/06 fix — caller should respond with HTTP 410).
-  bool handleAcceptResponse(Map<String, dynamic> body) {
+  Future<bool> handleAcceptResponse(Map<String, dynamic> body) async {
     final transferId = body['transferId'] as String?;
     final token = body['transferToken'] as String?;
 
     if (transferId != null && _outgoingRequests.containsKey(transferId)) {
       final fileItems = _outgoingFileItems[transferId];
+      final session = _outgoingE2eeSessions[transferId];
+
+      if (session != null) {
+        final e2ee = body['e2ee'] as Map<String, dynamic>?;
+        if (e2ee == null) {
+          if (kDebugMode) {
+            debugPrint('[OneShare] Transfer accept rejected: missing E2EE msg2');
+          }
+          _outgoingFileItems.remove(transferId);
+          _outgoingRequests.remove(transferId)?.complete(
+                const TransferRequestOutcome(
+                  status: TransferResultStatus.failed,
+                  message: 'Peer did not include E2EE handshake response',
+                ),
+              );
+          return true;
+        }
+
+        try {
+          final receiverIdentityPubKeyBase64 =
+              e2ee['receiverIdentityPubKey'] as String?;
+          final receiverEphemeralPubKeyBase64 =
+              e2ee['receiverEphemeralPubKey'] as String?;
+          final receiverEphemeralSigBase64 =
+              e2ee['receiverEphemeralSig'] as String?;
+
+          if (receiverIdentityPubKeyBase64 == null ||
+              receiverEphemeralPubKeyBase64 == null ||
+              receiverEphemeralSigBase64 == null ||
+              token == null) {
+            throw const FormatException('Malformed E2EE accept parameters');
+          }
+
+          final receiverIdentityPubKey = Uint8List.fromList(
+              base64Decode(receiverIdentityPubKeyBase64));
+          final receiverEphemeralPubKey = Uint8List.fromList(
+              base64Decode(receiverEphemeralPubKeyBase64));
+          final receiverEphemeralSig = Uint8List.fromList(
+              base64Decode(receiverEphemeralSigBase64));
+
+          session.peerIdentityPubKey = receiverIdentityPubKey;
+          session.peerEphemeralPubKey = receiverEphemeralPubKey;
+
+          final tokenHash = await E2eeHandshake.computeTokenHash(token);
+          session.tokenHash = tokenHash;
+
+          // Verify receiver's signature on msg2
+          final isSigValid = await E2eeHandshake.verifyMsg2(
+            receiverIdentityPubKey: receiverIdentityPubKey,
+            signatureBytes: receiverEphemeralSig,
+            transferId: transferId,
+            manifestHash: session.manifestHash!,
+            tokenHash: tokenHash,
+            receiverEphemeralPubKey: receiverEphemeralPubKey,
+            senderEphemeralPubKey: session.myEphemeralPubKey!,
+            senderIdentityPubKey: session.myIdentityPubKey,
+          );
+
+          if (!isSigValid) {
+            throw StateError('Invalid cryptographic signature on msg2 from receiver');
+          }
+
+          // Compute transcript hash & derive keys
+          final transcriptHash = await E2eeHandshake.computeTranscriptHash(
+            transferId: transferId,
+            manifestHash: session.manifestHash!,
+            tokenHash: tokenHash,
+            senderIdentityPubKey: session.myIdentityPubKey,
+            receiverIdentityPubKey: receiverIdentityPubKey,
+            senderEphemeralPubKey: session.myEphemeralPubKey!,
+            receiverEphemeralPubKey: receiverEphemeralPubKey,
+          );
+
+          final sharedSecret = await E2eeHandshake.computeSharedSecret(
+            myEphemeralKeyPair: session.myEphemeralKeyPair!,
+            peerEphemeralPubKey: receiverEphemeralPubKey,
+          );
+
+          await session.deriveKeys(
+            sharedSecret: sharedSecret,
+            transcriptHash: transcriptHash,
+          );
+          session.state = E2eeSessionState.keysDerived;
+
+          // Best-effort zeroization of ephemeral private key
+          if (session.myEphemeralKeyPair != null) {
+            try {
+              final priv = await session.myEphemeralKeyPair!.extractPrivateKeyBytes();
+              priv.fillRange(0, priv.length, 0);
+            } catch (_) {}
+            session.myEphemeralKeyPair = null;
+          }
+
+          // Evaluate receiver trust in TrustStore
+          final receiverFp = await DeviceIdentityService.computeFingerprint(receiverIdentityPubKey);
+          final eval = await trustStore.evaluatePeer(
+            fingerprint: receiverFp,
+            deviceName: 'Receiver',
+            deviceId: body['receiverDeviceId'] as String? ?? '',
+          );
+          session.trustLevel = eval.trustLevel;
+        } catch (e) {
+          if (kDebugMode) {
+            debugPrint('[OneShare] E2EE msg2 verification failed: $e');
+          }
+          _cleanupTransferState(transferId);
+          _outgoingFileItems.remove(transferId);
+          _outgoingRequests.remove(transferId)?.complete(
+                TransferRequestOutcome(
+                  status: TransferResultStatus.failed,
+                  message: 'E2EE handshake verification failed: $e',
+                ),
+              );
+          return true;
+        }
+      }
+
       _outgoingRequests.remove(transferId)?.complete(
             TransferRequestOutcome(
               status: TransferResultStatus.accepted,
@@ -1709,9 +2158,13 @@ class TransferService {
 
     // 7. Size check — BUG-12 FIX: Skip the pre-flight content-length check
     // when expectedFileItem.fileSize == 0 (e.g. cloud files whose size was
-    // not known at selection time). The actual byte-count check after the
-    // stream is complete serves as the real guard for known-size files.
-    if (expectedFileItem.fileSize > 0 &&
+    // not known at selection time). Also skip for E2EE v2 transfers because
+    // chunked transfer encoding is used and content-length is omitted.
+    // The actual byte-count check after the stream is complete serves as the
+    // real guard for known-size files.
+    final session = _incomingE2eeSessions[transferId];
+    if (session == null &&
+        expectedFileItem.fileSize > 0 &&
         declaredSize != -1 &&
         declaredSize != expectedFileItem.fileSize) {
       if (kDebugMode) {
@@ -1801,52 +2254,107 @@ class TransferService {
     }
 
     try {
-      await for (final chunk in request) {
-        if (isTransferCancelled(transferId) || isFileCancelled(transferId, fileId)) {
-          if (kDebugMode) {
-            debugPrint(
-                '[OneShare Stream Receiver] Stream reading aborted for $rawFileName due to cancellation');
-          }
-          await sink.close();
-          _activeIncomingSinks.remove(transferId);
-          if (await tempFile.exists()) {
-            try {
-              await tempFile.delete();
-            } catch (_) {}
-          }
-          _activeIncomingTempFiles.remove(transferId);
-          _activeIncomingHttpRequests.remove(transferId);
-          return;
-        }
-
-        actualBytesReceived += chunk.length;
-        unflushedBytes += chunk.length;
-        if (kDebugMode && (actualBytesReceived % (1024 * 1024) == 0 || actualBytesReceived < 100 * 1024)) {
-          debugPrint('[DIAGNOSTIC] Receiver chunk loop: actualBytesReceived: $actualBytesReceived');
-        }
-
-        // Only enforce the size ceiling when the expected size is known (> 0).
-        if (expectedSize > 0 && actualBytesReceived > expectedSize) {
-          sizeExceeded = true;
-          break;
-        }
-        sink.add(chunk);
-
-        // Periodically flush sink every 2MB to apply backpressure on socket stream,
-        // preventing RAM buffers from expanding infinitely during multi-gigabyte transfers.
-        if (unflushedBytes >= flushThreshold) {
-          unflushedBytes = 0;
-          await sink.flush();
-        }
-
-        _updateReceiverProgress(
+      final session = _incomingE2eeSessions[transferId];
+      if (session != null) {
+        // E2EE stream: pipe request through EncryptedStreamReader
+        final fileKey = await session.deriveIncomingFileKeyForId(fileId);
+        final reader = EncryptedStreamReader(
+          fileKey: fileKey,
           transferId: transferId,
-          currentFileName: expectedFileItem.fileName,
-          pendingReq: pendingReq,
-          currentFileId: fileId,
-          currentFileBytes: actualBytesReceived,
-          currentFileSize: expectedSize,
+          fileId: fileId,
         );
+
+        final decryptedStream = reader.processStream(request);
+        await for (final chunk in decryptedStream) {
+          if (isTransferCancelled(transferId) || isFileCancelled(transferId, fileId)) {
+            if (kDebugMode) {
+              debugPrint(
+                  '[OneShare Stream Receiver] Stream reading aborted for $rawFileName due to cancellation');
+            }
+            await sink.close();
+            _activeIncomingSinks.remove(transferId);
+            if (await tempFile.exists()) {
+              try {
+                await tempFile.delete();
+              } catch (_) {}
+            }
+            _activeIncomingTempFiles.remove(transferId);
+            _activeIncomingHttpRequests.remove(transferId);
+            return;
+          }
+
+          actualBytesReceived += chunk.length;
+          unflushedBytes += chunk.length;
+
+          if (expectedSize > 0 && actualBytesReceived > expectedSize) {
+            sizeExceeded = true;
+            break;
+          }
+          sink.add(chunk);
+
+          if (unflushedBytes >= flushThreshold) {
+            unflushedBytes = 0;
+            await sink.flush();
+          }
+
+          _updateReceiverProgress(
+            transferId: transferId,
+            currentFileName: expectedFileItem.fileName,
+            pendingReq: pendingReq,
+            currentFileId: fileId,
+            currentFileBytes: actualBytesReceived,
+            currentFileSize: expectedSize,
+          );
+        }
+      } else {
+        // Non-E2EE stream (legacy or tests)
+        await for (final chunk in request) {
+          if (isTransferCancelled(transferId) || isFileCancelled(transferId, fileId)) {
+            if (kDebugMode) {
+              debugPrint(
+                  '[OneShare Stream Receiver] Stream reading aborted for $rawFileName due to cancellation');
+            }
+            await sink.close();
+            _activeIncomingSinks.remove(transferId);
+            if (await tempFile.exists()) {
+              try {
+                await tempFile.delete();
+              } catch (_) {}
+            }
+            _activeIncomingTempFiles.remove(transferId);
+            _activeIncomingHttpRequests.remove(transferId);
+            return;
+          }
+
+          actualBytesReceived += chunk.length;
+          unflushedBytes += chunk.length;
+          if (kDebugMode && (actualBytesReceived % (1024 * 1024) == 0 || actualBytesReceived < 100 * 1024)) {
+            debugPrint('[DIAGNOSTIC] Receiver chunk loop: actualBytesReceived: $actualBytesReceived');
+          }
+
+          // Only enforce the size ceiling when the expected size is known (> 0).
+          if (expectedSize > 0 && actualBytesReceived > expectedSize) {
+            sizeExceeded = true;
+            break;
+          }
+          sink.add(chunk);
+
+          // Periodically flush sink every 2MB to apply backpressure on socket stream,
+          // preventing RAM buffers from expanding infinitely during multi-gigabyte transfers.
+          if (unflushedBytes >= flushThreshold) {
+            unflushedBytes = 0;
+            await sink.flush();
+          }
+
+          _updateReceiverProgress(
+            transferId: transferId,
+            currentFileName: expectedFileItem.fileName,
+            pendingReq: pendingReq,
+            currentFileId: fileId,
+            currentFileBytes: actualBytesReceived,
+            currentFileSize: expectedSize,
+          );
+        }
       }
       await sink.flush();
       await sink.close();

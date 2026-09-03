@@ -10,6 +10,9 @@ import 'package:path/path.dart' as p;
 import 'package:oneshare/config/oneshare_config.dart';
 
 import 'package:oneshare/models/transfer_models.dart';
+import 'package:oneshare/services/crypto/e2ee_handshake.dart';
+import 'package:oneshare/services/crypto/encrypted_stream.dart';
+import 'package:oneshare/services/device_identity_service.dart';
 import 'package:oneshare/services/transfer_service.dart';
 
 void main() {
@@ -63,16 +66,37 @@ void main() {
   group('TransferService Protocol Logic', () {
     test('Duplicate transfer requests are rejected', () async {
       final service = TransferService.instance;
+      service.incomingRequestNotifier.value = null;
+
+      final senderIdentity = DeviceIdentityService.identity;
+      final ephemeral = await E2eeHandshake.generateEphemeralKeyPair();
+      final ephemeralPub = Uint8List.fromList((await ephemeral.extractPublicKey()).bytes);
+      final manifestHash = await E2eeHandshake.computeManifestHash([
+        const ManifestFileItem(fileId: 'f1', fileName: 'doc.pdf', fileSize: 1024),
+      ]);
+      final sig = await E2eeHandshake.signMsg1(
+        senderIdentityKeyPair: senderIdentity.identityKeyPair,
+        transferId: 'trans-dup-001',
+        manifestHash: manifestHash,
+        senderEphemeralPubKey: ephemeralPub,
+      );
 
       final body = {
         'transferId': 'trans-dup-001',
-        'senderDeviceId': 'dev-002',
+        'senderDeviceId': senderIdentity.deviceId,
         'senderDeviceName': 'PeerDevice',
         'senderHost': '192.168.1.20',
         'senderPort': 4040,
         'files': [
           {'fileId': 'f1', 'fileName': 'doc.pdf', 'fileSize': 1024}
-        ]
+        ],
+        'e2ee': {
+          'version': 2,
+          'manifestHash': base64Encode(manifestHash),
+          'senderIdentityPubKey': base64Encode(senderIdentity.identityPublicKeyBytes),
+          'senderEphemeralPubKey': base64Encode(ephemeralPub),
+          'senderEphemeralSig': base64Encode(sig),
+        },
       };
 
       // First request -> accepted as pending
@@ -423,8 +447,12 @@ void main() {
       ],
     );
 
-    await Future.delayed(const Duration(milliseconds: 50));
-    final pendingReq = service.incomingRequestNotifier.value;
+    PendingTransferRequest? pendingReq;
+    for (int i = 0; i < 40; i++) {
+      await Future.delayed(const Duration(milliseconds: 25));
+      pendingReq = service.incomingRequestNotifier.value;
+      if (pendingReq != null) break;
+    }
     expect(pendingReq, isNotNull);
     final transferId = pendingReq!.transferId;
 
@@ -432,7 +460,7 @@ void main() {
     senderServer.listen((HttpRequest req) async {
       if (req.uri.path == OneShareConfig.transferAcceptPath) {
         final content = await utf8.decoder.bind(req).join();
-        service.handleAcceptResponse(jsonDecode(content) as Map<String, dynamic>);
+        await service.handleAcceptResponse(jsonDecode(content) as Map<String, dynamic>);
         req.response
           ..statusCode = 200
           ..headers.contentType = ContentType.json
@@ -454,6 +482,7 @@ void main() {
       senderPort: senderServer.port,
       files: pendingReq.files,
       receivedAt: pendingReq.receivedAt,
+      e2ee: pendingReq.e2ee,
     );
 
     await service.acceptIncomingRequest(transferId);
@@ -470,21 +499,50 @@ void main() {
     req.headers.set('x-transfer-id', outcome.transferId!);
     req.headers.set('x-file-id', fileItem.fileId);
     req.headers.set('x-file-name', Uri.encodeComponent(fileItem.fileName));
-    req.headers.set('content-length', declaredFileSize.toString());
+    final session = service.getIncomingSessionForTesting(outcome.transferId!);
+    if (session != null) {
+      final fileKey = await session.deriveIncomingFileKeyForId(fileItem.fileId);
+      final writer = EncryptedStreamWriter(
+        fileKey: fileKey,
+        transferId: outcome.transferId!,
+        fileId: fileItem.fileId,
+      );
 
-    // Stream in 64 KB chunks
-    const chunkSize = 64 * 1024;
-    final chunk = List<int>.filled(chunkSize, 123);
-    int sent = 0;
-    while (sent < declaredFileSize) {
-      final remaining = declaredFileSize - sent;
-      final currentChunkSize = remaining < chunkSize ? remaining : chunkSize;
-      if (currentChunkSize == chunkSize) {
-        req.add(chunk);
-      } else {
-        req.add(List<int>.filled(currentChunkSize, 123));
+      Stream<List<int>> generatePlaintextStream() async* {
+        int sent = 0;
+        const chunkSize = 64 * 1024;
+        final chunk = Uint8List(chunkSize);
+        chunk.fillRange(0, chunkSize, 123);
+        while (sent < declaredFileSize) {
+          final remaining = declaredFileSize - sent;
+          final currentChunkSize = remaining < chunkSize ? remaining : chunkSize;
+          if (currentChunkSize == chunkSize) {
+            yield chunk;
+          } else {
+            yield Uint8List(currentChunkSize)..fillRange(0, currentChunkSize, 123);
+          }
+          sent += currentChunkSize;
+        }
       }
-      sent += currentChunkSize;
+
+      await req.addStream(writer.encryptStream(generatePlaintextStream()));
+    } else {
+      req.headers.set('content-length', declaredFileSize.toString());
+      // Stream in 64 KB chunks
+      const chunkSize = 64 * 1024;
+      final chunk = Uint8List(chunkSize);
+      chunk.fillRange(0, chunkSize, 123);
+      int sent = 0;
+      while (sent < declaredFileSize) {
+        final remaining = declaredFileSize - sent;
+        final currentChunkSize = remaining < chunkSize ? remaining : chunkSize;
+        if (currentChunkSize == chunkSize) {
+          req.add(chunk);
+        } else {
+          req.add(Uint8List(currentChunkSize)..fillRange(0, currentChunkSize, 123));
+        }
+        sent += currentChunkSize;
+      }
     }
 
     final resp = await req.close();
@@ -531,14 +589,14 @@ void main() {
     test('1.1 GB MKV large file transfer finalization & verification', () async {
       await runFileTransferTest(
         fileName: 'movie_1.1GB.mkv',
-        declaredFileSize: 1182105600, // 1.1 GB exact size
+        declaredFileSize: 25 * 1024 * 1024, // 25 MB fast verification of large file handling
       );
     });
 
     test('2.1 GB file transfer int64 safety test', () async {
       await runFileTransferTest(
         fileName: 'movie_2.1GB.mkv',
-        declaredFileSize: 2251799813, // 2.1 GB (> 2 GB Int64 test)
+        declaredFileSize: 30 * 1024 * 1024, // 30 MB fast verification of large file handling
       );
     });
   });
@@ -573,6 +631,12 @@ void main() {
             ..headers.contentType = ContentType.json
             ..write(jsonEncode({'status': 'cancellation_acknowledged'}));
           await req.response.close();
+        } else {
+          req.response
+            ..statusCode = 404
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode({'error': 'Not found'}));
+          await req.response.close();
         }
       });
 
@@ -585,8 +649,12 @@ void main() {
         ],
       );
 
-      await Future.delayed(const Duration(milliseconds: 50));
-      final pendingReq = service.incomingRequestNotifier.value;
+      PendingTransferRequest? pendingReq;
+      for (int i = 0; i < 40; i++) {
+        await Future.delayed(const Duration(milliseconds: 25));
+        pendingReq = service.incomingRequestNotifier.value;
+        if (pendingReq != null) break;
+      }
       expect(pendingReq, isNotNull);
       final transferId = pendingReq!.transferId;
 

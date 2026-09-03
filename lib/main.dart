@@ -11,14 +11,19 @@ import 'package:google_fonts/google_fonts.dart';
 
 import 'package:oneshare/config/oneshare_config.dart';
 import 'package:oneshare/models/transfer_models.dart';
+import 'package:oneshare/services/crypto/sas_verification.dart';
 import 'package:oneshare/services/device_identity_service.dart';
 import 'package:oneshare/services/network_monitor_service.dart';
 import 'package:oneshare/services/oneshare_discovery_service.dart';
 import 'package:oneshare/services/oneshare_http_server.dart';
 import 'package:oneshare/services/transfer_service.dart';
 import 'package:oneshare/widgets/incoming_transfer_dialog.dart';
+import 'package:oneshare/widgets/sas_verification_dialog.dart';
+import 'package:oneshare/widgets/trust_indicator.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await DeviceIdentityService.initialize();
   runApp(const OneShareApp());
 }
 
@@ -2281,7 +2286,98 @@ class _OneShareHomeScreenState extends State<OneShareHomeScreen>
             ),
           ],
         ),
-        const SizedBox(height: 14),
+        // ── 1.5 E2EE Trust Security Bar ──────────────────────────────
+        Builder(
+          builder: (context) {
+            final session = TransferService.instance.getSession(state.transferId);
+            if (session == null || session.sasCode == null) {
+              return const SizedBox.shrink();
+            }
+            final trustLevel = session.trustLevel;
+
+            return Container(
+              margin: const EdgeInsets.only(bottom: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              decoration: BoxDecoration(
+                color: const Color(0xFF101422),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFF1E2638), width: 1),
+              ),
+              child: Row(
+                children: [
+                  TrustIndicator(
+                    trustLevel: trustLevel,
+                    compact: true,
+                    onTap: () {
+                      SasVerificationDialog.show(
+                        context,
+                        transferId: state.transferId,
+                        peerDeviceName: _peerDeviceNameForDirection(direction) ?? 'Peer Device',
+                        peerDeviceId: session.peerIdentityPubKey != null
+                            ? session.peerIdentityPubKey!.map((b) => b.toRadixString(16).padLeft(2, '0')).join()
+                            : '',
+                        sasCode: session.sasCode!,
+                        peerFingerprint: session.peerIdentityPubKey != null
+                            ? session.peerIdentityPubKey!.map((b) => b.toRadixString(16).padLeft(2, '0')).join()
+                            : '',
+                        peerIdentityPublicKeyBytes: session.peerIdentityPubKey ?? const [],
+                        initialTrustLevel: trustLevel,
+                        onTrustLevelChanged: (newLevel) {
+                          setState(() {});
+                        },
+                      );
+                    },
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'SAS: ${SasVerification.formatSasCode(session.sasCode!)}',
+                      style: GoogleFonts.spaceMono(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: const Color(0xFF38BDF8),
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      SasVerificationDialog.show(
+                        context,
+                        transferId: state.transferId,
+                        peerDeviceName: _peerDeviceNameForDirection(direction) ?? 'Peer Device',
+                        peerDeviceId: session.peerIdentityPubKey != null
+                            ? session.peerIdentityPubKey!.map((b) => b.toRadixString(16).padLeft(2, '0')).join()
+                            : '',
+                        sasCode: session.sasCode!,
+                        peerFingerprint: session.peerIdentityPubKey != null
+                            ? session.peerIdentityPubKey!.map((b) => b.toRadixString(16).padLeft(2, '0')).join()
+                            : '',
+                        peerIdentityPublicKeyBytes: session.peerIdentityPubKey ?? const [],
+                        initialTrustLevel: trustLevel,
+                        onTrustLevelChanged: (newLevel) {
+                          setState(() {});
+                        },
+                      );
+                    },
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    child: Text(
+                      'Verify',
+                      style: GoogleFonts.plusJakartaSans(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: const Color(0xFF38BDF8),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
 
         // ── 2. Notice / Summary Card ──────────────────────────────────
         _buildSC3NoticeCard(context, state, statusAccentColor, direction),
